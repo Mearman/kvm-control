@@ -149,8 +149,37 @@ impl App {
             }
         }
         let mut modifier_error = None;
-        if !self.enhanced_keyboard {
+        if self.enhanced_keyboard {
             for modifier in &modifiers {
+                let right = match *modifier {
+                    "ShiftLeft" => "ShiftRight",
+                    "ControlLeft" => "ControlRight",
+                    "AltLeft" => "AltRight",
+                    _ => "MetaRight",
+                };
+                if !self.held_modifiers.contains(modifier) && !self.held_modifiers.contains(right) {
+                    if let Err(error) = device.key(modifier, true).await {
+                        modifier_error = Some(error);
+                        break;
+                    }
+                    self.held_modifiers.insert(modifier);
+                    self.synthetic_modifiers.insert(modifier);
+                }
+            }
+        } else {
+            for modifier in self.drag_modifiers.clone() {
+                if !modifiers.contains(&modifier) {
+                    if let Err(error) = device.key(modifier, false).await {
+                        modifier_error = Some(error);
+                        break;
+                    }
+                    self.drag_modifiers.retain(|held| *held != modifier);
+                }
+            }
+            for modifier in &modifiers {
+                if modifier_error.is_some() {
+                    break;
+                }
                 if self.drag_modifiers.contains(modifier) {
                     continue;
                 }
@@ -326,7 +355,7 @@ impl App {
             {
                 if let Some(key) = key_name(code) {
                     if self.enhanced_keyboard {
-                        if !matches!(code, KeyCode::Modifier(_)) {
+                        {
                             for (flag, name) in [
                                 (crossterm::event::KeyModifiers::SHIFT, "ShiftLeft"),
                                 (crossterm::event::KeyModifiers::CONTROL, "ControlLeft"),
@@ -334,6 +363,16 @@ impl App {
                                 (crossterm::event::KeyModifiers::SUPER, "MetaLeft"),
                             ] {
                                 if event.modifiers.contains(flag)
+                                    && !(matches!(code, KeyCode::Modifier(_))
+                                        && event.kind == KeyEventKind::Release)
+                                    && key != name
+                                    && key
+                                        != match name {
+                                            "ShiftLeft" => "ShiftRight",
+                                            "ControlLeft" => "ControlRight",
+                                            "AltLeft" => "AltRight",
+                                            _ => "MetaRight",
+                                        }
                                     && !self.held_modifiers.contains(name)
                                     && !self.held_modifiers.contains(match name {
                                         "ShiftLeft" => "ShiftRight",
@@ -1696,6 +1735,89 @@ mod tests {
         assert!(app.drag_modifiers.is_empty());
         assert!(app.held_modifiers.is_empty());
         assert_eq!(*device.calls.lock().unwrap(), ["release"]);
+    }
+
+    #[tokio::test]
+    async fn preheld_shift_is_reconciled_on_control_and_mouse_events() {
+        let device = FakeDevice::default();
+        let mut app = App {
+            enhanced_keyboard: true,
+            ..App::default()
+        };
+        app.refresh(&device).await;
+        app.control = true;
+        app.video = Some(image::RgbImage::new(2, 4));
+        app.key_event(
+            &device,
+            crossterm::event::KeyEvent::new_with_kind(
+                KeyCode::Modifier(crossterm::event::ModifierKeyCode::LeftControl),
+                crossterm::event::KeyModifiers::SHIFT | crossterm::event::KeyModifiers::CONTROL,
+                KeyEventKind::Press,
+            ),
+        )
+        .await;
+        app.mouse(
+            &device,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 1,
+                row: 1,
+                modifiers: crossterm::event::KeyModifiers::SHIFT
+                    | crossterm::event::KeyModifiers::CONTROL,
+            },
+            ratatui::layout::Rect::new(0, 0, 4, 4),
+        )
+        .await;
+        assert_eq!(
+            *device.calls.lock().unwrap(),
+            [
+                "key:ShiftLeft:true",
+                "key:ControlLeft:true",
+                "move:-32768:-32768",
+                "button:left:true"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn fallback_drag_releases_modifier_when_flag_disappears() {
+        let device = FakeDevice::default();
+        let mut app = App::default();
+        app.refresh(&device).await;
+        app.control = true;
+        app.video = Some(image::RgbImage::new(2, 4));
+        for (kind, modifiers) in [
+            (
+                MouseEventKind::Down(MouseButton::Left),
+                crossterm::event::KeyModifiers::SHIFT,
+            ),
+            (
+                MouseEventKind::Drag(MouseButton::Left),
+                crossterm::event::KeyModifiers::NONE,
+            ),
+        ] {
+            app.mouse(
+                &device,
+                MouseEvent {
+                    kind,
+                    column: 1,
+                    row: 1,
+                    modifiers,
+                },
+                ratatui::layout::Rect::new(0, 0, 4, 4),
+            )
+            .await;
+        }
+        assert_eq!(
+            *device.calls.lock().unwrap(),
+            [
+                "key:ShiftLeft:true",
+                "move:-32768:-32768",
+                "button:left:true",
+                "key:ShiftLeft:false",
+                "move:-32768:-32768"
+            ]
+        );
     }
 
     #[tokio::test]
