@@ -63,7 +63,7 @@ fn invoke(command: &[&str], responses: Vec<&'static [u8]>) -> (std::process::Out
     let mut child = Command::new(env!("CARGO_BIN_EXE_kvm-cli"))
         .args([
             "--endpoint",
-            &format!("https://localhost:{}/api", address.port()),
+            &format!("https://localhost:{}", address.port()),
             "--profile",
             "pikvm",
             "--username",

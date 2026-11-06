@@ -4,6 +4,7 @@ use std::{
     time::Duration,
 };
 
+use base64::{Engine, engine::general_purpose::STANDARD};
 use clap::{Parser, Subcommand, ValueEnum};
 use kvm_core::{Device, DeviceProfile};
 use kvm_kvmd::{Config, Kvmd};
@@ -23,6 +24,9 @@ struct Cli {
     /// Read the password from standard input instead of a hidden terminal prompt
     #[arg(long)]
     password_stdin: bool,
+    /// Authentication method
+    #[arg(long, value_enum, default_value = "cookie")]
+    auth: Auth,
     /// PEM certificate authority to trust
     #[arg(long)]
     ca: Option<PathBuf>,
@@ -37,6 +41,12 @@ struct Cli {
 enum Profile {
     Pikvm,
     Glkvm,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum Auth {
+    Cookie,
+    Header,
 }
 
 #[derive(Subcommand)]
@@ -64,8 +74,12 @@ enum Command {
         #[arg(allow_hyphen_values = true)]
         y: i16,
     },
-    /// Report the absence of a streaming API
-    Video,
+    /// Stream newline-delimited JSON objects containing base64 JPEG frames
+    Video {
+        /// Stop after this many frames
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+        frames: Option<u64>,
+    },
 }
 
 fn password(from_stdin: bool) -> Result<String, String> {
@@ -144,14 +158,27 @@ async fn execute(device: &impl Device, command: Command) -> Result<Value, String
             device.mouse_move(x, y).await.map_err(|e| e.to_string())?;
             Ok(json!({"x": x, "y": y}))
         }
-        Command::Video => Err("live video is unsupported by the foundation library".into()),
+        Command::Video { frames } => {
+            let mut video = device.video().await.map_err(|e| e.to_string())?;
+            let stdout = io::stdout();
+            let mut output = stdout.lock();
+            let mut count = 0_u64;
+            while let Some(frame) = video.next_frame().await.map_err(|e| e.to_string())? {
+                let record = json!({"ok": true, "frame": {"encoding": "base64", "media_type": "image/jpeg", "data": STANDARD.encode(frame.jpeg)}});
+                writeln!(output, "{record}")
+                    .and_then(|()| output.flush())
+                    .map_err(|e| format!("cannot write video frame: {e}"))?;
+                count += 1;
+                if frames == Some(count) {
+                    break;
+                }
+            }
+            Ok(json!({"frames": count}))
+        }
     }
 }
 
 async fn run(cli: Cli) -> Result<Value, String> {
-    if matches!(cli.command, Command::Video) {
-        return Err("live video is unsupported by the foundation library".into());
-    }
     let ca = cli
         .ca
         .map(std::fs::read)
@@ -160,7 +187,7 @@ async fn run(cli: Cli) -> Result<Value, String> {
     if cli.insecure_tls {
         eprintln!("warning: TLS certificate verification is disabled");
     }
-    let device = Kvmd::new(Config {
+    let config = Config {
         endpoint: cli.endpoint,
         profile: match cli.profile {
             Profile::Pikvm => DeviceProfile::PiKvm,
@@ -169,13 +196,24 @@ async fn run(cli: Cli) -> Result<Value, String> {
         trusted_ca_pem: ca,
         insecure_tls: cli.insecure_tls,
         timeout: Duration::from_secs(30),
-    })
-    .map_err(|e| e.to_string())?;
+    };
     let secret = password(cli.password_stdin)?;
-    device
-        .login(&cli.username, &secret)
-        .await
-        .map_err(|e| e.to_string())?;
+    let device = match cli.auth {
+        Auth::Cookie => {
+            let device = Kvmd::new(config).map_err(|e| e.to_string())?;
+            device
+                .login(&cli.username, &secret)
+                .await
+                .map_err(|e| e.to_string())?;
+            device
+        }
+        Auth::Header => {
+            let device = Kvmd::with_header_auth(config, &cli.username, &secret)
+                .map_err(|e| e.to_string())?;
+            device.check_auth().await.map_err(|e| e.to_string())?;
+            device
+        }
+    };
     drop(secret);
     execute(&device, cli.command).await
 }
@@ -201,6 +239,9 @@ mod tests {
 
     #[async_trait::async_trait]
     impl Device for Fake {
+        async fn video(&self) -> kvm_core::Result<Box<dyn kvm_core::VideoStream>> {
+            Err(kvm_core::Error::Unsupported("synthetic video".into()))
+        }
         async fn status(&self) -> kvm_core::Result<kvm_core::DeviceStatus> {
             unreachable!()
         }

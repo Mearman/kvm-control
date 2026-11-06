@@ -890,6 +890,7 @@ name = "kvm-cli"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "base64 0.23.1",
  "clap",
  "kvm-core",
  "kvm-kvmd",

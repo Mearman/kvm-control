@@ -5,6 +5,7 @@ license.workspace = true
 version.workspace = true
 
 [dependencies]
+base64 = "0.23.1"
 clap = { version = "4.6.7", features = ["derive"] }
 kvm-core = { version = "0.1.0", path = "../kvm-core" }
 kvm-kvmd = { version = "0.1.0", path = "../kvm-kvmd" }
