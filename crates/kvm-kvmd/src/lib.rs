@@ -1,4 +1,11 @@
-use std::{collections::BTreeSet, sync::Arc, time::Duration};
+use std::{
+    collections::BTreeSet,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
 
 use async_trait::async_trait;
 use kvm_core::{
@@ -27,8 +34,35 @@ pub enum LoginState {
     ApprovalPending { expires_in: Option<u64> },
 }
 
+struct Session {
+    client: Client,
+    cookies: Arc<SessionCookies>,
+}
+
+#[derive(Default)]
+struct SessionCookies {
+    jar: reqwest::cookie::Jar,
+    sealed: AtomicBool,
+}
+
+impl reqwest::cookie::CookieStore for SessionCookies {
+    fn set_cookies(
+        &self,
+        headers: &mut dyn Iterator<Item = &reqwest::header::HeaderValue>,
+        url: &Url,
+    ) {
+        if !self.sealed.load(Ordering::Acquire) {
+            reqwest::cookie::CookieStore::set_cookies(&self.jar, headers, url);
+        }
+    }
+
+    fn cookies(&self, url: &Url) -> Option<reqwest::header::HeaderValue> {
+        reqwest::cookie::CookieStore::cookies(&self.jar, url)
+    }
+}
+
 pub struct Kvmd {
-    client: RwLock<Client>,
+    client: RwLock<Session>,
     config: Config,
     endpoint: Url,
     profile: DeviceProfile,
@@ -58,6 +92,7 @@ impl Kvmd {
             ));
         }
         let client = Self::build_client(&config)?;
+        client.cookies.sealed.store(true, Ordering::Release);
         Ok(Self {
             client: RwLock::new(client),
             endpoint: config.endpoint.clone(),
@@ -69,8 +104,8 @@ impl Kvmd {
         })
     }
 
-    fn build_client(config: &Config) -> Result<Client> {
-        let cookies = Arc::new(reqwest::cookie::Jar::default());
+    fn build_client(config: &Config) -> Result<Session> {
+        let cookies = Arc::new(SessionCookies::default());
         let mut builder = Client::builder()
             .timeout(config.timeout)
             .cookie_provider(cookies.clone())
@@ -82,9 +117,10 @@ impl Kvmd {
                 .map_err(|_| Error::InvalidResponse("invalid CA certificate".into()))?;
             builder = builder.add_root_certificate(ca);
         }
-        builder
+        let client = builder
             .build()
-            .map_err(|_| Error::Transport("could not build HTTP client".into()))
+            .map_err(|_| Error::Transport("could not build HTTP client".into()))?;
+        Ok(Session { client, cookies })
     }
 
     /// Builds a client with credentials sent in KVMD's authentication headers.
@@ -143,10 +179,13 @@ impl Kvmd {
         let mut pending = self.approval_token.lock().await;
         *pending = None;
         let mut active = self.client.write().await;
-        *active = Self::build_client(&self.config)?;
+        let empty = Self::build_client(&self.config)?;
+        empty.cookies.sealed.store(true, Ordering::Release);
+        *active = empty;
         let candidate = Self::build_client(&self.config)?;
         let url = self.url("auth/login")?;
         let response = candidate
+            .client
             .post(url)
             .form(&[("user", username), ("passwd", password)])
             .send()
@@ -182,7 +221,8 @@ impl Kvmd {
                 expires_in: Some(expires_in),
             });
         }
-        self.verify_client(&candidate).await?;
+        candidate.cookies.sealed.store(true, Ordering::Release);
+        self.verify_client(&candidate.client).await?;
         *active = candidate;
         Ok(LoginState::Authenticated)
     }
@@ -196,6 +236,7 @@ impl Kvmd {
         let mut active = self.client.write().await;
         let candidate = Self::build_client(&self.config)?;
         let response = candidate
+            .client
             .post(self.url("auth/two_step_complete")?)
             .form(&[("two_step_token", token)])
             .send()
@@ -224,7 +265,8 @@ impl Kvmd {
                 "missing approved session token".into(),
             ));
         }
-        self.verify_client(&candidate).await?;
+        candidate.cookies.sealed.store(true, Ordering::Release);
+        self.verify_client(&candidate.client).await?;
         *active = candidate;
         *pending = None;
         Ok(LoginState::Authenticated)
@@ -268,7 +310,7 @@ impl Kvmd {
 
     async fn get(&self, path: &str) -> Result<reqwest::Response> {
         let active = self.client.read().await;
-        self.get_with(&active, path).await
+        self.get_with(&active.client, path).await
     }
 
     async fn get_with(&self, active: &Client, path: &str) -> Result<reqwest::Response> {
@@ -284,7 +326,7 @@ impl Kvmd {
 
     async fn json(&self, path: &str) -> Result<serde_json::Value> {
         let active = self.client.read().await;
-        self.json_with(&active, path).await
+        self.json_with(&active.client, path).await
     }
 
     async fn json_with(&self, active: &Client, path: &str) -> Result<serde_json::Value> {
@@ -307,7 +349,7 @@ impl Kvmd {
 
     async fn discover_endpoint(&self, path: &str) -> Result<Capability> {
         let active = self.client.read().await;
-        self.discover_with(&active, path).await
+        self.discover_with(&active.client, path).await
     }
 
     async fn discover_with(&self, active: &Client, path: &str) -> Result<Capability> {
@@ -337,7 +379,7 @@ impl Kvmd {
 
     async fn input(&self, path: &str, params: &[(&str, String)]) -> Result<()> {
         let active = self.client.read().await;
-        self.input_with(&active, path, params).await
+        self.input_with(&active.client, path, params).await
     }
 
     async fn input_with(
@@ -513,17 +555,20 @@ impl Device for Kvmd {
             Control::MediaSelect { image } => ("msd", "msd/set_params", vec![("image", image)]),
         };
         let active = self.client.read().await;
-        if self.discover_with(&active, capability).await? != Capability::Supported {
+        if self.discover_with(&active.client, capability).await? != Capability::Supported {
             return Err(Error::Unsupported(format!(
                 "{capability} capability not confirmed"
             )));
         }
-        self.input_with(&active, path, &params)
+        self.input_with(&active.client, path, &params)
             .await
             .map_err(|error| Error::AmbiguousControl(error.to_string()))?;
-        let state = self.json_with(&active, capability).await.map_err(|_| {
-            Error::AmbiguousControl("request acknowledged but observation failed".into())
-        })?;
+        let state = self
+            .json_with(&active.client, capability)
+            .await
+            .map_err(|_| {
+                Error::AmbiguousControl("request acknowledged but observation failed".into())
+            })?;
         let verified = match observed {
             Control::Power(PowerAction::On) => {
                 state
