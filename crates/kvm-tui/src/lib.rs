@@ -360,8 +360,10 @@ impl<T: TerminalModes> Drop for TerminalGuard<T> {
 /// Runs the TUI for an already authenticated device. Input cleanup is attempted on every normal return.
 pub async fn run(device: &dyn Device) -> io::Result<()> {
     let _guard = TerminalGuard::enter(SystemTerminal)?;
+    let picker = ratatui_image::picker::Picker::from_query_stdio()
+        .unwrap_or_else(|_| ratatui_image::picker::Picker::halfblocks());
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
-    let result = run_loop(&mut terminal, device).await;
+    let result = run_loop(&mut terminal, device, &picker).await;
     let cleanup = device.release_inputs().await.map_err(io::Error::other);
     result.and(cleanup)
 }
@@ -369,6 +371,7 @@ pub async fn run(device: &dyn Device) -> io::Result<()> {
 async fn run_loop<B: Backend<Error = io::Error>>(
     terminal: &mut Terminal<B>,
     device: &dyn Device,
+    picker: &ratatui_image::picker::Picker,
 ) -> io::Result<()> {
     let mut app = App::default();
     app.refresh(device).await;
@@ -382,7 +385,26 @@ async fn run_loop<B: Backend<Error = io::Error>>(
     }
     let mut stream: Option<StreamTask> = None;
     loop {
-        terminal.draw(|frame| draw(frame, &app))?;
+        terminal.draw(|frame| {
+            draw(frame, &app);
+            if let Some(image) = &app.video {
+                let areas = Layout::vertical([
+                    Constraint::Length(3),
+                    Constraint::Min(3),
+                    Constraint::Length(4),
+                ])
+                .split(frame.area());
+                if let Some(area) = video_viewport(areas[1], image.width(), image.height()) {
+                    let mut protocol =
+                        picker.new_resize_protocol(image::DynamicImage::ImageRgb8(image.clone()));
+                    frame.render_stateful_widget(
+                        ratatui_image::StatefulImage::default(),
+                        area,
+                        &mut protocol,
+                    );
+                }
+            }
+        })?;
         if video_rx.has_changed().unwrap_or(false) {
             let item = video_rx.borrow_and_update().clone();
             if let Some(item) = item {
