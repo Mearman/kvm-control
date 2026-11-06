@@ -1,5 +1,8 @@
 use std::{
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 
@@ -19,7 +22,7 @@ use serde_json::json;
 use url::Url;
 
 #[derive(Clone, Default)]
-struct Calls(Arc<Mutex<Vec<String>>>);
+struct Calls(Arc<Mutex<Vec<String>>>, Arc<AtomicBool>);
 
 async fn login(State(calls): State<Calls>, uri: Uri, body: String) -> impl IntoResponse {
     calls
@@ -27,6 +30,9 @@ async fn login(State(calls): State<Calls>, uri: Uri, body: String) -> impl IntoR
         .lock()
         .unwrap()
         .push(format!("{} {body}", uri.path()));
+    if body.contains("passwd=test-password") {
+        calls.1.store(false, Ordering::SeqCst);
+    }
     if body.contains("passwd=bad") {
         let mut headers = HeaderMap::new();
         headers.insert(
@@ -99,7 +105,7 @@ async fn status(State(calls): State<Calls>, uri: Uri, headers: HeaderMap) -> imp
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         == Some("Basic dGVzdC11c2VyOnRlc3QtcGFzc3dvcmQ=");
-    if !cookie && !header_auth && !basic {
+    if (!cookie && !header_auth && !basic) || calls.1.load(Ordering::SeqCst) {
         return (
             StatusCode::FORBIDDEN,
             Json(json!({"ok": false, "result": {}})),
@@ -206,6 +212,7 @@ async fn fixture() -> (Url, Vec<u8>, Calls, tokio::task::JoinHandle<()>) {
         .route("/api/switch", get(capability))
         .route("/api/gpio", get(capability))
         .route("/api/msd", get(capability))
+        .route("/api/hid/events/send_key", post(status))
         .route("/api/atx/power", post(control))
         .route("/api/switch/set_active", post(control))
         .route("/api/gpio/switch", post(control))
@@ -401,6 +408,40 @@ async fn request_during_relogin_cannot_use_old_session() {
         Err(Error::Authentication)
     ));
     assert!(matches!(task.await.unwrap(), Err(Error::Authentication)));
+    server.abort();
+}
+
+#[tokio::test]
+async fn expired_session_requires_explicit_reauthentication() {
+    let (endpoint, ca, calls, server) = fixture().await;
+    let device = client(endpoint, Some(ca));
+    device.login("test-user", "test-password").await.unwrap();
+    calls.1.store(true, Ordering::SeqCst);
+    assert!(matches!(
+        device.key("KeyA", true).await,
+        Err(Error::AmbiguousInput(_))
+    ));
+    assert!(matches!(
+        device.check_auth().await,
+        Err(Error::Authentication)
+    ));
+    device.login("test-user", "test-password").await.unwrap();
+    device.check_auth().await.unwrap();
+    let paths = calls.0.lock().unwrap();
+    assert_eq!(
+        paths
+            .iter()
+            .filter(|v| v.starts_with("/api/auth/login "))
+            .count(),
+        2
+    );
+    assert_eq!(
+        paths
+            .iter()
+            .filter(|v| v.as_str() == "/api/hid/events/send_key")
+            .count(),
+        1
+    );
     server.abort();
 }
 
