@@ -55,6 +55,35 @@ pub enum LoginState {
     ApprovalPending { expires_in: Option<u64> },
 }
 
+// Bounds memory consumed by untrusted JSON responses while allowing device inventory data.
+const MAX_JSON_BYTES: usize = 4 * 1024 * 1024;
+
+async fn bounded_json(mut response: reqwest::Response) -> Result<serde_json::Value> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_JSON_BYTES as u64)
+    {
+        return Err(Error::InvalidResponse(
+            "JSON response exceeds the size limit".into(),
+        ));
+    }
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|_| Error::Transport("JSON response read failed".into()))?
+    {
+        if chunk.len() > MAX_JSON_BYTES - bytes.len() {
+            return Err(Error::InvalidResponse(
+                "JSON response exceeds the size limit".into(),
+            ));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    serde_json::from_slice(&bytes)
+        .map_err(|_| Error::InvalidResponse("invalid JSON response".into()))
+}
+
 struct Session {
     client: Client,
     video: Client,
@@ -234,10 +263,7 @@ impl Kvmd {
             .await
             .map_err(|error| request_error("login", &error))?;
         Self::check(response.status())?;
-        let body: serde_json::Value = response
-            .json()
-            .await
-            .map_err(|_| Error::InvalidResponse("invalid login response".into()))?;
+        let body = bounded_json(response).await?;
         if body.get("ok").and_then(serde_json::Value::as_bool) != Some(true) {
             return Err(Error::Authentication);
         }
@@ -285,10 +311,7 @@ impl Kvmd {
             .await
             .map_err(|error| request_error("approval", &error))?;
         Self::check(response.status())?;
-        let body: serde_json::Value = response
-            .json()
-            .await
-            .map_err(|_| Error::InvalidResponse("invalid approval response".into()))?;
+        let body = bounded_json(response).await?;
         if body.get("ok").and_then(serde_json::Value::as_bool) != Some(true) {
             return Err(Error::Authentication);
         }
@@ -321,10 +344,7 @@ impl Kvmd {
             .await
             .map_err(|error| request_error("authentication check", &error))?;
         Self::check(response.status())?;
-        let body: serde_json::Value = response
-            .json()
-            .await
-            .map_err(|_| Error::InvalidResponse("invalid authentication check response".into()))?;
+        let body = bounded_json(response).await?;
         if body.get("ok").and_then(serde_json::Value::as_bool) != Some(true) {
             return Err(Error::Authentication);
         }
@@ -372,12 +392,7 @@ impl Kvmd {
     }
 
     async fn json_with(&self, active: &Client, path: &str) -> Result<serde_json::Value> {
-        let value: serde_json::Value = self
-            .get_with(active, path)
-            .await?
-            .json()
-            .await
-            .map_err(|_| Error::InvalidResponse("invalid JSON".into()))?;
+        let value = bounded_json(self.get_with(active, path).await?).await?;
         if value.get("ok").and_then(serde_json::Value::as_bool) != Some(true) {
             return Err(Error::InvalidResponse(
                 "KVMD response was not successful".into(),
@@ -438,10 +453,9 @@ impl Kvmd {
             .await
             .map_err(|_| Error::AmbiguousInput("request failed after submission".into()))?;
         Self::check(response.status()).map_err(|e| Error::AmbiguousInput(e.to_string()))?;
-        let body: serde_json::Value = response
-            .json()
+        let body = bounded_json(response)
             .await
-            .map_err(|_| Error::AmbiguousInput("invalid input response".into()))?;
+            .map_err(|_| Error::AmbiguousInput("invalid or oversized input response".into()))?;
         if body.get("ok").and_then(serde_json::Value::as_bool) != Some(true) {
             return Err(Error::AmbiguousInput("device did not confirm input".into()));
         }
