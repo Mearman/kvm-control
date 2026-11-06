@@ -88,6 +88,12 @@ impl App {
             return;
         };
         let Some(viewport) = video_viewport(area, video.width(), video.height()) else {
+            if matches!(event.kind, MouseEventKind::Up(_))
+                && let Err(error) = device.release_inputs().await
+            {
+                self.control = false;
+                self.message = error.to_string();
+            }
             return;
         };
         let Some((x, y)) = mouse_coordinates(event.column, event.row, viewport) else {
@@ -99,7 +105,11 @@ impl App {
                 };
                 if let Err(error) = device.mouse_button(name, false).await {
                     self.control = false;
-                    self.message = error.to_string();
+                    let cleanup = device.release_inputs().await;
+                    self.message = match cleanup {
+                        Ok(()) => error.to_string(),
+                        Err(cleanup) => format!("{error}; input cleanup uncertain: {cleanup}"),
+                    };
                 }
             }
             return;
@@ -227,7 +237,12 @@ impl App {
                     self.message = "Keyboard control is unsupported or undiscovered".into();
                 }
             }
-            _ if self.control => {
+            _ if self.control
+                && self
+                    .capabilities
+                    .as_ref()
+                    .is_some_and(|c| c.keyboard == Capability::Supported) =>
+            {
                 if let Some(key) = key_name(code) {
                     let mods = event.modifiers;
                     let mut modifiers = Vec::new();
@@ -241,7 +256,7 @@ impl App {
                         modifiers.push("MetaLeft");
                     }
                     if mods.contains(crossterm::event::KeyModifiers::SHIFT)
-                        || matches!(code, KeyCode::Char(c) if c.is_ascii_uppercase())
+                        || matches!(code, KeyCode::Char(c) if c.is_ascii_uppercase() || "_+{}|:\"~<>?!@#$%^&*()".contains(c))
                     {
                         modifiers.push("ShiftLeft");
                     }
@@ -373,10 +388,41 @@ fn key_name(code: KeyCode) -> Option<String> {
             Some(format!("Key{}", c.to_ascii_uppercase()))
         }
         KeyCode::Char(c) if c.is_ascii_digit() => Some(format!("Digit{c}")),
+        KeyCode::F(n @ 1..=24) => Some(format!("F{n}")),
+        KeyCode::Delete => Some("Delete".into()),
+        KeyCode::Insert => Some("Insert".into()),
+        KeyCode::Home => Some("Home".into()),
+        KeyCode::End => Some("End".into()),
+        KeyCode::PageUp => Some("PageUp".into()),
+        KeyCode::PageDown => Some("PageDown".into()),
+        KeyCode::Char(c) => match c {
+            '-' | '_' => Some("Minus".into()),
+            '=' | '+' => Some("Equal".into()),
+            '[' | '{' => Some("BracketLeft".into()),
+            ']' | '}' => Some("BracketRight".into()),
+            '\\' | '|' => Some("Backslash".into()),
+            ';' | ':' => Some("Semicolon".into()),
+            '\'' | '"' => Some("Quote".into()),
+            '`' | '~' => Some("Backquote".into()),
+            ',' | '<' => Some("Comma".into()),
+            '.' | '>' => Some("Period".into()),
+            '/' | '?' => Some("Slash".into()),
+            '!' => Some("Digit1".into()),
+            '@' => Some("Digit2".into()),
+            '#' => Some("Digit3".into()),
+            '$' => Some("Digit4".into()),
+            '%' => Some("Digit5".into()),
+            '^' => Some("Digit6".into()),
+            '&' => Some("Digit7".into()),
+            '*' => Some("Digit8".into()),
+            '(' => Some("Digit9".into()),
+            ')' => Some("Digit0".into()),
+            ' ' => Some("Space".into()),
+            _ => None,
+        },
         KeyCode::Enter => Some("Enter".into()),
         KeyCode::Backspace => Some("Backspace".into()),
         KeyCode::Tab => Some("Tab".into()),
-        KeyCode::Char(' ') => Some("Space".into()),
         KeyCode::Up => Some("ArrowUp".into()),
         KeyCode::Down => Some("ArrowDown".into()),
         KeyCode::Left => Some("ArrowLeft".into()),
@@ -513,7 +559,7 @@ impl<T: TerminalModes> TerminalGuard<T> {
         let mouse = self.terminal.mouse_off();
         let screen = self.terminal.leave();
         let raw = self.terminal.cooked();
-        self.restored = true;
+        self.restored = mouse.is_ok() && screen.is_ok() && raw.is_ok();
         let errors: Vec<String> = [mouse, screen, raw]
             .into_iter()
             .filter_map(Result::err)
@@ -573,8 +619,9 @@ where
 {
     let mut app = App::default();
     app.refresh(device).await;
-    let (video_tx, mut video_rx) =
-        tokio::sync::watch::channel::<Option<Result<kvm_core::Snapshot, String>>>(None);
+    let mut video_rx: Option<
+        tokio::sync::watch::Receiver<Option<Result<kvm_core::Snapshot, String>>>,
+    > = None;
     struct StreamTask(tokio::task::JoinHandle<()>);
     impl Drop for StreamTask {
         fn drop(&mut self) {
@@ -605,8 +652,10 @@ where
                 }
             })
             .map_err(io::Error::other)?;
-        if video_rx.has_changed().unwrap_or(false) {
-            let item = video_rx.borrow_and_update().clone();
+        if let Some(receiver) = &mut video_rx
+            && receiver.has_changed().unwrap_or(false)
+        {
+            let item = receiver.borrow_and_update().clone();
             if let Some(item) = item {
                 match item {
                     Ok(frame) => match image::load_from_memory_with_format(
@@ -633,7 +682,10 @@ where
         }
         if let Some(event) = next_event()? {
             match event {
-                Event::Key(key) if key.kind == KeyEventKind::Press => {
+                Event::Key(key)
+                    if key.kind == KeyEventKind::Press
+                        || (app.control && key.kind == KeyEventKind::Repeat) =>
+                {
                     if !app.control
                         && app.command.is_none()
                         && app.pending.is_none()
@@ -641,11 +693,12 @@ where
                     {
                         drop(stream.take());
                         app.video = None;
-                        video_tx.send_replace(None);
+                        video_rx = None;
                         match device.video().await {
                             Ok(mut video) => {
                                 app.video = None;
-                                let sender = video_tx.clone();
+                                let (sender, receiver) = tokio::sync::watch::channel(None);
+                                video_rx = Some(receiver);
                                 drop(stream.replace(StreamTask(tokio::spawn(async move {
                                     loop {
                                         match video.next_frame().await {
@@ -1030,6 +1083,16 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn punctuation_includes_shift_and_balanced_key_events() {
+        let device = FakeDevice::default();
+        let mut app = App::default();
+        app.refresh(&device).await;
+        app.key(&device, KeyCode::Char('i')).await;
+        app.key(&device, KeyCode::Char('!')).await;
+        assert_eq!(*device.calls.lock().unwrap(), ["key:ShiftLeft:true", "key:Digit1:true", "key:Digit1:false", "key:ShiftLeft:false"]);
+    }
+
+    #[tokio::test]
     async fn mouse_only_device_can_enter_input_mode() {
         let device = FakeDevice::default();
         let mut app = App::default();
@@ -1255,6 +1318,9 @@ mod tests {
     #[test]
     fn maps_only_known_keys() {
         assert_eq!(key_name(KeyCode::Char('a')).as_deref(), Some("KeyA"));
-        assert_eq!(key_name(KeyCode::Char('!')), None);
+        assert_eq!(key_name(KeyCode::Char('!')).as_deref(), Some("Digit1"));
+        assert_eq!(key_name(KeyCode::F(12)).as_deref(), Some("F12"));
+        assert_eq!(key_name(KeyCode::Delete).as_deref(), Some("Delete"));
+        assert_eq!(key_name(KeyCode::Char('é')), None);
     }
 }
