@@ -86,6 +86,11 @@ git init -q --bare "$tmp/intent-origin"
 git -C "$tmp/untagged" remote add origin "$tmp/intent-origin"
 initial=$(git -C "$tmp/untagged" rev-parse HEAD)
 intent=$(grep '^plan=' "$GITHUB_OUTPUT" | cut -d = -f 2-)
+if (cd "$tmp/untagged" && PLAN="$intent" bash "$root/.github/scripts/check-release-binaries.sh"); then
+  printf '%s\n' 'A release without binary manifests was accepted.' >&2
+  exit 1
+fi
+(cd "$tmp/untagged" && PLAN='[]' bash "$root/.github/scripts/check-release-binaries.sh")
 for invalid in '{' '[{}]' '[{"tag":"v0.1.0"}]'; do
   if (cd "$tmp/untagged" && PLAN="$invalid" bash "$root/.github/scripts/record-release-intent.sh"); then
     printf '%s\n' 'Invalid release plan was accepted.' >&2

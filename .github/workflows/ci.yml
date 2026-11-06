@@ -82,6 +82,10 @@ jobs:
           ATTEMPT: ${{ github.run_attempt }}
           GH_TOKEN: ${{ github.token }}
         run: bash .github/scripts/version.sh
+      - name: Verify release binaries exist
+        env:
+          PLAN: ${{ steps.version.outputs.plan }}
+        run: bash .github/scripts/check-release-binaries.sh
       - name: Record release intent
         env:
           PLAN: ${{ steps.version.outputs.plan }}
