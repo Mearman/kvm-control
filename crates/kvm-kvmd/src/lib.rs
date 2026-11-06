@@ -1,13 +1,16 @@
 use std::{collections::BTreeSet, time::Duration};
 
 use async_trait::async_trait;
-use kvm_core::{Capabilities, Device, DeviceProfile, DeviceStatus, Error, Result, Snapshot};
+use kvm_core::{
+    Capabilities, Capability, Device, DeviceProfile, DeviceStatus, Error, Result, Snapshot,
+};
 use reqwest::{Client, Method, StatusCode};
 use tokio::sync::Mutex;
 use url::Url;
 
 /// Connection parameters. Credentials are supplied separately and are never formatted for logs.
 pub struct Config {
+    /// HTTPS device origin or reverse-proxy prefix; the adapter appends `api/`.
     pub endpoint: Url,
     pub profile: DeviceProfile,
     pub trusted_ca_pem: Option<Vec<u8>>,
@@ -45,6 +48,7 @@ impl Kvmd {
         let mut builder = Client::builder()
             .timeout(config.timeout)
             .cookie_store(true)
+            .retry(reqwest::retry::never())
             .redirect(reqwest::redirect::Policy::none())
             .danger_accept_invalid_certs(config.insecure_tls);
         if let Some(pem) = config.trusted_ca_pem {
@@ -63,6 +67,7 @@ impl Kvmd {
         })
     }
 
+    /// Returns the explicitly selected device profile.
     pub fn profile(&self) -> DeviceProfile {
         self.profile
     }
@@ -77,7 +82,15 @@ impl Kvmd {
             .send()
             .await
             .map_err(|_| Error::Transport("login request failed".into()))?;
-        Self::check(response.status())
+        Self::check(response.status())?;
+        let body: serde_json::Value = response
+            .json()
+            .await
+            .map_err(|_| Error::InvalidResponse("invalid login response".into()))?;
+        if body.get("ok").and_then(serde_json::Value::as_bool) != Some(true) {
+            return Err(Error::Authentication);
+        }
+        Ok(())
     }
 
     fn url(&self, path: &str) -> Result<Url> {
@@ -85,7 +98,7 @@ impl Kvmd {
         if !base.path().ends_with('/') {
             base.set_path(&format!("{}/", base.path()));
         }
-        base.join(path)
+        base.join(&format!("api/{path}"))
             .map_err(|_| Error::InvalidResponse("invalid endpoint".into()))
     }
 
@@ -136,7 +149,77 @@ impl Kvmd {
             .send()
             .await
             .map_err(|_| Error::AmbiguousInput("request failed after submission".into()))?;
-        Self::check(response.status()).map_err(|e| Error::AmbiguousInput(e.to_string()))
+        Self::check(response.status()).map_err(|e| Error::AmbiguousInput(e.to_string()))?;
+        let body: serde_json::Value = response
+            .json()
+            .await
+            .map_err(|_| Error::AmbiguousInput("invalid input response".into()))?;
+        if body.get("ok").and_then(serde_json::Value::as_bool) != Some(true) {
+            return Err(Error::AmbiguousInput("device did not confirm input".into()));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config(endpoint: &str) -> Config {
+        Config {
+            endpoint: Url::parse(endpoint).unwrap(),
+            profile: DeviceProfile::PiKvm,
+            trusted_ca_pem: None,
+            insecure_tls: false,
+            timeout: Duration::from_secs(5),
+        }
+    }
+
+    #[test]
+    fn paths_include_api_and_preserve_proxy_prefix() {
+        let client = Kvmd::new(config("https://example.com/proxy")).unwrap();
+        assert_eq!(
+            client.url("auth/login").unwrap().as_str(),
+            "https://example.com/proxy/api/auth/login"
+        );
+        assert_eq!(
+            client.url("hid/events/send_key").unwrap().as_str(),
+            "https://example.com/proxy/api/hid/events/send_key"
+        );
+        let client = Kvmd::new(config("https://example.com/")).unwrap();
+        assert_eq!(
+            client.url("info").unwrap().as_str(),
+            "https://example.com/api/info"
+        );
+    }
+
+    #[test]
+    fn rejects_insecure_and_credential_bearing_endpoints() {
+        for endpoint in [
+            "http://example.com/",
+            "https://user:password@example.com/",
+            "https://example.com/?token=x",
+            "https://example.com/#fragment",
+        ] {
+            assert!(Kvmd::new(config(endpoint)).is_err());
+        }
+    }
+
+    #[test]
+    fn auth_statuses_are_distinguished() {
+        assert!(matches!(
+            Kvmd::check(StatusCode::UNAUTHORIZED),
+            Err(Error::Authentication)
+        ));
+        assert!(matches!(
+            Kvmd::check(StatusCode::FORBIDDEN),
+            Err(Error::Authentication)
+        ));
+        assert!(matches!(
+            Kvmd::check(StatusCode::NOT_FOUND),
+            Err(Error::Http(404))
+        ));
+        assert!(Kvmd::check(StatusCode::OK).is_ok());
     }
 }
 
@@ -154,11 +237,11 @@ impl Device for Kvmd {
         self.status().await?;
         // Status endpoints do not establish whether individual control operations are supported.
         Ok(Capabilities {
-            status: true,
-            snapshot: false,
-            keyboard: false,
-            mouse: false,
-            live_video: false,
+            status: Capability::Supported,
+            snapshot: Capability::Unknown,
+            keyboard: Capability::Unknown,
+            mouse: Capability::Unknown,
+            live_video: Capability::Unsupported,
         })
     }
 

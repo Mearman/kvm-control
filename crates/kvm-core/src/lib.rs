@@ -32,13 +32,20 @@ pub struct DeviceStatus {
     pub streamer: serde_json::Value,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Capability {
+    Supported,
+    Unsupported,
+    Unknown,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Capabilities {
-    pub status: bool,
-    pub snapshot: bool,
-    pub keyboard: bool,
-    pub mouse: bool,
-    pub live_video: bool,
+    pub status: Capability,
+    pub snapshot: Capability,
+    pub keyboard: Capability,
+    pub mouse: Capability,
+    pub live_video: Capability,
 }
 
 #[derive(Debug, Clone)]
