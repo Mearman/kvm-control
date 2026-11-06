@@ -1,6 +1,6 @@
 use std::{env, error::Error, fs, sync::Arc, time::Duration};
 
-use kvm_core::{Device, DeviceProfile};
+use kvm_core::DeviceProfile;
 use kvm_kvmd::{Config, Kvmd, LoginState};
 use kvm_mcp::Server;
 use rmcp::ServiceExt;
@@ -75,10 +75,21 @@ async fn main() -> Result<(), Box<dyn Error>> {
     })?);
     let password = read_password(&env::var("KVM_PASSWORD_FD")?)?;
     let login = device.login(&env::var("KVM_USERNAME")?, &password).await?;
-    if let LoginState::ApprovalPending { .. } = login {
-        return Err("device approval is pending; MCP session was not started".into());
-    }
     drop(password);
+    if let LoginState::ApprovalPending { expires_in } = login {
+        let seconds = expires_in.ok_or("device approval expiry is missing")?;
+        eprintln!("Device approval pending; approve the request on the device.");
+        tokio::time::timeout(Duration::from_secs(seconds), async {
+            loop {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                if matches!(device.complete_approval().await?, LoginState::Authenticated) {
+                    return Ok::<(), kvm_core::Error>(());
+                }
+            }
+        })
+        .await
+        .map_err(|_| "device approval expired")??;
+    }
     let allow_control = env::var("KVM_ALLOW_CONTROL").as_deref() == Ok("1");
     #[cfg(unix)]
     let transport = (
@@ -88,9 +99,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
     #[cfg(not(unix))]
     let transport = rmcp::transport::stdio();
     let allow_consequential = env::var("KVM_ALLOW_CONSEQUENTIAL").as_deref() == Ok("1");
-    let service = Server::new(device.clone(), allow_control, allow_consequential)
-        .serve(transport)
-        .await?;
+    let server = Server::new(device.clone(), allow_control, allow_consequential);
+    let service = server.clone().serve(transport).await?;
     let cancel = service.cancellation_token();
     let signal_task = tokio::spawn(async move {
         if let Err(error) = shutdown_signal().await {
@@ -101,7 +111,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let outcome = service.waiting().await;
     signal_task.abort();
     let _ = signal_task.await;
-    if allow_control && let Err(error) = device.release_inputs().await {
+    if let Err(error) = server.shutdown().await {
         eprintln!("Input cleanup uncertain: {error}");
     }
     outcome?;
