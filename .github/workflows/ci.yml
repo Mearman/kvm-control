@@ -32,6 +32,9 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - name: Test release recovery
+        if: matrix.os == 'ubuntu-latest'
+        run: bash .github/scripts/test-release.sh
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo test --workspace --locked
@@ -60,6 +63,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       tag: ${{ steps.version.outputs.tag }}
+      commit: ${{ steps.version.outputs.commit }}
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
@@ -72,21 +76,8 @@ jobs:
         shell: bash
         env:
           ATTEMPT: ${{ github.run_attempt }}
-        run: |
-          set -euo pipefail
-          tag=$(git tag --merged HEAD --list 'v[0-9]*' --sort=-v:refname | sed -n '1p')
-          if [ -z "$tag" ]; then
-            echo 'A baseline version tag is required before semantic releases.' >&2
-            exit 1
-          fi
-          if [ "$ATTEMPT" -gt 1 ] && [ "$(git rev-list -n 1 "$tag")" = "$(git rev-parse HEAD)" ]; then
-            echo "tag=$tag" >> "$GITHUB_OUTPUT"
-          else
-            next=$(convco version --bump)
-            if [ "$next" != "${tag#v}" ]; then
-              echo "tag=v$next" >> "$GITHUB_OUTPUT"
-            fi
-          fi
+          GH_TOKEN: ${{ github.token }}
+        run: bash .github/scripts/version.sh
 
   archives:
     needs: version
@@ -107,6 +98,7 @@ jobs:
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
+          ref: ${{ needs.version.outputs.commit }}
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
@@ -150,6 +142,7 @@ jobs:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           fetch-depth: 0
+          ref: ${{ needs.version.outputs.commit }}
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           path: dist
@@ -161,30 +154,4 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ needs.version.outputs.tag }}
-        run: |
-          set -euo pipefail
-          for target in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu x86_64-apple-darwin aarch64-apple-darwin; do
-            archive="kvm-control-${TAG}-${target}.tar.gz"
-            test -s "dist/$archive"
-            test -s "dist/$archive.sha256"
-            (cd dist && shasum -a 256 -c "$archive.sha256")
-          done
-          convco changelog --unreleased "${TAG#v}" --max-versions 1 --output release-notes.md
-          if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
-            if [ "$(git rev-list -n 1 "$TAG")" != "$(git rev-parse HEAD)" ]; then
-              echo "Tag $TAG points to a different commit." >&2
-              exit 1
-            fi
-          else
-            git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' -c tag.gpgsign=false tag -a "$TAG" -m "$TAG"
-            git push origin "refs/tags/$TAG"
-          fi
-          state=$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases" --jq ".[] | select(.tag_name == \"$TAG\") | if .draft then \"draft\" else \"published\" end")
-          case "$state" in
-            published) exit 0 ;;
-            '') gh release create "$TAG" --draft --verify-tag --title "$TAG" --notes-file release-notes.md ;;
-            draft) ;;
-            *) echo "Unexpected release state: $state" >&2; exit 1 ;;
-          esac
-          gh release upload "$TAG" dist/* --clobber
-          gh release edit "$TAG" --draft=false
+        run: bash .github/scripts/release.sh
