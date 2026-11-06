@@ -300,6 +300,10 @@ impl Kvmd {
 
     async fn get(&self, path: &str) -> Result<reqwest::Response> {
         let active = self.client.read().await;
+        self.get_with(&active, path).await
+    }
+
+    async fn get_with(&self, active: &Client, path: &str) -> Result<reqwest::Response> {
         let response = active
             .get(self.url(path)?)
             .headers(self.auth_headers.clone())
@@ -311,8 +315,13 @@ impl Kvmd {
     }
 
     async fn json(&self, path: &str) -> Result<serde_json::Value> {
+        let active = self.client.read().await;
+        self.json_with(&active, path).await
+    }
+
+    async fn json_with(&self, active: &Client, path: &str) -> Result<serde_json::Value> {
         let value: serde_json::Value = self
-            .get(path)
+            .get_with(active, path)
             .await?
             .json()
             .await
@@ -329,7 +338,12 @@ impl Kvmd {
     }
 
     async fn discover_endpoint(&self, path: &str) -> Result<Capability> {
-        match self.json(path).await {
+        let active = self.client.read().await;
+        self.discover_with(&active, path).await
+    }
+
+    async fn discover_with(&self, active: &Client, path: &str) -> Result<Capability> {
+        match self.json_with(active, path).await {
             Ok(state) => {
                 let available = match path {
                     "gpio" => state
@@ -355,6 +369,15 @@ impl Kvmd {
 
     async fn input(&self, path: &str, params: &[(&str, String)]) -> Result<()> {
         let active = self.client.read().await;
+        self.input_with(&active, path, params).await
+    }
+
+    async fn input_with(
+        &self,
+        active: &Client,
+        path: &str,
+        params: &[(&str, String)],
+    ) -> Result<()> {
         let response = active
             .request(Method::POST, self.url(path)?)
             .headers(self.auth_headers.clone())
@@ -525,15 +548,16 @@ impl Device for Kvmd {
             ),
             Control::MediaSelect { image } => ("msd", "msd/set_params", vec![("image", image)]),
         };
-        if self.discover_endpoint(capability).await? != Capability::Supported {
+        let active = self.client.read().await;
+        if self.discover_with(&active, capability).await? != Capability::Supported {
             return Err(Error::Unsupported(format!(
                 "{capability} capability not confirmed"
             )));
         }
-        self.input(path, &params)
+        self.input_with(&active, path, &params)
             .await
             .map_err(|error| Error::AmbiguousControl(error.to_string()))?;
-        let state = self.json(capability).await.map_err(|_| {
+        let state = self.json_with(&active, capability).await.map_err(|_| {
             Error::AmbiguousControl("request acknowledged but observation failed".into())
         })?;
         let verified = match observed {
