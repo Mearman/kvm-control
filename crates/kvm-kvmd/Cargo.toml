@@ -17,5 +17,8 @@ tungstenite = "0.27"
 url.workspace = true
 
 [dev-dependencies]
-tokio = { version = "1", features = ["net", "io-util", "rt-multi-thread", "macros", "sync", "time"] }
+tokio = { workspace = true, features = ["net", "io-util"] }
 tokio-tungstenite = "0.28"
+axum = "0.8"
+axum-server = { version = "0.9.0", features = ["tls-rustls-no-provider"], default-features = false }
+rcgen = "0.13"
