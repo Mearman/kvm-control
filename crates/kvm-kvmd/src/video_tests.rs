@@ -53,15 +53,22 @@ async fn device(body: &'static [u8]) -> (Kvmd, Arc<Notify>, tokio::task::JoinHan
         .build()
         .unwrap();
     let device = Kvmd {
-        client: client.clone(),
-        video_client: client,
-        timeout: Duration::from_secs(3),
+        client: tokio::sync::RwLock::new(crate::Session {
+            client: client.clone(),
+            video: client,
+        }),
+        config: Config {
+            endpoint: Url::parse(&format!("http://{address}/proxy/")).unwrap(),
+            profile: DeviceProfile::PiKvm,
+            trusted_ca_pem: None,
+            insecure_tls: false,
+            timeout: Duration::from_secs(3),
+        },
         endpoint: Url::parse(&format!("http://{address}/proxy/")).unwrap(),
         profile: DeviceProfile::PiKvm,
         inputs: Default::default(),
         auth_headers: Default::default(),
         approval_token: Default::default(),
-        cookies: Default::default(),
     };
     (device, closed, task)
 }
@@ -94,6 +101,19 @@ async fn trusted_tls_login_cookie_reaches_lease_and_stream() {
         );
         login.write_all(b"HTTP/1.1 200 OK\r\nSet-Cookie: auth_token=synthetic; Path=/\r\nContent-Length: 23\r\nConnection: close\r\n\r\n{\"ok\":true,\"result\":{}}").await.unwrap();
         login.shutdown().await.unwrap();
+        let (socket, _) = listener.accept().await.unwrap();
+        let mut check = acceptor.accept(socket).await.unwrap();
+        let mut check_request = [0; 4096];
+        let n = check.read(&mut check_request).await.unwrap();
+        let check_request = std::str::from_utf8(&check_request[..n]).unwrap();
+        assert!(check_request.starts_with("GET /proxy/api/auth/check "));
+        assert!(
+            check_request
+                .to_ascii_lowercase()
+                .contains("cookie: auth_token=synthetic")
+        );
+        check.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 23\r\nConnection: close\r\n\r\n{\"ok\":true,\"result\":{}}").await.unwrap();
+        check.shutdown().await.unwrap();
         let (socket, _) = listener.accept().await.unwrap();
         let mut tls = acceptor.accept(socket).await.unwrap();
         let mut request = Vec::new();
@@ -296,15 +316,22 @@ async fn cancelled_partial_frame_can_resume() {
     });
     let client = reqwest::Client::builder().http1_only().build().unwrap();
     let device = Kvmd {
-        client: client.clone(),
-        video_client: client,
-        timeout: Duration::from_secs(3),
+        client: tokio::sync::RwLock::new(crate::Session {
+            client: client.clone(),
+            video: client,
+        }),
+        config: Config {
+            endpoint: Url::parse(&format!("http://{address}/proxy/")).unwrap(),
+            profile: DeviceProfile::PiKvm,
+            trusted_ca_pem: None,
+            insecure_tls: false,
+            timeout: Duration::from_secs(3),
+        },
         endpoint: Url::parse(&format!("http://{address}/proxy/")).unwrap(),
         profile: DeviceProfile::PiKvm,
         inputs: Default::default(),
         auth_headers: Default::default(),
         approval_token: Default::default(),
-        cookies: Default::default(),
     };
     let mut video = device.video().await.unwrap();
     assert!(
@@ -318,6 +345,82 @@ async fn cancelled_partial_frame_can_resume() {
         b"\xff\xd8\xff\xd9"
     );
     server.await.unwrap();
+}
+
+#[tokio::test]
+async fn relogin_waits_for_video_establishment() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (stream_arrived, stream_wait) = tokio::sync::oneshot::channel();
+    let (release_stream, release_wait) = tokio::sync::oneshot::channel();
+    let (login_arrived, mut login_wait) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        let mut ws = tokio_tungstenite::accept_async(socket).await.unwrap();
+        let watcher = tokio::spawn(async move {
+            while let Some(message) = ws.next().await {
+                if message.is_err() {
+                    break;
+                }
+            }
+        });
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut request = [0; 4096];
+        assert!(stream.read(&mut request).await.unwrap() > 0);
+        stream_arrived.send(()).unwrap();
+        release_wait.await.unwrap();
+        stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: multipart/x-mixed-replace; boundary=frame\r\n\r\n--frame\r\nContent-Type: image/jpeg\r\nContent-Length: 4\r\n\r\n\xff\xd8\xff\xd9\r\n--frame--\r\n").await.unwrap();
+        let (mut login, _) = listener.accept().await.unwrap();
+        assert!(login.read(&mut request).await.unwrap() > 0);
+        login_arrived.send(()).unwrap();
+        login
+            .write_all(
+                b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        watcher.await.unwrap();
+    });
+    let client = reqwest::Client::builder().http1_only().build().unwrap();
+    let endpoint = Url::parse(&format!("http://{address}/proxy/")).unwrap();
+    let device = Arc::new(Kvmd {
+        client: tokio::sync::RwLock::new(crate::Session {
+            client: client.clone(),
+            video: client,
+        }),
+        config: Config {
+            endpoint: endpoint.clone(),
+            profile: DeviceProfile::PiKvm,
+            trusted_ca_pem: None,
+            insecure_tls: false,
+            timeout: Duration::from_secs(3),
+        },
+        endpoint,
+        profile: DeviceProfile::PiKvm,
+        inputs: Default::default(),
+        auth_headers: Default::default(),
+        approval_token: Default::default(),
+    });
+    let video_device = device.clone();
+    let video_task = tokio::spawn(async move { video_device.video().await });
+    stream_wait.await.unwrap();
+    let login_device = device.clone();
+    let login_task = tokio::spawn(async move { login_device.login("user", "pass").await });
+    tokio::task::yield_now().await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(30), &mut login_wait)
+            .await
+            .is_err()
+    );
+    release_stream.send(()).unwrap();
+    let mut video = video_task.await.unwrap().unwrap();
+    assert!(login_task.await.unwrap().is_err());
+    assert!(video.next_frame().await.unwrap().is_some());
+    drop(video);
+    tokio::time::timeout(Duration::from_secs(3), server)
+        .await
+        .unwrap()
+        .unwrap();
 }
 
 #[tokio::test]
@@ -343,15 +446,22 @@ async fn coalesced_http_response_delivers_multiple_frames() {
     });
     let client = reqwest::Client::builder().http1_only().build().unwrap();
     let device = Kvmd {
-        client: client.clone(),
-        video_client: client,
-        timeout: Duration::from_secs(3),
+        client: tokio::sync::RwLock::new(crate::Session {
+            client: client.clone(),
+            video: client,
+        }),
+        config: Config {
+            endpoint: Url::parse(&format!("http://{address}/proxy/")).unwrap(),
+            profile: DeviceProfile::PiKvm,
+            trusted_ca_pem: None,
+            insecure_tls: false,
+            timeout: Duration::from_secs(3),
+        },
         endpoint: Url::parse(&format!("http://{address}/proxy/")).unwrap(),
         profile: DeviceProfile::PiKvm,
         inputs: Default::default(),
         auth_headers: Default::default(),
         approval_token: Default::default(),
-        cookies: Default::default(),
     };
     let mut video = device.video().await.unwrap();
     assert_eq!(
