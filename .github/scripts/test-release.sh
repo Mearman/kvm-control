@@ -86,6 +86,13 @@ git init -q --bare "$tmp/intent-origin"
 git -C "$tmp/untagged" remote add origin "$tmp/intent-origin"
 initial=$(git -C "$tmp/untagged" rev-parse HEAD)
 intent=$(grep '^plan=' "$GITHUB_OUTPUT" | cut -d = -f 2-)
+for invalid in '{' '[{}]' '[{"tag":"v0.1.0"}]'; do
+  if (cd "$tmp/untagged" && PLAN="$invalid" bash "$root/.github/scripts/record-release-intent.sh"); then
+    printf '%s\n' 'Invalid release plan was accepted.' >&2
+    exit 1
+  fi
+done
+test -z "$(git -C "$tmp/intent-origin" tag --list)"
 (cd "$tmp/untagged" && PLAN="$intent" bash "$root/.github/scripts/record-release-intent.sh")
 test "$(git -C "$tmp/intent-origin" rev-list -n 1 v0.1.0)" = "$initial"
 (cd "$tmp/untagged" && PLAN="$intent" bash "$root/.github/scripts/record-release-intent.sh")
