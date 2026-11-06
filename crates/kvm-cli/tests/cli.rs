@@ -114,7 +114,7 @@ fn status_is_json_and_authentication_is_not_leaked() {
     let body = b"{\"ok\":true,\"result\":{\"online\":true}}";
     let (output, requests) = invoke(
         &["status"],
-        vec![b"{\"ok\":true,\"result\":{}}", body, body, body],
+        vec![b"{\"ok\":true,\"result\":{}}", body, body, body, body],
     );
     assert!(
         output.status.success(),
@@ -124,7 +124,8 @@ fn status_is_json_and_authentication_is_not_leaked() {
     let result: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(result["result"]["status"]["hid"]["online"], true);
     assert!(requests[0].starts_with("POST /api/auth/login "));
-    assert!(requests[1].starts_with("GET /api/info "));
+    assert!(requests[1].starts_with("GET /api/auth/check "));
+    assert!(requests[2].starts_with("GET /api/info "));
     assert!(!String::from_utf8_lossy(&output.stdout).contains("synthetic-password"));
     assert!(!String::from_utf8_lossy(&output.stderr).contains("synthetic-password"));
 }
@@ -137,7 +138,7 @@ fn approval_pending_is_reported_and_polled_before_status() {
     let body = b"{\"ok\":true,\"result\":{\"online\":true}}";
     let (output, requests) = invoke(
         &["status"],
-        vec![login, pending, approved, body, body, body],
+        vec![login, pending, approved, body, body, body, body],
     );
     assert!(
         output.status.success(),
@@ -149,7 +150,8 @@ fn approval_pending_is_reported_and_polled_before_status() {
     assert!(!stderr.contains("synthetic-approval"));
     assert!(requests[1].starts_with("POST /api/auth/two_step_complete "));
     assert!(requests[2].starts_with("POST /api/auth/two_step_complete "));
-    assert!(requests[3].starts_with("GET /api/info "));
+    assert!(requests[3].starts_with("GET /api/auth/check "));
+    assert!(requests[4].starts_with("GET /api/info "));
 }
 
 #[test]
@@ -169,6 +171,7 @@ fn key_press_is_followed_by_release() {
             b"{\"ok\":true,\"result\":{}}",
             b"{\"ok\":true,\"result\":{}}",
             b"{\"ok\":true,\"result\":{}}",
+            b"{\"ok\":true,\"result\":{}}",
         ],
     );
     assert!(
@@ -180,6 +183,7 @@ fn key_press_is_followed_by_release() {
         serde_json::from_slice::<Value>(&output.stdout).unwrap()["result"]["released"],
         true
     );
-    assert!(requests[1].starts_with("POST /api/hid/events/send_key?key=KeyA&state=true "));
-    assert!(requests[2].starts_with("POST /api/hid/events/send_key?key=KeyA&state=false "));
+    assert!(requests[1].starts_with("GET /api/auth/check "));
+    assert!(requests[2].starts_with("POST /api/hid/events/send_key?key=KeyA&state=true "));
+    assert!(requests[3].starts_with("POST /api/hid/events/send_key?key=KeyA&state=false "));
 }
