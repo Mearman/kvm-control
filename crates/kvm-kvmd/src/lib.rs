@@ -10,7 +10,7 @@ use std::{
 use async_trait::async_trait;
 use kvm_core::{
     Capabilities, Capability, Confirmation, Control, ControlOutcome, Device, DeviceProfile,
-    DeviceStatus, Error, PowerAction, Result, Snapshot,
+    DeviceStatus, Error, MouseMode, PowerAction, Result, Snapshot,
 };
 use reqwest::{Client, Method, StatusCode};
 use tokio::sync::{Mutex, RwLock};
@@ -426,6 +426,17 @@ fn hid_capability(state: &serde_json::Value, device: &str) -> Capability {
     }
 }
 
+fn mouse_mode(state: &serde_json::Value) -> MouseMode {
+    match state
+        .pointer("/mouse/absolute")
+        .and_then(serde_json::Value::as_bool)
+    {
+        Some(true) => MouseMode::Absolute,
+        Some(false) => MouseMode::Relative,
+        None => MouseMode::Unknown,
+    }
+}
+
 #[async_trait]
 impl Device for Kvmd {
     async fn status(&self) -> Result<DeviceStatus> {
@@ -443,6 +454,7 @@ impl Device for Kvmd {
             snapshot: Capability::Unknown,
             keyboard: hid_capability(&status.hid, "keyboard"),
             mouse: hid_capability(&status.hid, "mouse"),
+            mouse_mode: mouse_mode(&status.hid),
             live_video: Capability::Unsupported,
             power: self.discover_endpoint("atx").await?,
             switch: self.discover_endpoint("switch").await?,
@@ -520,7 +532,17 @@ impl Device for Kvmd {
 
     async fn mouse_move(&self, x: i16, y: i16) -> Result<()> {
         let _inputs = self.inputs.lock().await;
-        self.input(
+        let active = self.client.read().await;
+        let state = self.json_with(&active.client, "hid").await?;
+        if hid_capability(&state, "mouse") != Capability::Supported
+            || mouse_mode(&state) != MouseMode::Absolute
+        {
+            return Err(Error::Unsupported(
+                "absolute mouse movement requires an online absolute-mode mouse".into(),
+            ));
+        }
+        self.input_with(
+            &active.client,
             "hid/events/send_mouse_move",
             &[("to_x", x.to_string()), ("to_y", y.to_string())],
         )
@@ -696,6 +718,22 @@ mod tests {
             insecure_tls: false,
             timeout: Duration::from_secs(5),
         }
+    }
+
+    #[test]
+    fn mouse_modes_preserve_unknown() {
+        assert_eq!(
+            mouse_mode(&serde_json::json!({"mouse": {"absolute": true}})),
+            MouseMode::Absolute
+        );
+        assert_eq!(
+            mouse_mode(&serde_json::json!({"mouse": {"absolute": false}})),
+            MouseMode::Relative
+        );
+        assert_eq!(
+            mouse_mode(&serde_json::json!({"mouse": {}})),
+            MouseMode::Unknown
+        );
     }
 
     #[test]
