@@ -27,11 +27,32 @@ async fn login(State(calls): State<Calls>, uri: Uri, body: String) -> impl IntoR
         .lock()
         .unwrap()
         .push(format!("{} {body}", uri.path()));
+    if body.contains("passwd=bad") {
+        return (
+            StatusCode::FORBIDDEN,
+            HeaderMap::new(),
+            Json(json!({"ok": false, "result": {}})),
+        );
+    }
+    if body.contains("passwd=pending") {
+        return (
+            StatusCode::OK,
+            HeaderMap::new(),
+            Json(
+                json!({"ok": true, "result": {"two_step_required": true, "two_step_token": "synthetic-approval", "expires_in": 60}}),
+            ),
+        );
+    }
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::SET_COOKIE,
+        "auth_token=synthetic; Path=/; Secure; HttpOnly"
+            .parse()
+            .unwrap(),
+    );
     (
-        [(
-            header::SET_COOKIE,
-            "auth_token=synthetic; Path=/; Secure; HttpOnly",
-        )],
+        StatusCode::OK,
+        headers,
         Json(json!({"ok": true, "result": {}})),
     )
 }
@@ -77,8 +98,12 @@ async fn status(State(calls): State<Calls>, uri: Uri, headers: HeaderMap) -> imp
 
 async fn capability(uri: Uri) -> impl IntoResponse {
     let state = match uri.path() {
-        "/api/gpio" => json!({"state": {"outputs": {"lamp": {"online": true, "state": true}}}}),
-        "/api/switch" => json!({"model": {"ports": [{}]}, "summary": {"active_port": 0}}),
+        "/api/gpio" => {
+            json!({"state": {"outputs": {"lamp": {"online": true, "busy": false, "state": true}, "offline": {"online": false, "busy": false, "state": false}, "busy": {"online": true, "busy": true, "state": false}}}})
+        }
+        "/api/switch" => {
+            json!({"model": {"ports": [{}]}, "summary": {"active_port": 0, "synced": false}})
+        }
         "/api/atx" => json!({"enabled": true, "leds": {"power": false}}),
         _ => json!({"enabled": true, "drive": {"connected": true, "image": {"name": "disk.iso"}}}),
     };
@@ -183,6 +208,21 @@ async fn basic_auth_and_discovered_control_requests() {
             ControlOutcome::ObservedMatching,
         ),
         (Control::Switch { port: 1 }, ControlOutcome::Unverified),
+        (Control::Switch { port: 0 }, ControlOutcome::Unverified),
+        (
+            Control::Gpio {
+                channel: "offline".into(),
+                state: false,
+            },
+            ControlOutcome::Unverified,
+        ),
+        (
+            Control::Gpio {
+                channel: "busy".into(),
+                state: false,
+            },
+            ControlOutcome::Unverified,
+        ),
         (
             Control::Gpio {
                 channel: "lamp".into(),
@@ -219,6 +259,32 @@ async fn basic_auth_and_discovered_control_requests() {
     ] {
         assert!(calls.iter().any(|v| v == path), "missing {path}");
     }
+    server.abort();
+}
+
+#[tokio::test]
+async fn failed_or_pending_relogin_does_not_reuse_previous_cookie() {
+    let (endpoint, ca, _, server) = fixture().await;
+    let device = client(endpoint, Some(ca));
+    device.login("test-user", "test-password").await.unwrap();
+    device.check_auth().await.unwrap();
+    assert!(matches!(
+        device.login("test-user", "bad").await,
+        Err(Error::Authentication)
+    ));
+    assert!(matches!(
+        device.check_auth().await,
+        Err(Error::Authentication)
+    ));
+    device.login("test-user", "test-password").await.unwrap();
+    assert!(matches!(
+        device.login("test-user", "pending").await.unwrap(),
+        LoginState::ApprovalPending { .. }
+    ));
+    assert!(matches!(
+        device.check_auth().await,
+        Err(Error::Authentication)
+    ));
     server.abort();
 }
 
