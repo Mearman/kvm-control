@@ -28,6 +28,21 @@ async fn login(State(calls): State<Calls>, uri: Uri, body: String) -> impl IntoR
         .unwrap()
         .push(format!("{} {body}", uri.path()));
     if body.contains("passwd=bad") {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::SET_COOKIE,
+            "auth_token=synthetic; Path=/proxy; Secure; HttpOnly"
+                .parse()
+                .unwrap(),
+        );
+        return (
+            StatusCode::FORBIDDEN,
+            headers,
+            Json(json!({"ok": false, "result": {}})),
+        );
+    }
+    if body.contains("passwd=delay") {
+        tokio::time::sleep(Duration::from_millis(200)).await;
         return (
             StatusCode::FORBIDDEN,
             HeaderMap::new(),
@@ -44,12 +59,12 @@ async fn login(State(calls): State<Calls>, uri: Uri, body: String) -> impl IntoR
         );
     }
     let mut headers = HeaderMap::new();
-    headers.insert(
-        header::SET_COOKIE,
+    let cookie = if uri.path().starts_with("/proxy/") {
+        "auth_token=synthetic; Path=/proxy; Secure; HttpOnly"
+    } else {
         "auth_token=synthetic; Path=/; Secure; HttpOnly"
-            .parse()
-            .unwrap(),
-    );
+    };
+    headers.insert(header::SET_COOKIE, cookie.parse().unwrap());
     (
         StatusCode::OK,
         headers,
@@ -125,6 +140,15 @@ async fn fixture() -> (Url, Vec<u8>, Calls, tokio::task::JoinHandle<()>) {
         .route("/api/auth/login", post(login))
         .route("/gl/api/auth/login", post(gl_login))
         .route("/gl/api/auth/two_step_complete", post(gl_complete))
+        .route("/gl/api/auth/check", get(status))
+        .route("/nocookie/api/auth/login", post(gl_login))
+        .route(
+            "/nocookie/api/auth/two_step_complete",
+            post(|| async { Json(json!({"ok": true, "result": {"token": "synthetic"}})) }),
+        )
+        .route("/nocookie/api/auth/check", get(status))
+        .route("/proxy/api/auth/login", post(login))
+        .route("/proxy/api/auth/check", get(status))
         .route("/api/auth/check", get(status))
         .route("/api/info", get(status))
         .route("/api/hid", get(status))
@@ -263,8 +287,37 @@ async fn basic_auth_and_discovered_control_requests() {
 }
 
 #[tokio::test]
+async fn request_during_relogin_cannot_use_old_session() {
+    let (mut endpoint, ca, calls, server) = fixture().await;
+    endpoint.set_path("/proxy/");
+    let device = Arc::new(client(endpoint, Some(ca)));
+    device.login("test-user", "test-password").await.unwrap();
+    let task_device = device.clone();
+    let task = tokio::spawn(async move { task_device.login("test-user", "delay").await });
+    loop {
+        if calls
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|v| v.contains("passwd=delay"))
+        {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert!(matches!(
+        device.check_auth().await,
+        Err(Error::Authentication)
+    ));
+    assert!(matches!(task.await.unwrap(), Err(Error::Authentication)));
+    server.abort();
+}
+
+#[tokio::test]
 async fn failed_or_pending_relogin_does_not_reuse_previous_cookie() {
-    let (endpoint, ca, _, server) = fixture().await;
+    let (mut endpoint, ca, _, server) = fixture().await;
+    endpoint.set_path("/proxy/");
     let device = client(endpoint, Some(ca));
     device.login("test-user", "test-password").await.unwrap();
     device.check_auth().await.unwrap();
@@ -280,6 +333,26 @@ async fn failed_or_pending_relogin_does_not_reuse_previous_cookie() {
     assert!(matches!(
         device.login("test-user", "pending").await.unwrap(),
         LoginState::ApprovalPending { .. }
+    ));
+    assert!(matches!(
+        device.check_auth().await,
+        Err(Error::Authentication)
+    ));
+    server.abort();
+}
+
+#[tokio::test]
+async fn approval_token_without_usable_cookie_is_rejected() {
+    let (mut endpoint, ca, _, server) = fixture().await;
+    endpoint.set_path("/nocookie/");
+    let device = client(endpoint, Some(ca));
+    assert!(matches!(
+        device.login("test-user", "test-password").await.unwrap(),
+        LoginState::ApprovalPending { .. }
+    ));
+    assert!(matches!(
+        device.complete_approval().await,
+        Err(Error::Authentication)
     ));
     assert!(matches!(
         device.check_auth().await,
