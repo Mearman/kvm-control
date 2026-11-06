@@ -107,6 +107,25 @@ fn password(from_stdin: bool) -> Result<String, String> {
     }
 }
 
+async fn write_video(
+    video: &mut dyn kvm_core::VideoStream,
+    output: &mut impl Write,
+    frames: Option<u64>,
+) -> Result<u64, String> {
+    let mut count = 0_u64;
+    while let Some(frame) = video.next_frame().await.map_err(|e| e.to_string())? {
+        let record = json!({"ok": true, "frame": {"encoding": "base64", "media_type": "image/jpeg", "data": STANDARD.encode(frame.jpeg)}});
+        writeln!(output, "{record}")
+            .and_then(|()| output.flush())
+            .map_err(|e| format!("cannot write video frame: {e}"))?;
+        count += 1;
+        if frames == Some(count) {
+            break;
+        }
+    }
+    Ok(count)
+}
+
 async fn execute(device: &impl Device, command: Command) -> Result<Value, String> {
     match command {
         Command::Diagnose | Command::Status => {
@@ -162,17 +181,7 @@ async fn execute(device: &impl Device, command: Command) -> Result<Value, String
             let mut video = device.video().await.map_err(|e| e.to_string())?;
             let stdout = io::stdout();
             let mut output = stdout.lock();
-            let mut count = 0_u64;
-            while let Some(frame) = video.next_frame().await.map_err(|e| e.to_string())? {
-                let record = json!({"ok": true, "frame": {"encoding": "base64", "media_type": "image/jpeg", "data": STANDARD.encode(frame.jpeg)}});
-                writeln!(output, "{record}")
-                    .and_then(|()| output.flush())
-                    .map_err(|e| format!("cannot write video frame: {e}"))?;
-                count += 1;
-                if frames == Some(count) {
-                    break;
-                }
-            }
+            let count = write_video(video.as_mut(), &mut output, frames).await?;
             Ok(json!({"frames": count}))
         }
     }
@@ -254,6 +263,34 @@ mod tests {
     use clap::CommandFactory;
 
     struct Fake(std::sync::Mutex<Vec<String>>);
+    struct Frames(u8);
+
+    #[async_trait::async_trait]
+    impl kvm_core::VideoStream for Frames {
+        async fn next_frame(&mut self) -> kvm_core::Result<Option<kvm_core::Snapshot>> {
+            if self.0 == 0 {
+                return Ok(None);
+            }
+            self.0 -= 1;
+            Ok(Some(kvm_core::Snapshot {
+                jpeg: vec![0xff, 0xd8, 0xff, 0xd9],
+            }))
+        }
+    }
+
+    #[tokio::test]
+    async fn video_emits_bounded_individual_json_frames() {
+        let mut stream = Frames(2);
+        let mut bytes = Vec::new();
+        assert_eq!(
+            write_video(&mut stream, &mut bytes, Some(1)).await.unwrap(),
+            1
+        );
+        assert_eq!(stream.0, 1);
+        let record: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(record["frame"]["data"], "/9j/2Q==");
+        assert_eq!(record["frame"]["media_type"], "image/jpeg");
+    }
 
     #[async_trait::async_trait]
     impl Device for Fake {
