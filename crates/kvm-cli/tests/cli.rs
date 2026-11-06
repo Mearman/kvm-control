@@ -131,6 +131,35 @@ fn status_is_json_and_authentication_is_not_leaked() {
 }
 
 #[test]
+fn capabilities_include_mouse_mode() {
+    let ok = b"{\"ok\":true,\"result\":{}}";
+    let hid = b"{\"ok\":true,\"result\":{\"mouse\":{\"absolute\":false}}}";
+    let (output, _) = invoke(&["capabilities"], vec![ok, ok, ok, hid, ok, ok, ok, ok, ok]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["result"]["capabilities"]["mouse_mode"], "Relative");
+}
+
+#[test]
+fn absolute_move_rejects_relative_and_unknown_modes() {
+    let ok = b"{\"ok\":true,\"result\":{}}";
+    for hid in [
+        b"{\"ok\":true,\"result\":{\"mouse\":{\"absolute\":false}}}".as_slice(),
+        ok.as_slice(),
+    ] {
+        let (output, requests) = invoke(&["move", "1", "2"], vec![ok, ok, hid]);
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("unsupported"));
+        assert_eq!(requests.len(), 3);
+        assert!(requests[2].starts_with("GET /api/hid "));
+    }
+}
+
+#[test]
 fn approval_pending_is_reported_and_polled_before_status() {
     let login = b"{\"ok\":true,\"result\":{\"two_step_required\":true,\"two_step_token\":\"synthetic-approval\",\"expires_in\":60}}";
     let pending = b"{\"ok\":true,\"result\":{\"status\":\"pending\"}}";
