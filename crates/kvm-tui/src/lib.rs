@@ -131,6 +131,46 @@ impl App {
                         }
                     }
                 }
+                for (flag, modifier, right) in [
+                    (
+                        crossterm::event::KeyModifiers::CONTROL,
+                        "ControlLeft",
+                        "ControlRight",
+                    ),
+                    (crossterm::event::KeyModifiers::ALT, "AltLeft", "AltRight"),
+                    (
+                        crossterm::event::KeyModifiers::SHIFT,
+                        "ShiftLeft",
+                        "ShiftRight",
+                    ),
+                    (
+                        crossterm::event::KeyModifiers::SUPER,
+                        "MetaLeft",
+                        "MetaRight",
+                    ),
+                ] {
+                    let held = if self.enhanced_keyboard {
+                        self.held_modifiers.contains(modifier)
+                            || self.held_modifiers.contains(right)
+                    } else {
+                        self.drag_modifiers.contains(&modifier)
+                    };
+                    if event.modifiers.contains(flag) && !held {
+                        if let Err(error) = device.key(modifier, true).await {
+                            self.control = false;
+                            self.clear_input_state();
+                            self.message = error.to_string();
+                            let _ = device.release_inputs().await;
+                            return;
+                        }
+                        if self.enhanced_keyboard {
+                            self.held_modifiers.insert(modifier);
+                            self.synthetic_modifiers.insert(modifier);
+                        } else {
+                            self.drag_modifiers.push(modifier);
+                        }
+                    }
+                }
                 let name = match button {
                     MouseButton::Left => "left",
                     MouseButton::Right => "right",
@@ -1778,6 +1818,54 @@ mod tests {
             *device.calls.lock().unwrap(),
             ["key:ShiftLeft:true", "key:ControlLeft:false"]
         );
+    }
+
+    #[tokio::test]
+    async fn outside_mouse_up_reconciles_new_modifier_in_both_modes() {
+        for enhanced in [false, true] {
+            let device = FakeDevice::default();
+            let mut app = App {
+                enhanced_keyboard: enhanced,
+                ..App::default()
+            };
+            app.refresh(&device).await;
+            app.control = true;
+            app.video = Some(image::RgbImage::new(2, 4));
+            for (kind, column, modifiers) in [
+                (
+                    MouseEventKind::Down(MouseButton::Left),
+                    1,
+                    crossterm::event::KeyModifiers::NONE,
+                ),
+                (
+                    MouseEventKind::Up(MouseButton::Left),
+                    10,
+                    crossterm::event::KeyModifiers::SHIFT,
+                ),
+            ] {
+                app.mouse(
+                    &device,
+                    MouseEvent {
+                        kind,
+                        column,
+                        row: 1,
+                        modifiers,
+                    },
+                    ratatui::layout::Rect::new(0, 0, 4, 4),
+                )
+                .await;
+            }
+            let mut expected = vec![
+                "move:-32768:-32768",
+                "button:left:true",
+                "key:ShiftLeft:true",
+                "button:left:false",
+            ];
+            if !enhanced {
+                expected.push("key:ShiftLeft:false");
+            }
+            assert_eq!(*device.calls.lock().unwrap(), expected);
+        }
     }
 
     #[tokio::test]
