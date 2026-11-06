@@ -61,6 +61,7 @@ async fn device(body: &'static [u8]) -> (Kvmd, Arc<Notify>, tokio::task::JoinHan
         inputs: Default::default(),
         auth_headers: Default::default(),
         approval_token: Default::default(),
+        cookies: Default::default(),
     };
     (device, closed, task)
 }
