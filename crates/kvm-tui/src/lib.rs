@@ -31,6 +31,7 @@ pub struct App {
     enhanced_keyboard: bool,
     drag_modifiers: Vec<&'static str>,
     held_modifiers: std::collections::BTreeSet<&'static str>,
+    synthetic_modifiers: std::collections::BTreeSet<&'static str>,
     /// Most recently decoded video frame, if the stream has delivered one.
     pub video: Option<image::RgbImage>,
     pending: Option<kvm_core::Control>,
@@ -41,6 +42,7 @@ pub struct App {
 impl App {
     fn clear_input_state(&mut self) {
         self.held_modifiers.clear();
+        self.synthetic_modifiers.clear();
         self.drag_modifiers.clear();
     }
 
@@ -219,8 +221,8 @@ impl App {
         }
     }
 
-    /// Handles one key event. Returns false when the interface should exit.
-    pub async fn key(&mut self, device: &dyn Device, code: KeyCode) -> bool {
+    #[cfg(test)]
+    async fn key(&mut self, device: &dyn Device, code: KeyCode) -> bool {
         self.key_event(
             device,
             crossterm::event::KeyEvent::new(code, crossterm::event::KeyModifiers::NONE),
@@ -348,31 +350,32 @@ impl App {
                                         return true;
                                     }
                                     self.held_modifiers.insert(name);
+                                    self.synthetic_modifiers.insert(name);
                                 }
                             }
                         }
                         let release_key = match key.as_str() {
                             "ShiftRight"
                                 if !self.held_modifiers.contains("ShiftRight")
-                                    && self.held_modifiers.contains("ShiftLeft") =>
+                                    && self.synthetic_modifiers.contains("ShiftLeft") =>
                             {
                                 "ShiftLeft"
                             }
                             "ControlRight"
                                 if !self.held_modifiers.contains("ControlRight")
-                                    && self.held_modifiers.contains("ControlLeft") =>
+                                    && self.synthetic_modifiers.contains("ControlLeft") =>
                             {
                                 "ControlLeft"
                             }
                             "AltRight"
                                 if !self.held_modifiers.contains("AltRight")
-                                    && self.held_modifiers.contains("AltLeft") =>
+                                    && self.synthetic_modifiers.contains("AltLeft") =>
                             {
                                 "AltLeft"
                             }
                             "MetaRight"
                                 if !self.held_modifiers.contains("MetaRight")
-                                    && self.held_modifiers.contains("MetaLeft") =>
+                                    && self.synthetic_modifiers.contains("MetaLeft") =>
                             {
                                 "MetaLeft"
                             }
@@ -402,7 +405,9 @@ impl App {
                             if let Some(name) = name {
                                 if event.kind == KeyEventKind::Release {
                                     self.held_modifiers.remove(name);
+                                    self.synthetic_modifiers.remove(name);
                                 } else if event.kind == KeyEventKind::Press {
+                                    self.synthetic_modifiers.remove(name);
                                     self.held_modifiers.insert(name);
                                 }
                             }
@@ -1645,6 +1650,42 @@ mod tests {
         assert!(app.drag_modifiers.is_empty());
         assert!(app.held_modifiers.is_empty());
         assert_eq!(*device.calls.lock().unwrap(), ["release"]);
+    }
+
+    #[tokio::test]
+    async fn untracked_right_release_does_not_release_physical_left() {
+        let device = FakeDevice::default();
+        let mut app = App {
+            enhanced_keyboard: true,
+            ..App::default()
+        };
+        app.refresh(&device).await;
+        app.control = true;
+        for (modifier, kind) in [
+            (
+                crossterm::event::ModifierKeyCode::LeftShift,
+                KeyEventKind::Press,
+            ),
+            (
+                crossterm::event::ModifierKeyCode::RightShift,
+                KeyEventKind::Release,
+            ),
+        ] {
+            app.key_event(
+                &device,
+                crossterm::event::KeyEvent::new_with_kind(
+                    KeyCode::Modifier(modifier),
+                    crossterm::event::KeyModifiers::NONE,
+                    kind,
+                ),
+            )
+            .await;
+        }
+        assert_eq!(
+            *device.calls.lock().unwrap(),
+            ["key:ShiftLeft:true", "key:ShiftRight:false"]
+        );
+        assert!(app.held_modifiers.contains("ShiftLeft"));
     }
 
     #[tokio::test]
