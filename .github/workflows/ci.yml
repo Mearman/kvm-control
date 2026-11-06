@@ -35,6 +35,8 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo test --workspace --locked
+      - name: Test release version metadata
+        run: bash .github/scripts/test-release-version.sh
 
   commits:
     if: github.event_name == 'pull_request'
@@ -110,6 +112,10 @@ jobs:
         with:
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - name: Set release package version
+        env:
+          TAG: ${{ needs.version.outputs.tag }}
+        run: bash .github/scripts/set-release-version.sh "$TAG"
       - name: Build all interfaces
         env:
           TARGET: ${{ matrix.target }}
