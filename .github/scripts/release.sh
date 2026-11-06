@@ -1,11 +1,21 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+verify_checksum() {
+  local directory=$1 archive=$2 expected actual
+  expected=$(cd "$directory" && shasum -a 256 "$archive")
+  actual=$(<"$directory/$archive.sha256")
+  if [ "$actual" != "$expected" ]; then
+    printf 'Checksum file does not match archive %s.\n' "$archive" >&2
+    return 1
+  fi
+}
+
 for target in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu x86_64-apple-darwin aarch64-apple-darwin; do
   archive="kvm-control-${TAG}-${target}.tar.gz"
   test -s "dist/$archive"
   test -s "dist/$archive.sha256"
-  (cd dist && shasum -a 256 -c "$archive.sha256")
+  verify_checksum dist "$archive"
 done
 
 if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
@@ -45,7 +55,7 @@ for target in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu x86_64-apple-da
   archive="kvm-control-${TAG}-${target}.tar.gz"
   test -s "$remote_dir/$archive"
   test -s "$remote_dir/$archive.sha256"
-  (cd "$remote_dir" && shasum -a 256 -c "$archive.sha256")
+  verify_checksum "$remote_dir" "$archive"
   for name in "$archive" "$archive.sha256"; do
     digest="sha256:$(shasum -a 256 "$remote_dir/$name" | cut -d ' ' -f 1)"
     if [ "$(printf '%s\n' "$assets" | awk -F '\t' -v name="$name" -v digest="$digest" '$1 == name && $2 == "uploaded" && $3 == digest { count++ } END { print count+0 }')" != 1 ]; then
