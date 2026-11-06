@@ -28,6 +28,13 @@ pub struct Config {
     pub timeout: Duration,
 }
 
+/// Result of the device's explicit two-step login response.
+#[derive(Debug, PartialEq, Eq)]
+pub enum LoginState {
+    Authenticated,
+    ApprovalPending { expires_in: Option<u64> },
+}
+
 pub struct Kvmd {
     client: Client,
     video_client: Client,
@@ -36,6 +43,7 @@ pub struct Kvmd {
     profile: DeviceProfile,
     inputs: Mutex<Inputs>,
     auth_headers: reqwest::header::HeaderMap,
+    approval_token: Mutex<Option<String>>,
 }
 
 #[derive(Default)]
@@ -89,6 +97,7 @@ impl Kvmd {
             profile: config.profile,
             inputs: Mutex::new(Inputs::default()),
             auth_headers: reqwest::header::HeaderMap::new(),
+            approval_token: Mutex::new(None),
         })
     }
 
@@ -119,7 +128,9 @@ impl Kvmd {
     }
 
     /// Authenticates using KVMD's cookie login. A rejected login may also represent a device-specific challenge.
-    pub async fn login(&self, username: &str, password: &str) -> Result<()> {
+    pub async fn login(&self, username: &str, password: &str) -> Result<LoginState> {
+        let mut pending = self.approval_token.lock().await;
+        *pending = None;
         let url = self.url("auth/login")?;
         let response = self
             .client
@@ -136,7 +147,69 @@ impl Kvmd {
         if body.get("ok").and_then(serde_json::Value::as_bool) != Some(true) {
             return Err(Error::Authentication);
         }
-        Ok(())
+        let result = body
+            .get("result")
+            .ok_or_else(|| Error::InvalidResponse("missing login result".into()))?;
+        if result
+            .get("two_step_required")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+        {
+            let token = result
+                .get("two_step_token")
+                .and_then(serde_json::Value::as_str)
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| Error::InvalidResponse("missing approval token".into()))?;
+            let expires_in = result
+                .get("expires_in")
+                .and_then(serde_json::Value::as_u64)
+                .ok_or_else(|| Error::InvalidResponse("missing approval expiry".into()))?;
+            *pending = Some(token.to_owned());
+            return Ok(LoginState::ApprovalPending {
+                expires_in: Some(expires_in),
+            });
+        }
+        Ok(LoginState::Authenticated)
+    }
+
+    /// Checks a pending GLKVM approval without exposing its temporary token.
+    pub async fn complete_approval(&self) -> Result<LoginState> {
+        let mut pending = self.approval_token.lock().await;
+        let token = pending
+            .as_ref()
+            .ok_or_else(|| Error::InvalidResponse("no approval is pending".into()))?;
+        let response = self
+            .client
+            .post(self.url("auth/two_step_complete")?)
+            .form(&[("two_step_token", token)])
+            .send()
+            .await
+            .map_err(|_| Error::Transport("approval request failed".into()))?;
+        Self::check(response.status())?;
+        let body: serde_json::Value = response
+            .json()
+            .await
+            .map_err(|_| Error::InvalidResponse("invalid approval response".into()))?;
+        if body.get("ok").and_then(serde_json::Value::as_bool) != Some(true) {
+            return Err(Error::Authentication);
+        }
+        let result = body
+            .get("result")
+            .ok_or_else(|| Error::InvalidResponse("missing approval result".into()))?;
+        if result.get("status").and_then(serde_json::Value::as_str) == Some("pending") {
+            return Ok(LoginState::ApprovalPending { expires_in: None });
+        }
+        if result
+            .get("token")
+            .and_then(serde_json::Value::as_str)
+            .is_none_or(str::is_empty)
+        {
+            return Err(Error::InvalidResponse(
+                "missing approved session token".into(),
+            ));
+        }
+        *pending = None;
+        Ok(LoginState::Authenticated)
     }
 
     fn url(&self, path: &str) -> Result<Url> {
