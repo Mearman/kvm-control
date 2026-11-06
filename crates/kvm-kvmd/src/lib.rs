@@ -2,7 +2,8 @@ use std::{collections::BTreeSet, time::Duration};
 
 use async_trait::async_trait;
 use kvm_core::{
-    Capabilities, Capability, Device, DeviceProfile, DeviceStatus, Error, Result, Snapshot,
+    Capabilities, Capability, Confirmation, Control, Device, DeviceProfile, DeviceStatus, Error,
+    PowerAction, Result, Snapshot,
 };
 use reqwest::{Client, Method, StatusCode};
 use tokio::sync::Mutex;
@@ -91,6 +92,26 @@ impl Kvmd {
         }
         // Rebuilding here would lose the configured CA and TLS policy, so headers are held by the device instead.
         device.auth_headers = headers;
+        Ok(device)
+    }
+
+    /// Builds a client using HTTP Basic authentication over the configured HTTPS connection.
+    pub fn with_basic_auth(config: Config, username: &str, password: &str) -> Result<Self> {
+        use base64::Engine;
+        if username.contains(':') || password.contains(':') {
+            return Err(Error::InvalidResponse(
+                "Basic credentials cannot contain colons".into(),
+            ));
+        }
+        let mut device = Self::new(config)?;
+        let encoded =
+            base64::engine::general_purpose::STANDARD.encode(format!("{username}:{password}"));
+        let mut header = reqwest::header::HeaderValue::from_str(&format!("Basic {encoded}"))
+            .map_err(|_| Error::InvalidResponse("invalid Basic credentials".into()))?;
+        header.set_sensitive(true);
+        device
+            .auth_headers
+            .insert(reqwest::header::AUTHORIZATION, header);
         Ok(device)
     }
 
@@ -238,6 +259,31 @@ impl Kvmd {
             .ok_or_else(|| Error::InvalidResponse("missing result".into()))
     }
 
+    async fn discover_endpoint(&self, path: &str) -> Result<Capability> {
+        match self.json(path).await {
+            Ok(state) => {
+                let available = match path {
+                    "gpio" => state
+                        .pointer("/state/outputs")
+                        .and_then(serde_json::Value::as_object)
+                        .map(|outputs| !outputs.is_empty()),
+                    "switch" => state
+                        .pointer("/model/ports")
+                        .and_then(serde_json::Value::as_array)
+                        .map(|ports| !ports.is_empty()),
+                    _ => state.get("enabled").and_then(serde_json::Value::as_bool),
+                };
+                Ok(match available {
+                    Some(true) => Capability::Supported,
+                    Some(false) => Capability::Unsupported,
+                    None => Capability::Unknown,
+                })
+            }
+            Err(Error::Http(404)) => Ok(Capability::Unsupported),
+            Err(error) => Err(error),
+        }
+    }
+
     async fn input(&self, path: &str, params: &[(&str, String)]) -> Result<()> {
         let response = self
             .client
@@ -278,6 +324,10 @@ impl Device for Kvmd {
             keyboard: Capability::Unknown,
             mouse: Capability::Unknown,
             live_video: Capability::Unsupported,
+            power: self.discover_endpoint("atx").await?,
+            switch: self.discover_endpoint("switch").await?,
+            gpio: self.discover_endpoint("gpio").await?,
+            media: self.discover_endpoint("msd").await?,
         })
     }
 
@@ -355,6 +405,56 @@ impl Device for Kvmd {
             &[("to_x", x.to_string()), ("to_y", y.to_string())],
         )
         .await
+    }
+
+    async fn control(&self, operation: Control, _confirmation: Confirmation) -> Result<()> {
+        let (capability, path, params) = match operation {
+            Control::Power(action) => (
+                "atx",
+                "atx/power",
+                vec![
+                    (
+                        "action",
+                        match action {
+                            PowerAction::On => "on",
+                            PowerAction::Off => "off",
+                            PowerAction::OffHard => "off_hard",
+                            PowerAction::ResetHard => "reset_hard",
+                        }
+                        .to_owned(),
+                    ),
+                    ("wait", "true".to_owned()),
+                ],
+            ),
+            Control::Switch { port } => (
+                "switch",
+                "switch/set_active",
+                vec![("port", port.to_string())],
+            ),
+            Control::Gpio { channel, state } => (
+                "gpio",
+                "gpio/switch",
+                vec![
+                    ("channel", channel),
+                    ("state", state.to_string()),
+                    ("wait", "true".to_owned()),
+                ],
+            ),
+            Control::MediaConnect { connected } => (
+                "msd",
+                "msd/set_connected",
+                vec![("connected", connected.to_string())],
+            ),
+            Control::MediaSelect { image } => ("msd", "msd/set_params", vec![("image", image)]),
+        };
+        if self.discover_endpoint(capability).await? != Capability::Supported {
+            return Err(Error::Unsupported(format!(
+                "{capability} capability not confirmed"
+            )));
+        }
+        self.input(path, &params)
+            .await
+            .map_err(|error| Error::AmbiguousControl(error.to_string()))
     }
 
     async fn release_inputs(&self) -> Result<()> {

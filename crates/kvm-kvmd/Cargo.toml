@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 async-trait.workspace = true
+base64 = "0.22"
 kvm-core = { path = "../kvm-core" }
 reqwest.workspace = true
 serde_json.workspace = true
