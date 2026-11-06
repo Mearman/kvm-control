@@ -219,9 +219,14 @@ fn write_snapshot(
     bytes: &[u8],
     write: impl FnOnce(&mut std::fs::File, &[u8]) -> io::Result<()>,
 ) -> Result<(), String> {
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
         .open(path)
         .map_err(|e| format!("cannot create snapshot: {e}"))?;
     if let Err(error) = write(&mut file, bytes) {
@@ -500,6 +505,38 @@ mod tests {
             self.0.lock().unwrap().push("release".into());
             Ok(())
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn snapshot_is_private_with_permissive_umask() {
+        use std::os::unix::fs::PermissionsExt;
+        const CHILD: &str = "KVM_SNAPSHOT_PERMISSION_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let result = std::process::Command::new("sh")
+                .arg("-c")
+                .arg("umask 000; exec \"$1\" --exact tests::snapshot_is_private_with_permissive_umask")
+                .arg("sh")
+                .arg(std::env::current_exe().unwrap())
+                .env(CHILD, "1")
+                .status()
+                .unwrap();
+            assert!(result.success());
+            return;
+        }
+        let directory =
+            std::env::temp_dir().join(format!("kvm-cli-permissions-{}", std::process::id()));
+        std::fs::create_dir(&directory).unwrap();
+        let path = directory.join("snapshot.jpg");
+        write_snapshot(&path, b"first", |file, bytes| file.write_all(bytes)).unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert!(write_snapshot(&path, b"second", |file, bytes| file.write_all(bytes)).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"first");
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_dir(directory).unwrap();
     }
 
     #[test]
