@@ -63,7 +63,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(username) => username,
         None => prompt("Username")?,
     };
-    let password = rpassword::prompt_password("Password: ")?;
+    let password = zeroize::Zeroizing::new(rpassword::prompt_password("Password: ")?);
     if args.insecure_tls {
         eprintln!("Warning: TLS certificate verification is disabled");
     }
