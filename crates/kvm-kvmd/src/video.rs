@@ -14,61 +14,6 @@ const MAX_FRAME: usize = 16 * 1024 * 1024;
 const MAX_BOUNDARY: usize = 70;
 const PING_INTERVAL: Duration = Duration::from_secs(15);
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::{
-        pin::Pin,
-        task::{Context, Poll},
-    };
-
-    struct BlockedSink;
-    impl futures_util::Sink<Message> for BlockedSink {
-        type Error = ();
-        fn poll_ready(
-            self: Pin<&mut Self>,
-            _: &mut Context<'_>,
-        ) -> Poll<std::result::Result<(), ()>> {
-            Poll::Pending
-        }
-        fn start_send(self: Pin<&mut Self>, _: Message) -> std::result::Result<(), ()> {
-            unreachable!()
-        }
-        fn poll_flush(
-            self: Pin<&mut Self>,
-            _: &mut Context<'_>,
-        ) -> Poll<std::result::Result<(), ()>> {
-            Poll::Pending
-        }
-        fn poll_close(
-            self: Pin<&mut Self>,
-            _: &mut Context<'_>,
-        ) -> Poll<std::result::Result<(), ()>> {
-            Poll::Pending
-        }
-    }
-
-    #[tokio::test]
-    async fn blocked_ping_is_timed_out() {
-        assert!(!send_ping(&mut BlockedSink, Duration::from_millis(10)).await);
-    }
-
-    #[test]
-    fn coalesced_chunk_is_split_without_rejecting_later_frames() {
-        let mut buffer = Vec::new();
-        let mut pending = bytes::Bytes::new();
-        absorb_chunk(
-            &mut buffer,
-            &mut pending,
-            bytes::Bytes::from_static(b"frame-oneframe-two"),
-            9,
-        )
-        .unwrap();
-        assert_eq!(buffer, b"frame-one");
-        assert_eq!(pending, b"frame-two"[..]);
-    }
-}
-
 struct Mjpeg {
     response: reqwest::Response,
     boundary: Vec<u8>,
@@ -396,5 +341,60 @@ impl VideoStream for Mjpeg {
         }
         self.buffer.drain(..suffix_start + 2);
         Ok(Some(Snapshot { jpeg: frame }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{
+        pin::Pin,
+        task::{Context, Poll},
+    };
+
+    struct BlockedSink;
+    impl futures_util::Sink<Message> for BlockedSink {
+        type Error = ();
+        fn poll_ready(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+        ) -> Poll<std::result::Result<(), ()>> {
+            Poll::Pending
+        }
+        fn start_send(self: Pin<&mut Self>, _: Message) -> std::result::Result<(), ()> {
+            unreachable!()
+        }
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+        ) -> Poll<std::result::Result<(), ()>> {
+            Poll::Pending
+        }
+        fn poll_close(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+        ) -> Poll<std::result::Result<(), ()>> {
+            Poll::Pending
+        }
+    }
+
+    #[tokio::test]
+    async fn blocked_ping_is_timed_out() {
+        assert!(!send_ping(&mut BlockedSink, Duration::from_millis(10)).await);
+    }
+
+    #[test]
+    fn coalesced_chunk_is_split_without_rejecting_later_frames() {
+        let mut buffer = Vec::new();
+        let mut pending = bytes::Bytes::new();
+        absorb_chunk(
+            &mut buffer,
+            &mut pending,
+            bytes::Bytes::from_static(b"frame-oneframe-two"),
+            9,
+        )
+        .unwrap();
+        assert_eq!(buffer, b"frame-one");
+        assert_eq!(pending, b"frame-two"[..]);
     }
 }

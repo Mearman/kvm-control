@@ -176,7 +176,8 @@ async fn cancelled_partial_frame_can_resume() {
         });
         let (mut http, _) = listener.accept().await.unwrap();
         let mut request = [0; 4096];
-        http.read(&mut request).await.unwrap();
+        let n = http.read(&mut request).await.unwrap();
+        assert!(n > 0);
         http.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: multipart/x-mixed-replace; boundary=frame\r\n\r\n--frame\r\nContent-Type: image/jpeg\r\nContent-Length: 4\r\n\r\n\xff\xd8").await.unwrap();
         wait.await.unwrap();
         http.write_all(b"\xff\xd9\r\n--frame--\r\n").await.unwrap();
