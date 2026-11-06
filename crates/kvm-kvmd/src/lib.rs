@@ -1,4 +1,4 @@
-use std::{collections::BTreeSet, time::Duration};
+use std::{collections::BTreeSet, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use kvm_core::{
@@ -33,6 +33,7 @@ pub struct Kvmd {
     inputs: Mutex<Inputs>,
     auth_headers: reqwest::header::HeaderMap,
     approval_token: Mutex<Option<String>>,
+    cookies: Arc<reqwest::cookie::Jar>,
 }
 
 #[derive(Default)]
@@ -55,9 +56,10 @@ impl Kvmd {
                 "endpoint must be an HTTPS URL without credentials, query or fragment".into(),
             ));
         }
+        let cookies = Arc::new(reqwest::cookie::Jar::default());
         let mut builder = Client::builder()
             .timeout(config.timeout)
-            .cookie_store(true)
+            .cookie_provider(cookies.clone())
             .retry(reqwest::retry::never())
             .redirect(reqwest::redirect::Policy::none())
             .danger_accept_invalid_certs(config.insecure_tls);
@@ -76,6 +78,7 @@ impl Kvmd {
             inputs: Mutex::new(Inputs::default()),
             auth_headers: reqwest::header::HeaderMap::new(),
             approval_token: Mutex::new(None),
+            cookies,
         })
     }
 
@@ -127,8 +130,15 @@ impl Kvmd {
 
     /// Authenticates using KVMD's cookie login. A rejected login may also represent a device-specific challenge.
     pub async fn login(&self, username: &str, password: &str) -> Result<LoginState> {
+        if !self.auth_headers.is_empty() {
+            return Err(Error::InvalidResponse(
+                "cookie login cannot replace configured header credentials".into(),
+            ));
+        }
         let mut pending = self.approval_token.lock().await;
         *pending = None;
+        self.cookies
+            .add_cookie_str("auth_token=; Max-Age=0; Path=/", &self.endpoint);
         let url = self.url("auth/login")?;
         let response = self
             .client
@@ -479,21 +489,26 @@ impl Device for Kvmd {
             Control::Power(PowerAction::ResetHard) => false,
             Control::Switch { port } => {
                 state
-                    .pointer("/summary/active_port")
-                    .and_then(serde_json::Value::as_u64)
-                    == Some(u64::from(port))
+                    .pointer("/summary/synced")
+                    .and_then(serde_json::Value::as_bool)
+                    == Some(true)
+                    && state
+                        .pointer("/summary/active_port")
+                        .and_then(serde_json::Value::as_u64)
+                        == Some(u64::from(port))
             }
             Control::Gpio {
                 channel,
                 state: expected,
-            } => {
-                state
-                    .pointer("/state/outputs")
-                    .and_then(|v| v.get(&channel))
-                    .and_then(|v| v.get("state"))
-                    .and_then(serde_json::Value::as_bool)
-                    == Some(expected)
-            }
+            } => state
+                .pointer("/state/outputs")
+                .and_then(|v| v.get(&channel))
+                .is_some_and(|output| {
+                    output.get("online").and_then(serde_json::Value::as_bool) == Some(true)
+                        && output.get("busy").and_then(serde_json::Value::as_bool) == Some(false)
+                        && output.get("state").and_then(serde_json::Value::as_bool)
+                            == Some(expected)
+                }),
             Control::MediaConnect { connected } => {
                 state
                     .pointer("/drive/connected")
