@@ -53,8 +53,17 @@ pub struct Snapshot {
     pub jpeg: Vec<u8>,
 }
 
+/// A pull-based video stream. Dropping it releases its transport resources.
+#[async_trait]
+pub trait VideoStream: Send {
+    /// Returns the next complete JPEG, or `None` when the stream ends normally.
+    async fn next_frame(&mut self) -> Result<Option<Snapshot>>;
+}
+
 #[async_trait]
 pub trait Device: Send + Sync {
+    /// Opens a continuous video stream when supported by the device.
+    async fn video(&self) -> Result<Box<dyn VideoStream>>;
     async fn status(&self) -> Result<DeviceStatus>;
     async fn capabilities(&self) -> Result<Capabilities>;
     async fn snapshot(&self) -> Result<Snapshot>;
