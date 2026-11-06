@@ -15,6 +15,8 @@ pub enum Error {
     InvalidResponse(String),
     #[error("input outcome is uncertain; do not replay automatically: {0}")]
     AmbiguousInput(String),
+    #[error("control outcome is uncertain; do not replay automatically: {0}")]
+    AmbiguousControl(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -46,6 +48,40 @@ pub struct Capabilities {
     pub keyboard: Capability,
     pub mouse: Capability,
     pub live_video: Capability,
+    pub power: Capability,
+    pub switch: Capability,
+    pub gpio: Capability,
+    pub media: Capability,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub enum PowerAction {
+    On,
+    Off,
+    OffHard,
+    ResetHard,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum Control {
+    Power(PowerAction),
+    Switch { port: u32 },
+    Gpio { channel: String, state: bool },
+    MediaConnect { connected: bool },
+    MediaSelect { image: String },
+}
+
+/// Explicit consent for one consequential device operation.
+pub struct Confirmation(());
+impl Confirmation {
+    pub fn new() -> Self {
+        Self(())
+    }
+}
+impl Default for Confirmation {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -71,4 +107,5 @@ pub trait Device: Send + Sync {
     async fn mouse_button(&self, button: &str, pressed: bool) -> Result<()>;
     async fn mouse_move(&self, x: i16, y: i16) -> Result<()>;
     async fn release_inputs(&self) -> Result<()>;
+    async fn control(&self, operation: Control, confirmation: Confirmation) -> Result<()>;
 }
