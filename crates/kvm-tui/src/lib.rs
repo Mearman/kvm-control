@@ -1089,7 +1089,15 @@ mod tests {
         app.refresh(&device).await;
         app.key(&device, KeyCode::Char('i')).await;
         app.key(&device, KeyCode::Char('!')).await;
-        assert_eq!(*device.calls.lock().unwrap(), ["key:ShiftLeft:true", "key:Digit1:true", "key:Digit1:false", "key:ShiftLeft:false"]);
+        assert_eq!(
+            *device.calls.lock().unwrap(),
+            [
+                "key:ShiftLeft:true",
+                "key:Digit1:true",
+                "key:Digit1:false",
+                "key:ShiftLeft:false"
+            ]
+        );
     }
 
     #[tokio::test]
