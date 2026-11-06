@@ -56,6 +56,7 @@ async fn device(body: &'static [u8]) -> (Kvmd, Arc<Notify>, tokio::task::JoinHan
         client: tokio::sync::RwLock::new(crate::Session {
             client: client.clone(),
             video: client,
+            cookies: Default::default(),
         }),
         config: Config {
             endpoint: Url::parse(&format!("http://{address}/proxy/")).unwrap(),
@@ -135,7 +136,7 @@ async fn trusted_tls_login_cookie_reaches_lease_and_stream() {
             .find_map(|line| line.strip_prefix("sec-websocket-key: "))
             .unwrap();
         let accept = tokio_tungstenite::tungstenite::handshake::derive_accept_key(key.as_bytes());
-        tls.write_all(format!("HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Accept: {accept}\r\n\r\n").as_bytes()).await.unwrap();
+        tls.write_all(format!("HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSet-Cookie: auth_token=attacker; Path=/\r\nSec-WebSocket-Accept: {accept}\r\n\r\n").as_bytes()).await.unwrap();
         let watcher = tokio::spawn(async move {
             let mut ws = tokio_tungstenite::WebSocketStream::from_raw_socket(
                 tls,
@@ -225,7 +226,7 @@ async fn video_auth_headers(basic: bool) {
             .find_map(|line| line.strip_prefix("sec-websocket-key: "))
             .unwrap();
         let accept = tokio_tungstenite::tungstenite::handshake::derive_accept_key(key.as_bytes());
-        tls.write_all(format!("HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Accept: {accept}\r\n\r\n").as_bytes()).await.unwrap();
+        tls.write_all(format!("HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSet-Cookie: auth_token=attacker; Path=/\r\nSec-WebSocket-Accept: {accept}\r\n\r\n").as_bytes()).await.unwrap();
         let watcher = tokio::spawn(async move {
             let mut ws = tokio_tungstenite::WebSocketStream::from_raw_socket(
                 tls,
@@ -319,6 +320,7 @@ async fn cancelled_partial_frame_can_resume() {
         client: tokio::sync::RwLock::new(crate::Session {
             client: client.clone(),
             video: client,
+            cookies: Default::default(),
         }),
         config: Config {
             endpoint: Url::parse(&format!("http://{address}/proxy/")).unwrap(),
@@ -387,6 +389,7 @@ async fn relogin_waits_for_video_establishment() {
         client: tokio::sync::RwLock::new(crate::Session {
             client: client.clone(),
             video: client,
+            cookies: Default::default(),
         }),
         config: Config {
             endpoint: endpoint.clone(),
@@ -449,6 +452,7 @@ async fn coalesced_http_response_delivers_multiple_frames() {
         client: tokio::sync::RwLock::new(crate::Session {
             client: client.clone(),
             video: client,
+            cookies: Default::default(),
         }),
         config: Config {
             endpoint: Url::parse(&format!("http://{address}/proxy/")).unwrap(),
