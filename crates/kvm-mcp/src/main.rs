@@ -80,8 +80,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
     }
     drop(password);
     let allow_control = env::var("KVM_ALLOW_CONTROL").as_deref() == Ok("1");
+    #[cfg(unix)]
+    let transport = (
+        tokio::net::unix::pipe::Receiver::from_file(fs::File::open("/dev/stdin")?)?,
+        tokio::io::stdout(),
+    );
+    #[cfg(not(unix))]
+    let transport = rmcp::transport::stdio();
     let service = Server::new(device.clone(), allow_control)
-        .serve(rmcp::transport::stdio())
+        .serve(transport)
         .await?;
     let cancel = service.cancellation_token();
     let signal_task = tokio::spawn(async move {
@@ -92,6 +99,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     });
     let outcome = service.waiting().await;
     signal_task.abort();
+    let _ = signal_task.await;
     if allow_control && let Err(error) = device.release_inputs().await {
         eprintln!("Input cleanup uncertain: {error}");
     }

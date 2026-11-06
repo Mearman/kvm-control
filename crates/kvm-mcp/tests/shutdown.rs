@@ -115,4 +115,5 @@ async fn sigterm_releases_pressed_key() {
     assert!(status.success());
     assert_eq!(*events.lock().unwrap(), vec![true, false]);
     server.abort();
+    assert!(server.await.unwrap_err().is_cancelled());
 }
