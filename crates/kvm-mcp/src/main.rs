@@ -87,7 +87,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
     );
     #[cfg(not(unix))]
     let transport = rmcp::transport::stdio();
-    let service = Server::new(device.clone(), allow_control)
+    let allow_consequential = env::var("KVM_ALLOW_CONSEQUENTIAL").as_deref() == Ok("1");
+    let service = Server::new(device.clone(), allow_control, allow_consequential)
         .serve(transport)
         .await?;
     let cancel = service.cancellation_token();

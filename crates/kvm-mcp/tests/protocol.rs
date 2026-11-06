@@ -1,5 +1,7 @@
 use async_trait::async_trait;
-use kvm_core::{Capabilities, Capability, Device, DeviceStatus, Result, Snapshot};
+use kvm_core::{
+    Capabilities, Capability, Confirmation, Control, Device, DeviceStatus, Result, Snapshot,
+};
 use kvm_mcp::Server;
 use rmcp::ServiceExt;
 use serde_json::{Value, json};
@@ -26,6 +28,10 @@ impl Device for Fake {
             keyboard: Capability::Unknown,
             mouse: Capability::Unknown,
             live_video: Capability::Unsupported,
+            power: Capability::Unknown,
+            switch: Capability::Unknown,
+            gpio: Capability::Unknown,
+            media: Capability::Unknown,
         })
     }
     async fn snapshot(&self) -> Result<Snapshot> {
@@ -46,6 +52,10 @@ impl Device for Fake {
     async fn release_inputs(&self) -> Result<()> {
         Ok(())
     }
+    async fn control(&self, _: Control, _: Confirmation) -> Result<()> {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
 }
 
 #[tokio::test]
@@ -53,7 +63,7 @@ async fn protocol_round_trip() {
     let fake = Arc::new(Fake(AtomicUsize::new(0)));
     let (client, server) = tokio::io::duplex(16384);
     let task = tokio::spawn(async move {
-        Server::new(fake.clone(), false)
+        Server::new(fake.clone(), false, false)
             .serve(server)
             .await
             .unwrap()
@@ -101,6 +111,8 @@ async fn protocol_round_trip() {
     assert_eq!(image["result"]["content"][0]["data"], "/9j/2Q==");
     let denied = call(&mut write, &mut lines, json!({"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"key","arguments":{"key":"KeyA","pressed":true}}})).await;
     assert_eq!(denied["result"]["isError"], true);
+    let denied_power = call(&mut write, &mut lines, json!({"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"consequential","arguments":{"operation":{"kind":"power","action":"off_hard","confirmed":true}}}})).await;
+    assert_eq!(denied_power["result"]["isError"], true);
     drop(write);
     drop(lines);
     let fake = task.await.unwrap();

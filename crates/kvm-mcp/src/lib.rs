@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use base64::{Engine, engine::general_purpose::STANDARD};
-use kvm_core::Device;
+use kvm_core::{Confirmation, Control, Device, PowerAction};
 use rmcp::{
     ServerHandler,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
@@ -14,6 +14,7 @@ use serde::Deserialize;
 pub struct Server {
     device: Arc<dyn Device>,
     allow_control: bool,
+    allow_consequential: bool,
     tool_router: ToolRouter<Self>,
 }
 
@@ -35,6 +36,46 @@ pub struct MoveInput {
     pub y: i16,
 }
 
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct ConsequentialRequest {
+    pub operation: ConsequentialInput,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ConsequentialInput {
+    Power {
+        action: PowerInput,
+        confirmed: bool,
+    },
+    Switch {
+        port: u32,
+        confirmed: bool,
+    },
+    Gpio {
+        channel: String,
+        state: bool,
+        confirmed: bool,
+    },
+    MediaConnect {
+        connected: bool,
+        confirmed: bool,
+    },
+    MediaSelect {
+        image: String,
+        confirmed: bool,
+    },
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum PowerInput {
+    On,
+    Off,
+    OffHard,
+    ResetHard,
+}
+
 fn result<T: serde::Serialize>(value: kvm_core::Result<T>) -> CallToolResult {
     match value {
         Ok(value) => match serde_json::to_string(&value) {
@@ -49,10 +90,11 @@ fn result<T: serde::Serialize>(value: kvm_core::Result<T>) -> CallToolResult {
 
 #[tool_router]
 impl Server {
-    pub fn new(device: Arc<dyn Device>, allow_control: bool) -> Self {
+    pub fn new(device: Arc<dyn Device>, allow_control: bool, allow_consequential: bool) -> Self {
         Self {
             device,
             allow_control,
+            allow_consequential,
             tool_router: Self::tool_router(),
         }
     }
@@ -110,6 +152,48 @@ impl Server {
             return denied();
         }
         result(self.device.mouse_move(input.x, input.y).await)
+    }
+
+    #[tool(
+        description = "Perform a consequential power, switch, GPIO or media operation. Requires separate server-side authorisation and confirmation for this operation. Never replay an uncertain outcome."
+    )]
+    async fn consequential(
+        &self,
+        Parameters(ConsequentialRequest { operation: input }): Parameters<ConsequentialRequest>,
+    ) -> CallToolResult {
+        if !self.allow_consequential {
+            return denied();
+        }
+        let (operation, confirmed) = match input {
+            ConsequentialInput::Power { action, confirmed } => (
+                Control::Power(match action {
+                    PowerInput::On => PowerAction::On,
+                    PowerInput::Off => PowerAction::Off,
+                    PowerInput::OffHard => PowerAction::OffHard,
+                    PowerInput::ResetHard => PowerAction::ResetHard,
+                }),
+                confirmed,
+            ),
+            ConsequentialInput::Switch { port, confirmed } => (Control::Switch { port }, confirmed),
+            ConsequentialInput::Gpio {
+                channel,
+                state,
+                confirmed,
+            } => (Control::Gpio { channel, state }, confirmed),
+            ConsequentialInput::MediaConnect {
+                connected,
+                confirmed,
+            } => (Control::MediaConnect { connected }, confirmed),
+            ConsequentialInput::MediaSelect { image, confirmed } => {
+                (Control::MediaSelect { image }, confirmed)
+            }
+        };
+        if !confirmed {
+            return CallToolResult::error(vec![ContentBlock::text(
+                "Explicit confirmation is required",
+            )]);
+        }
+        result(self.device.control(operation, Confirmation::new()).await)
     }
 
     #[tool(
