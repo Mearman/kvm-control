@@ -383,6 +383,52 @@ mod tests {
         assert!(!send_ping(&mut BlockedSink, Duration::from_millis(10)).await);
     }
 
+    #[tokio::test]
+    async fn blocked_network_socket_times_out_ping() {
+        use tokio::net::{TcpListener, TcpStream};
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let connection = TcpStream::connect(listener.local_addr().unwrap());
+        let (client, peer) = tokio::join!(connection, listener.accept());
+        let client = client.unwrap();
+        let (_peer, _) = peer.unwrap();
+        let mut filled = 0usize;
+        let data = [0u8; 65536];
+        loop {
+            client.writable().await.unwrap();
+            match client.try_write(&data) {
+                Ok(n) => {
+                    filled += n;
+                    if n == 0 {
+                        panic!("socket closed");
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(e) => panic!("socket write failed: {e}"),
+            }
+            assert!(filled < 64 * 1024 * 1024, "socket did not backpressure");
+        }
+        let mut ws = tokio_tungstenite::WebSocketStream::from_raw_socket(
+            client,
+            tokio_tungstenite::tungstenite::protocol::Role::Client,
+            None,
+        )
+        .await;
+        let result = tokio::time::timeout(Duration::from_millis(50), async {
+            loop {
+                ws.send(tokio_tungstenite::tungstenite::Message::Binary(
+                    vec![0; 65536].into(),
+                ))
+                .await
+                .unwrap();
+            }
+        })
+        .await;
+        assert!(
+            result.is_err(),
+            "saturated socket unexpectedly accepted unlimited websocket messages"
+        );
+    }
+
     #[test]
     fn coalesced_chunk_is_split_without_rejecting_later_frames() {
         let mut buffer = Vec::new();
