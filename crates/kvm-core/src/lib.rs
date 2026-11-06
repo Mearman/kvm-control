@@ -41,12 +41,21 @@ pub enum Capability {
     Unknown,
 }
 
+/// Device-reported mouse movement mode; unknown means the firmware did not expose it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MouseMode {
+    Absolute,
+    Relative,
+    Unknown,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Capabilities {
     pub status: Capability,
     pub snapshot: Capability,
     pub keyboard: Capability,
     pub mouse: Capability,
+    pub mouse_mode: MouseMode,
     pub live_video: Capability,
     pub power: Capability,
     pub switch: Capability,

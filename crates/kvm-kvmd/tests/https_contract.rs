@@ -1,5 +1,5 @@
 use std::{
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}},
     time::Duration,
 };
 
@@ -12,14 +12,15 @@ use axum::{
 };
 use axum_server::tls_rustls::RustlsConfig;
 use kvm_core::{
-    Capability, Confirmation, Control, ControlOutcome, Device, DeviceProfile, Error, PowerAction,
+    Capability, Confirmation, Control, ControlOutcome, Device, DeviceProfile, Error, MouseMode,
+    PowerAction,
 };
 use kvm_kvmd::{Config, Kvmd, LoginState};
 use serde_json::json;
 use url::Url;
 
 #[derive(Clone, Default)]
-struct Calls(Arc<Mutex<Vec<String>>>);
+struct Calls(Arc<Mutex<Vec<String>>>, Arc<AtomicBool>, Arc<AtomicBool>);
 
 async fn login(State(calls): State<Calls>, uri: Uri, body: String) -> impl IntoResponse {
     calls
@@ -106,7 +107,7 @@ async fn status(State(calls): State<Calls>, uri: Uri, headers: HeaderMap) -> imp
         );
     }
     let result = if uri.path().ends_with("/hid") {
-        json!({"enabled": true, "online": true, "keyboard": {"online": true, "outputs": {"available": [], "active": ""}}, "mouse": {"online": true, "absolute": true, "outputs": {"available": [], "active": ""}}})
+        json!({"enabled": true, "online": true, "keyboard": {"online": true, "outputs": {"available": [], "active": ""}}, "mouse": {"online": true, "absolute": !calls.2.load(Ordering::SeqCst), "outputs": {"available": [], "active": ""}}})
     } else {
         json!({"online": true})
     };
@@ -208,6 +209,8 @@ async fn fixture() -> (Url, Vec<u8>, Calls, tokio::task::JoinHandle<()>) {
         .route("/api/switch", get(capability))
         .route("/api/gpio", get(capability))
         .route("/api/msd", get(capability))
+        .route("/api/hid/events/send_key", post(status))
+        .route("/api/hid/events/send_mouse_move", post(control))
         .route("/api/atx/power", post(control))
         .route("/api/switch/set_active", post(control))
         .route("/api/gpio/switch", post(control))
@@ -430,6 +433,36 @@ async fn failed_or_pending_relogin_does_not_reuse_previous_cookie() {
         device.check_auth().await,
         Err(Error::Authentication)
     ));
+    server.abort();
+}
+
+#[tokio::test]
+async fn absolute_move_rechecks_firmware_mouse_mode() {
+    let (endpoint, ca, calls, server) = fixture().await;
+    let device = client(endpoint, Some(ca));
+    device.login("test-user", "test-password").await.unwrap();
+    assert_eq!(
+        device.capabilities().await.unwrap().mouse_mode,
+        MouseMode::Absolute
+    );
+    device.mouse_move(10, 20).await.unwrap();
+    calls.2.store(true, Ordering::SeqCst);
+    assert_eq!(
+        device.capabilities().await.unwrap().mouse_mode,
+        MouseMode::Relative
+    );
+    assert!(matches!(
+        device.mouse_move(30, 40).await,
+        Err(Error::Unsupported(_))
+    ));
+    let paths = calls.0.lock().unwrap();
+    assert_eq!(
+        paths
+            .iter()
+            .filter(|p| p.starts_with("/api/hid/events/send_mouse_move?"))
+            .count(),
+        1
+    );
     server.abort();
 }
 
