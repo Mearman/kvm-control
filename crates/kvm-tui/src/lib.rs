@@ -761,6 +761,22 @@ where
             })
             .map_err(io::Error::other)?;
         if let Some(receiver) = &mut video_rx
+            && receiver.has_changed().is_err()
+        {
+            let item = receiver.borrow_and_update().clone();
+            app.video = None;
+            app.control = false;
+            app.message = match item {
+                Some(Err(error)) => error,
+                _ => "Video stream closed".into(),
+            };
+            if let Err(error) = device.release_inputs().await {
+                app.message = format!("{}; input cleanup uncertain: {error}", app.message);
+            }
+            drop(stream.take());
+            video_rx = None;
+        }
+        if let Some(receiver) = &mut video_rx
             && receiver.has_changed().unwrap_or(false)
         {
             let item = receiver.borrow_and_update().clone();
@@ -869,9 +885,11 @@ mod tests {
         fail_restart: bool,
         video_frame: Option<Vec<u8>>,
         dropped: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        fail_video_after_frame: bool,
     }
     struct FakeStream {
         jpeg: Option<Vec<u8>>,
+        fail_after_frame: bool,
         dropped: std::sync::Arc<std::sync::atomic::AtomicBool>,
     }
     impl Drop for FakeStream {
@@ -885,6 +903,8 @@ mod tests {
         async fn next_frame(&mut self) -> kvm_core::Result<Option<kvm_core::Snapshot>> {
             if let Some(jpeg) = self.jpeg.take() {
                 Ok(Some(kvm_core::Snapshot { jpeg }))
+            } else if self.fail_after_frame {
+                Err(kvm_core::Error::Transport("stream failed".into()))
             } else {
                 std::future::pending().await
             }
@@ -902,6 +922,7 @@ mod tests {
             match &self.video_frame {
                 Some(jpeg) => Ok(Box::new(FakeStream {
                     jpeg: Some(jpeg.clone()),
+                    fail_after_frame: self.fail_video_after_frame,
                     dropped: self.dropped.clone(),
                 })),
                 None => Err(kvm_core::Error::Unsupported("video".into())),
@@ -969,6 +990,56 @@ mod tests {
             self.calls.lock().unwrap().push("power".into());
             Ok(kvm_core::ControlOutcome::Unverified)
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn closed_stream_reports_last_error_and_releases_inputs() {
+        let mut jpeg = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new(&mut jpeg)
+            .encode_image(&image::RgbImage::new(8, 8))
+            .unwrap();
+        let device = FakeDevice {
+            video_frame: Some(jpeg),
+            fail_video_after_frame: true,
+            ..FakeDevice::default()
+        };
+        let mut terminal = Terminal::new(TestBackend::new(60, 16)).unwrap();
+        let mut count = 0;
+        run_loop(
+            &mut terminal,
+            &device,
+            &ratatui_image::picker::Picker::halfblocks(),
+            false,
+            || {
+                count += 1;
+                if count == 1 {
+                    return Ok(Some(Event::Key(crossterm::event::KeyEvent::new(
+                        KeyCode::Char('v'),
+                        crossterm::event::KeyModifiers::NONE,
+                    ))));
+                }
+                if count > 100 && device.dropped.load(std::sync::atomic::Ordering::SeqCst) {
+                    return Ok(Some(Event::Key(crossterm::event::KeyEvent::new(
+                        KeyCode::Char('q'),
+                        crossterm::event::KeyModifiers::NONE,
+                    ))));
+                }
+                std::thread::yield_now();
+                Ok(None)
+            },
+        )
+        .await
+        .unwrap();
+        let content = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(content.contains("stream failed"));
+        assert!(!content.contains('▀'));
+        assert_eq!(*device.calls.lock().unwrap(), ["release"]);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
