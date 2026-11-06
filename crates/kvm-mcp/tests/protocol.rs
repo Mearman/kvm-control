@@ -15,6 +15,9 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 struct Fake(AtomicUsize);
 #[async_trait]
 impl Device for Fake {
+    async fn video(&self) -> Result<Box<dyn kvm_core::VideoStream>> {
+        Err(kvm_core::Error::Unsupported("video".into()))
+    }
     async fn status(&self) -> Result<DeviceStatus> {
         Ok(DeviceStatus {
             info: json!({}),
