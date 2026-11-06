@@ -381,10 +381,22 @@ impl App {
                             }
                             _ => key.as_str(),
                         };
+                        let synthetic_flag = match release_key {
+                            "ShiftLeft" => Some(crossterm::event::KeyModifiers::SHIFT),
+                            "ControlLeft" => Some(crossterm::event::KeyModifiers::CONTROL),
+                            "AltLeft" => Some(crossterm::event::KeyModifiers::ALT),
+                            "MetaLeft" => Some(crossterm::event::KeyModifiers::SUPER),
+                            _ => None,
+                        };
+                        let keep_synthetic = event.kind == KeyEventKind::Release
+                            && self.synthetic_modifiers.contains(release_key)
+                            && synthetic_flag.is_some_and(|flag| event.modifiers.contains(flag));
                         let result = match event.kind {
                             KeyEventKind::Press => device.key(&key, true).await,
-                            KeyEventKind::Release => device.key(release_key, false).await,
-                            KeyEventKind::Repeat => Ok(()),
+                            KeyEventKind::Release if !keep_synthetic => {
+                                device.key(release_key, false).await
+                            }
+                            KeyEventKind::Release | KeyEventKind::Repeat => Ok(()),
                         };
                         if result.is_ok() && matches!(code, KeyCode::Modifier(_)) {
                             let name = match if event.kind == KeyEventKind::Release {
@@ -403,7 +415,7 @@ impl App {
                                 _ => None,
                             };
                             if let Some(name) = name {
-                                if event.kind == KeyEventKind::Release {
+                                if event.kind == KeyEventKind::Release && !keep_synthetic {
                                     self.held_modifiers.remove(name);
                                     self.synthetic_modifiers.remove(name);
                                 } else if event.kind == KeyEventKind::Press {
@@ -1650,6 +1662,52 @@ mod tests {
         assert!(app.drag_modifiers.is_empty());
         assert!(app.held_modifiers.is_empty());
         assert_eq!(*device.calls.lock().unwrap(), ["release"]);
+    }
+
+    #[tokio::test]
+    async fn preheld_both_shifts_remain_active_until_last_release() {
+        let device = FakeDevice::default();
+        let mut app = App {
+            enhanced_keyboard: true,
+            ..App::default()
+        };
+        app.refresh(&device).await;
+        app.control = true;
+        app.key_event(
+            &device,
+            crossterm::event::KeyEvent::new_with_kind(
+                KeyCode::Char('a'),
+                crossterm::event::KeyModifiers::SHIFT,
+                KeyEventKind::Press,
+            ),
+        )
+        .await;
+        app.key_event(
+            &device,
+            crossterm::event::KeyEvent::new_with_kind(
+                KeyCode::Modifier(crossterm::event::ModifierKeyCode::LeftShift),
+                crossterm::event::KeyModifiers::SHIFT,
+                KeyEventKind::Release,
+            ),
+        )
+        .await;
+        assert_eq!(
+            *device.calls.lock().unwrap(),
+            ["key:ShiftLeft:true", "key:KeyA:true"]
+        );
+        app.key_event(
+            &device,
+            crossterm::event::KeyEvent::new_with_kind(
+                KeyCode::Modifier(crossterm::event::ModifierKeyCode::RightShift),
+                crossterm::event::KeyModifiers::NONE,
+                KeyEventKind::Release,
+            ),
+        )
+        .await;
+        assert_eq!(
+            *device.calls.lock().unwrap(),
+            ["key:ShiftLeft:true", "key:KeyA:true", "key:ShiftLeft:false"]
+        );
     }
 
     #[tokio::test]
