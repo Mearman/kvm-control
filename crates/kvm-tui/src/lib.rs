@@ -29,6 +29,8 @@ pub struct App {
     pub message: String,
     pub control: bool,
     enhanced_keyboard: bool,
+    drag_modifiers: Vec<&'static str>,
+    held_modifiers: std::collections::BTreeSet<&'static str>,
     /// Most recently decoded video frame, if the stream has delivered one.
     pub video: Option<image::RgbImage>,
     pending: Option<kvm_core::Control>,
@@ -111,6 +113,16 @@ impl App {
                         Err(cleanup) => format!("{error}; input cleanup uncertain: {cleanup}"),
                     };
                 }
+                if !self.enhanced_keyboard {
+                    for modifier in std::mem::take(&mut self.drag_modifiers).iter().rev() {
+                        if let Err(error) = device.key(modifier, false).await {
+                            self.control = false;
+                            self.message = error.to_string();
+                            let _ = device.release_inputs().await;
+                            break;
+                        }
+                    }
+                }
             }
             return;
         };
@@ -126,7 +138,7 @@ impl App {
             }
         }
         let mut modifier_error = None;
-        if !self.enhanced_keyboard {
+        if !self.enhanced_keyboard && self.drag_modifiers.is_empty() {
             for modifier in &modifiers {
                 if let Err(error) = device.key(modifier, true).await {
                     modifier_error = Some(error);
@@ -157,8 +169,26 @@ impl App {
                 _ => Ok(()),
             }
         };
-        if !self.enhanced_keyboard && result.is_ok() {
-            for modifier in modifiers.iter().rev() {
+        if !self.enhanced_keyboard
+            && result.is_ok()
+            && matches!(event.kind, MouseEventKind::Down(_))
+            && self.drag_modifiers.is_empty()
+        {
+            self.drag_modifiers = modifiers.clone();
+        }
+        if !self.enhanced_keyboard
+            && result.is_ok()
+            && !matches!(
+                event.kind,
+                MouseEventKind::Down(_) | MouseEventKind::Drag(_)
+            )
+        {
+            let release = if self.drag_modifiers.is_empty() {
+                modifiers
+            } else {
+                std::mem::take(&mut self.drag_modifiers)
+            };
+            for modifier in release.iter().rev() {
                 if let Err(error) = device.key(modifier, false).await {
                     result = Err(error);
                     break;
@@ -290,11 +320,47 @@ impl App {
             {
                 if let Some(key) = key_name(code) {
                     if self.enhanced_keyboard {
+                        if !matches!(code, KeyCode::Modifier(_)) {
+                            for (flag, name) in [
+                                (crossterm::event::KeyModifiers::SHIFT, "ShiftLeft"),
+                                (crossterm::event::KeyModifiers::CONTROL, "ControlLeft"),
+                                (crossterm::event::KeyModifiers::ALT, "AltLeft"),
+                                (crossterm::event::KeyModifiers::SUPER, "MetaLeft"),
+                            ] {
+                                if event.modifiers.contains(flag)
+                                    && !self.held_modifiers.contains(name)
+                                {
+                                    if let Err(error) = device.key(name, true).await {
+                                        self.control = false;
+                                        self.message = error.to_string();
+                                        let _ = device.release_inputs().await;
+                                        return true;
+                                    }
+                                    self.held_modifiers.insert(name);
+                                }
+                            }
+                        }
                         let result = match event.kind {
                             KeyEventKind::Press => device.key(&key, true).await,
                             KeyEventKind::Release => device.key(&key, false).await,
                             KeyEventKind::Repeat => Ok(()),
                         };
+                        if result.is_ok() && matches!(code, KeyCode::Modifier(_)) {
+                            let name = match key.as_str() {
+                                "ShiftLeft" => Some("ShiftLeft"),
+                                "ControlLeft" => Some("ControlLeft"),
+                                "AltLeft" => Some("AltLeft"),
+                                "MetaLeft" => Some("MetaLeft"),
+                                _ => None,
+                            };
+                            if let Some(name) = name {
+                                if event.kind == KeyEventKind::Release {
+                                    self.held_modifiers.remove(name);
+                                } else if event.kind == KeyEventKind::Press {
+                                    self.held_modifiers.insert(name);
+                                }
+                            }
+                        }
                         if let Err(error) = result {
                             self.control = false;
                             let cleanup = device.release_inputs().await;
@@ -606,10 +672,18 @@ impl TerminalModes for SystemTerminal {
         disable_raw_mode()
     }
     fn mouse_on(&mut self) -> io::Result<()> {
-        execute!(io::stdout(), EnableMouseCapture)
+        execute!(
+            io::stdout(),
+            EnableMouseCapture,
+            crossterm::event::EnableFocusChange
+        )
     }
     fn mouse_off(&mut self) -> io::Result<()> {
-        execute!(io::stdout(), DisableMouseCapture)
+        execute!(
+            io::stdout(),
+            DisableMouseCapture,
+            crossterm::event::DisableFocusChange
+        )
     }
 }
 
@@ -672,8 +746,24 @@ impl<T: TerminalModes> Drop for TerminalGuard<T> {
     }
 }
 
-/// Runs the TUI for an already authenticated device. Input cleanup is attempted on every normal return.
-pub async fn run(device: &dyn Device) -> io::Result<()> {
+struct InputCleanup(Option<std::sync::Arc<dyn Device>>);
+impl Drop for InputCleanup {
+    fn drop(&mut self) {
+        if let Some(device) = self.0.take()
+            && let Ok(runtime) = tokio::runtime::Handle::try_current()
+        {
+            runtime.spawn(async move {
+                if let Err(error) = device.release_inputs().await {
+                    eprintln!("Input cleanup uncertain after cancellation: {error}");
+                }
+            });
+        }
+    }
+}
+
+/// Runs the TUI for an already authenticated device. Cancellation schedules best-effort input release while the runtime remains active.
+pub async fn run(device: std::sync::Arc<dyn Device>) -> io::Result<()> {
+    let mut input_cleanup = InputCleanup(Some(device.clone()));
     let mut guard = TerminalGuard::enter(SystemTerminal)?;
     let picker = ratatui_image::picker::Picker::from_query_stdio()
         .unwrap_or_else(|_| ratatui_image::picker::Picker::halfblocks());
@@ -690,7 +780,7 @@ pub async fn run(device: &dyn Device) -> io::Result<()> {
     }
     guard.keyboard = enhanced;
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
-    let result = run_loop(&mut terminal, device, &picker, enhanced, || {
+    let result = run_loop(&mut terminal, device.as_ref(), &picker, enhanced, || {
         if event::poll(Duration::from_millis(25))? {
             Ok(Some(event::read()?))
         } else {
@@ -699,6 +789,7 @@ pub async fn run(device: &dyn Device) -> io::Result<()> {
     })
     .await;
     let cleanup = device.release_inputs().await.map_err(io::Error::other);
+    input_cleanup.0 = None;
     let restored = guard.restore();
     let errors: Vec<String> = [result, cleanup, restored]
         .into_iter()
@@ -854,6 +945,13 @@ where
                     } else if !app.key_event(device, key).await {
                         break;
                     }
+                }
+                Event::FocusLost => {
+                    app.control = false;
+                    app.message = match device.release_inputs().await {
+                        Ok(()) => "Focus lost; inputs released".into(),
+                        Err(error) => format!("Focus lost; input cleanup uncertain: {error}"),
+                    };
                 }
                 Event::Mouse(mouse) => {
                     let areas = Layout::vertical([
@@ -1315,6 +1413,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cancellation_guard_schedules_input_release() {
+        let device = std::sync::Arc::new(FakeDevice::default());
+        let guard = InputCleanup(Some(device.clone()));
+        drop(guard);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while device.calls.lock().unwrap().is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(*device.calls.lock().unwrap(), ["release"]);
+    }
+
+    #[tokio::test]
+    async fn enhanced_input_reconciles_preheld_modifier() {
+        let device = FakeDevice::default();
+        let mut app = App {
+            enhanced_keyboard: true,
+            ..App::default()
+        };
+        app.refresh(&device).await;
+        app.key(&device, KeyCode::Char('i')).await;
+        app.key_event(
+            &device,
+            crossterm::event::KeyEvent::new_with_kind(
+                KeyCode::Char('a'),
+                crossterm::event::KeyModifiers::SHIFT,
+                KeyEventKind::Press,
+            ),
+        )
+        .await;
+        assert_eq!(
+            *device.calls.lock().unwrap(),
+            ["key:ShiftLeft:true", "key:KeyA:true"]
+        );
+    }
+
+    #[tokio::test]
     async fn enhanced_keys_hold_until_release_and_support_modifier_only() {
         let device = FakeDevice::default();
         let mut app = App {
@@ -1432,7 +1569,34 @@ mod tests {
             [
                 "key:ShiftLeft:true",
                 "move:-32768:-32768",
+                "button:left:true"
+            ]
+        );
+        for kind in [
+            MouseEventKind::Drag(MouseButton::Left),
+            MouseEventKind::Up(MouseButton::Left),
+        ] {
+            app.mouse(
+                &device,
+                MouseEvent {
+                    kind,
+                    column: 1,
+                    row: 1,
+                    modifiers: crossterm::event::KeyModifiers::SHIFT,
+                },
+                ratatui::layout::Rect::new(0, 0, 4, 4),
+            )
+            .await;
+        }
+        assert_eq!(
+            *device.calls.lock().unwrap(),
+            [
+                "key:ShiftLeft:true",
+                "move:-32768:-32768",
                 "button:left:true",
+                "move:-32768:-32768",
+                "move:-32768:-32768",
+                "button:left:false",
                 "key:ShiftLeft:false"
             ]
         );
