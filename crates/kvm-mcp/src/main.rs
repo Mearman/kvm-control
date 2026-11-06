@@ -7,16 +7,27 @@ use rmcp::ServiceExt;
 use url::Url;
 
 #[cfg(unix)]
-fn read_password(path: &str) -> Result<String, Box<dyn Error>> {
-    use std::os::unix::fs::PermissionsExt;
-    let file = fs::File::open(path)?;
-    let metadata = file.metadata()?;
-    if !metadata.is_file() || metadata.permissions().mode() & 0o077 != 0 {
-        return Err("password file must be a regular file inaccessible to group and others".into());
-    }
+fn read_password(path: &str) -> Result<zeroize::Zeroizing<String>, Box<dyn Error>> {
     use std::io::Read;
-    let mut password = String::new();
-    file.take(65536).read_to_string(&mut password)?;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags((rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::NONBLOCK).bits() as i32)
+        .open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file()
+        || metadata.mode() & 0o077 != 0
+        || metadata.uid() != rustix::process::geteuid().as_raw()
+    {
+        return Err("password file must be a regular file owned by the current user and inaccessible to group and others".into());
+    }
+    const MAX_PASSWORD_BYTES: u64 = 65536;
+    let mut password = zeroize::Zeroizing::new(String::new());
+    file.take(MAX_PASSWORD_BYTES + 1)
+        .read_to_string(&mut password)?;
+    if password.len() as u64 > MAX_PASSWORD_BYTES {
+        return Err("password file exceeds the size limit".into());
+    }
     if password.ends_with('\n') {
         password.pop();
         if password.ends_with('\r') {
@@ -27,7 +38,7 @@ fn read_password(path: &str) -> Result<String, Box<dyn Error>> {
 }
 
 #[cfg(not(unix))]
-fn read_password(_: &str) -> Result<String, Box<dyn Error>> {
+fn read_password(_: &str) -> Result<zeroize::Zeroizing<String>, Box<dyn Error>> {
     Err("password files require Unix permission checks".into())
 }
 

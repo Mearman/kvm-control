@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use kvm_core::{Capabilities, Device, DeviceStatus, Result, Snapshot};
+use kvm_core::{Capabilities, Capability, Device, DeviceStatus, Result, Snapshot};
 use kvm_mcp::Server;
 use rmcp::ServiceExt;
 use serde_json::{Value, json};
@@ -20,7 +20,13 @@ impl Device for Fake {
         })
     }
     async fn capabilities(&self) -> Result<Capabilities> {
-        Err(kvm_core::Error::Unsupported("not established".into()))
+        Ok(Capabilities {
+            status: Capability::Supported,
+            snapshot: Capability::Unknown,
+            keyboard: Capability::Unknown,
+            mouse: Capability::Unknown,
+            live_video: Capability::Unsupported,
+        })
     }
     async fn snapshot(&self) -> Result<Snapshot> {
         Ok(Snapshot {
@@ -84,6 +90,11 @@ async fn protocol_round_trip() {
     let tools = list["result"]["tools"].as_array().unwrap();
     assert!(tools.iter().any(|tool| tool["name"] == "key"
         && tool["inputSchema"]["properties"]["pressed"]["type"] == "boolean"));
+    let caps = call(&mut write, &mut lines, json!({"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"capabilities","arguments":{}}})).await;
+    let capabilities: Value =
+        serde_json::from_str(caps["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(capabilities["snapshot"], "Unknown");
+    assert_eq!(capabilities["live_video"], "Unsupported");
     let image = call(&mut write, &mut lines, json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"snapshot","arguments":{}}})).await;
     assert_eq!(image["result"]["content"][0]["type"], "image");
     assert_eq!(image["result"]["content"][0]["mimeType"], "image/jpeg");
