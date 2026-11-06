@@ -124,7 +124,9 @@ impl Server {
 }
 
 fn denied() -> CallToolResult {
-    CallToolResult::error(vec![ContentBlock::text("Control is disabled by server policy")])
+    CallToolResult::error(vec![ContentBlock::text(
+        "Control is disabled by server policy",
+    )])
 }
 
 #[tool_handler(router = self.tool_router)]
