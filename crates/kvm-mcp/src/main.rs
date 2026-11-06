@@ -7,26 +7,23 @@ use rmcp::ServiceExt;
 use url::Url;
 
 #[cfg(unix)]
-fn read_password(path: &str) -> Result<zeroize::Zeroizing<String>, Box<dyn Error>> {
+fn read_password(fd: &str) -> Result<zeroize::Zeroizing<String>, Box<dyn Error>> {
     use std::io::Read;
-    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
-    let file = fs::OpenOptions::new()
-        .read(true)
-        .custom_flags((rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::NONBLOCK).bits() as i32)
-        .open(path)?;
-    let metadata = file.metadata()?;
-    if !metadata.is_file()
-        || metadata.mode() & 0o077 != 0
-        || metadata.uid() != rustix::process::geteuid().as_raw()
-    {
-        return Err("password file must be a regular file owned by the current user and inaccessible to group and others".into());
+    use std::os::unix::fs::FileTypeExt;
+    let fd: i32 = fd.parse()?;
+    if fd < 3 {
+        return Err("password descriptor must not be a standard stream".into());
+    }
+    let file = fs::File::open(format!("/dev/fd/{fd}"))?;
+    if !file.metadata()?.file_type().is_fifo() {
+        return Err("password descriptor must be an inherited pipe".into());
     }
     const MAX_PASSWORD_BYTES: u64 = 65536;
     let mut password = zeroize::Zeroizing::new(String::new());
     file.take(MAX_PASSWORD_BYTES + 1)
         .read_to_string(&mut password)?;
     if password.len() as u64 > MAX_PASSWORD_BYTES {
-        return Err("password file exceeds the size limit".into());
+        return Err("password input exceeds the size limit".into());
     }
     if password.ends_with('\n') {
         password.pop();
@@ -39,7 +36,21 @@ fn read_password(path: &str) -> Result<zeroize::Zeroizing<String>, Box<dyn Error
 
 #[cfg(not(unix))]
 fn read_password(_: &str) -> Result<zeroize::Zeroizing<String>, Box<dyn Error>> {
-    Err("password files require Unix permission checks".into())
+    Err("inherited password pipes are supported only on Unix".into())
+}
+
+#[cfg(unix)]
+async fn shutdown_signal() -> std::io::Result<()> {
+    use tokio::signal::unix::{SignalKind, signal};
+    let mut terminate = signal(SignalKind::terminate())?;
+    let mut interrupt = signal(SignalKind::interrupt())?;
+    tokio::select! { _ = terminate.recv() => (), _ = interrupt.recv() => () }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+async fn shutdown_signal() -> std::io::Result<()> {
+    tokio::signal::ctrl_c().await
 }
 
 #[tokio::main]
@@ -62,17 +73,46 @@ async fn main() -> Result<(), Box<dyn Error>> {
         insecure_tls,
         timeout: Duration::from_secs(30),
     })?);
-    let password = read_password(&env::var("KVM_PASSWORD_FILE")?)?;
+    let password = read_password(&env::var("KVM_PASSWORD_FD")?)?;
     device.login(&env::var("KVM_USERNAME")?, &password).await?;
     drop(password);
     let allow_control = env::var("KVM_ALLOW_CONTROL").as_deref() == Ok("1");
     let service = Server::new(device.clone(), allow_control)
         .serve(rmcp::transport::stdio())
         .await?;
+    let cancel = service.cancellation_token();
+    let signal_task = tokio::spawn(async move {
+        if let Err(error) = shutdown_signal().await {
+            eprintln!("Could not listen for shutdown signal: {error}");
+        }
+        cancel.cancel();
+    });
     let outcome = service.waiting().await;
+    signal_task.abort();
     if allow_control && let Err(error) = device.release_inputs().await {
         eprintln!("Input cleanup uncertain: {error}");
     }
     outcome?;
     Ok(())
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::read_password;
+    use std::{fs::File, io::Write, os::fd::AsRawFd};
+
+    #[test]
+    fn accepts_pipe_and_rejects_non_pipe() {
+        let (reader, writer) = rustix::pipe::pipe().unwrap();
+        let mut writer = File::from(writer);
+        writer.write_all(b"synthetic-password\n").unwrap();
+        drop(writer);
+        assert_eq!(
+            &*read_password(&reader.as_raw_fd().to_string()).unwrap(),
+            "synthetic-password"
+        );
+        let file = File::open("/dev/null").unwrap();
+        assert!(read_password(&file.as_raw_fd().to_string()).is_err());
+        assert!(read_password("0").is_err());
+    }
 }

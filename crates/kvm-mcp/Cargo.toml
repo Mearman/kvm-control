@@ -9,12 +9,12 @@ base64 = "0.22"
 kvm-core = { path = "../kvm-core" }
 kvm-kvmd = { path = "../kvm-kvmd" }
 rmcp = { version = "3.9", features = ["transport-io"] }
-rustix = { version = "1.1.6", features = ["process", "fs"] }
 serde.workspace = true
 serde_json.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["signal"] }
 url.workspace = true
 zeroize = "1.9.1"
 
 [dev-dependencies]
 async-trait.workspace = true
+rustix = { version = "1.1.6", features = ["pipe", "fs"] }
