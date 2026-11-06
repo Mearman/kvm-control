@@ -11,7 +11,7 @@ use axum::{
     routing::{get, post},
 };
 use axum_server::tls_rustls::RustlsConfig;
-use kvm_core::{Capability, Device, DeviceProfile, Error};
+use kvm_core::{Capability, Confirmation, Control, Device, DeviceProfile, Error, PowerAction};
 use kvm_kvmd::{Config, Kvmd, LoginState};
 use serde_json::json;
 use url::Url;
@@ -57,7 +57,11 @@ async fn status(State(calls): State<Calls>, uri: Uri, headers: HeaderMap) -> imp
         headers.get(header::COOKIE).and_then(|v| v.to_str().ok()) == Some("auth_token=synthetic");
     let header_auth = headers.get("x-kvmd-user").and_then(|v| v.to_str().ok()) == Some("test-user")
         && headers.get("x-kvmd-passwd").and_then(|v| v.to_str().ok()) == Some("test-password");
-    if !cookie && !header_auth {
+    let basic = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        == Some("Basic dGVzdC11c2VyOnRlc3QtcGFzc3dvcmQ=");
+    if !cookie && !header_auth && !basic {
         return (
             StatusCode::FORBIDDEN,
             Json(json!({"ok": false, "result": {}})),
@@ -67,6 +71,20 @@ async fn status(State(calls): State<Calls>, uri: Uri, headers: HeaderMap) -> imp
         StatusCode::OK,
         Json(json!({"ok": true, "result": {"online": true}})),
     )
+}
+
+async fn capability(uri: Uri) -> impl IntoResponse {
+    let state = match uri.path() {
+        "/api/gpio" => json!({"state": {"outputs": {"lamp": {"online": true}}}}),
+        "/api/switch" => json!({"model": {"ports": [{}]}}),
+        _ => json!({"enabled": true}),
+    };
+    Json(json!({"ok": true, "result": state}))
+}
+
+async fn control(State(calls): State<Calls>, uri: Uri) -> impl IntoResponse {
+    calls.0.lock().unwrap().push(uri.to_string());
+    Json(json!({"ok": true, "result": {}}))
 }
 
 async fn fixture() -> (Url, Vec<u8>, Calls, tokio::task::JoinHandle<()>) {
@@ -83,6 +101,15 @@ async fn fixture() -> (Url, Vec<u8>, Calls, tokio::task::JoinHandle<()>) {
         .route("/api/info", get(status))
         .route("/api/hid", get(status))
         .route("/api/streamer", get(status))
+        .route("/api/atx", get(capability))
+        .route("/api/switch", get(capability))
+        .route("/api/gpio", get(capability))
+        .route("/api/msd", get(capability))
+        .route("/api/atx/power", post(control))
+        .route("/api/switch/set_active", post(control))
+        .route("/api/gpio/switch", post(control))
+        .route("/api/msd/set_connected", post(control))
+        .route("/api/msd/set_params", post(control))
         .route(
             "/api/streamer/snapshot",
             get(|| async { vec![0u8; 16 * 1024 * 1024 + 1] }),
@@ -114,6 +141,67 @@ fn client(endpoint: Url, ca: Option<Vec<u8>>) -> Kvmd {
         timeout: Duration::from_secs(5),
     })
     .unwrap()
+}
+
+#[tokio::test]
+async fn basic_auth_and_discovered_control_requests() {
+    let (endpoint, ca, calls, server) = fixture().await;
+    let device = Kvmd::with_basic_auth(
+        Config {
+            endpoint,
+            profile: DeviceProfile::PiKvm,
+            trusted_ca_pem: Some(ca),
+            insecure_tls: false,
+            timeout: Duration::from_secs(5),
+        },
+        "test-user",
+        "test-password",
+    )
+    .unwrap();
+    device.check_auth().await.unwrap();
+    let capabilities = device.capabilities().await.unwrap();
+    assert_eq!(
+        (
+            capabilities.power,
+            capabilities.switch,
+            capabilities.gpio,
+            capabilities.media
+        ),
+        (
+            Capability::Supported,
+            Capability::Supported,
+            Capability::Supported,
+            Capability::Supported
+        )
+    );
+    for operation in [
+        Control::Power(PowerAction::Off),
+        Control::Switch { port: 1 },
+        Control::Gpio {
+            channel: "lamp".into(),
+            state: true,
+        },
+        Control::MediaConnect { connected: true },
+        Control::MediaSelect {
+            image: "disk.iso".into(),
+        },
+    ] {
+        device
+            .control(operation, Confirmation::new())
+            .await
+            .unwrap();
+    }
+    let calls = calls.0.lock().unwrap();
+    for path in [
+        "/api/atx/power?action=off&wait=true",
+        "/api/switch/set_active?port=1",
+        "/api/gpio/switch?channel=lamp&state=true&wait=true",
+        "/api/msd/set_connected?connected=true",
+        "/api/msd/set_params?image=disk.iso",
+    ] {
+        assert!(calls.iter().any(|v| v == path), "missing {path}");
+    }
+    server.abort();
 }
 
 #[tokio::test]
