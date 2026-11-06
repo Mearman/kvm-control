@@ -1,0 +1,10 @@
+[package]
+name = "kvm-tui"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+crossterm = "0.29.0"
+kvm-core = { version = "0.1.0", path = "../kvm-core" }
+ratatui = "0.30.2"
