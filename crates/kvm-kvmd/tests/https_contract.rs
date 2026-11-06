@@ -11,7 +11,9 @@ use axum::{
     routing::{get, post},
 };
 use axum_server::tls_rustls::RustlsConfig;
-use kvm_core::{Capability, Confirmation, Control, Device, DeviceProfile, Error, PowerAction};
+use kvm_core::{
+    Capability, Confirmation, Control, ControlOutcome, Device, DeviceProfile, Error, PowerAction,
+};
 use kvm_kvmd::{Config, Kvmd, LoginState};
 use serde_json::json;
 use url::Url;
@@ -75,9 +77,10 @@ async fn status(State(calls): State<Calls>, uri: Uri, headers: HeaderMap) -> imp
 
 async fn capability(uri: Uri) -> impl IntoResponse {
     let state = match uri.path() {
-        "/api/gpio" => json!({"state": {"outputs": {"lamp": {"online": true}}}}),
-        "/api/switch" => json!({"model": {"ports": [{}]}}),
-        _ => json!({"enabled": true}),
+        "/api/gpio" => json!({"state": {"outputs": {"lamp": {"online": true, "state": true}}}}),
+        "/api/switch" => json!({"model": {"ports": [{}]}, "summary": {"active_port": 0}}),
+        "/api/atx" => json!({"enabled": true, "leds": {"power": false}}),
+        _ => json!({"enabled": true, "drive": {"connected": true, "image": {"name": "disk.iso"}}}),
     };
     Json(json!({"ok": true, "result": state}))
 }
@@ -174,22 +177,37 @@ async fn basic_auth_and_discovered_control_requests() {
             Capability::Supported
         )
     );
-    for operation in [
-        Control::Power(PowerAction::Off),
-        Control::Switch { port: 1 },
-        Control::Gpio {
-            channel: "lamp".into(),
-            state: true,
-        },
-        Control::MediaConnect { connected: true },
-        Control::MediaSelect {
-            image: "disk.iso".into(),
-        },
+    for (operation, expected) in [
+        (
+            Control::Power(PowerAction::Off),
+            ControlOutcome::ObservedMatching,
+        ),
+        (Control::Switch { port: 1 }, ControlOutcome::Unverified),
+        (
+            Control::Gpio {
+                channel: "lamp".into(),
+                state: true,
+            },
+            ControlOutcome::ObservedMatching,
+        ),
+        (
+            Control::MediaConnect { connected: true },
+            ControlOutcome::ObservedMatching,
+        ),
+        (
+            Control::MediaSelect {
+                image: "disk.iso".into(),
+            },
+            ControlOutcome::ObservedMatching,
+        ),
     ] {
-        device
-            .control(operation, Confirmation::new())
-            .await
-            .unwrap();
+        assert_eq!(
+            device
+                .control(operation, Confirmation::new())
+                .await
+                .unwrap(),
+            expected
+        );
     }
     let calls = calls.0.lock().unwrap();
     for path in [

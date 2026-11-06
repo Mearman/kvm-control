@@ -84,6 +84,13 @@ impl Default for Confirmation {
     }
 }
 
+/// Observation after a control request. Acknowledgement alone is not verification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ControlOutcome {
+    ObservedMatching,
+    Unverified,
+}
+
 #[derive(Debug, Clone)]
 pub struct Snapshot {
     pub jpeg: Vec<u8>,
@@ -107,5 +114,9 @@ pub trait Device: Send + Sync {
     async fn mouse_button(&self, button: &str, pressed: bool) -> Result<()>;
     async fn mouse_move(&self, x: i16, y: i16) -> Result<()>;
     async fn release_inputs(&self) -> Result<()>;
-    async fn control(&self, operation: Control, confirmation: Confirmation) -> Result<()>;
+    async fn control(
+        &self,
+        operation: Control,
+        confirmation: Confirmation,
+    ) -> Result<ControlOutcome>;
 }
