@@ -754,6 +754,7 @@ mod tests {
     struct FakeDevice {
         calls: std::sync::Mutex<Vec<String>>,
         fail_key: bool,
+        fail_mouse_release: bool,
         video_calls: std::sync::atomic::AtomicUsize,
         fail_restart: bool,
         video_frame: Option<Vec<u8>>,
@@ -835,7 +836,11 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push(format!("button:{button}:{pressed}"));
-            Ok(())
+            if self.fail_mouse_release && !pressed {
+                Err(kvm_core::Error::AmbiguousInput("release failed".into()))
+            } else {
+                Ok(())
+            }
         }
         async fn mouse_move(&self, x: i16, y: i16) -> kvm_core::Result<()> {
             self.calls.lock().unwrap().push(format!("move:{x}:{y}"));
@@ -1082,6 +1087,47 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn input_repeat_events_reach_device() {
+        let device = FakeDevice::default();
+        let mut terminal = Terminal::new(TestBackend::new(40, 16)).unwrap();
+        let mut step = 0;
+        run_loop(
+            &mut terminal,
+            &device,
+            &ratatui_image::picker::Picker::halfblocks(),
+            || {
+                step += 1;
+                let event = match step {
+                    1 => crossterm::event::KeyEvent::new(
+                        KeyCode::Char('i'),
+                        crossterm::event::KeyModifiers::NONE,
+                    ),
+                    2 => crossterm::event::KeyEvent::new_with_kind(
+                        KeyCode::Char('a'),
+                        crossterm::event::KeyModifiers::NONE,
+                        KeyEventKind::Repeat,
+                    ),
+                    3 => crossterm::event::KeyEvent::new(
+                        KeyCode::Esc,
+                        crossterm::event::KeyModifiers::NONE,
+                    ),
+                    _ => crossterm::event::KeyEvent::new(
+                        KeyCode::Char('q'),
+                        crossterm::event::KeyModifiers::NONE,
+                    ),
+                };
+                Ok(Some(Event::Key(event)))
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            *device.calls.lock().unwrap(),
+            ["key:KeyA:true", "key:KeyA:false", "release"]
+        );
+    }
+
     #[tokio::test]
     async fn punctuation_includes_shift_and_balanced_key_events() {
         let device = FakeDevice::default();
@@ -1101,6 +1147,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn resize_and_failed_outside_release_clean_up_inputs() {
+        let device = FakeDevice {
+            fail_mouse_release: true,
+            ..FakeDevice::default()
+        };
+        let mut app = App::default();
+        app.refresh(&device).await;
+        app.control = true;
+        app.video = Some(image::RgbImage::new(2, 4));
+        let mouse = |kind, column, row| MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        };
+        app.mouse(
+            &device,
+            mouse(MouseEventKind::Down(MouseButton::Left), 1, 1),
+            ratatui::layout::Rect::new(0, 0, 4, 4),
+        )
+        .await;
+        app.mouse(
+            &device,
+            mouse(MouseEventKind::Up(MouseButton::Left), 10, 10),
+            ratatui::layout::Rect::new(0, 0, 4, 4),
+        )
+        .await;
+        assert_eq!(
+            *device.calls.lock().unwrap(),
+            [
+                "move:-32768:-32768",
+                "button:left:true",
+                "button:left:false",
+                "release"
+            ]
+        );
+        assert!(!app.control);
+        device.calls.lock().unwrap().clear();
+        app.control = true;
+        app.mouse(
+            &device,
+            mouse(MouseEventKind::Up(MouseButton::Left), 0, 0),
+            ratatui::layout::Rect::new(0, 0, 1, 1),
+        )
+        .await;
+        assert_eq!(*device.calls.lock().unwrap(), ["release"]);
+    }
+
+    #[tokio::test]
     async fn mouse_only_device_can_enter_input_mode() {
         let device = FakeDevice::default();
         let mut app = App::default();
@@ -1108,6 +1203,8 @@ mod tests {
         app.capabilities.as_mut().unwrap().keyboard = Capability::Unsupported;
         app.key(&device, KeyCode::Char('i')).await;
         assert!(app.control);
+        app.key(&device, KeyCode::Char('a')).await;
+        assert!(device.calls.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -1274,12 +1371,16 @@ mod tests {
                 .to_string()
                 .contains("leave failed")
         );
+        drop(guard);
         assert_eq!(
             *calls.borrow(),
             [
                 "raw",
                 "alternate",
                 "mouse_on",
+                "mouse_off",
+                "leave",
+                "cooked",
                 "mouse_off",
                 "leave",
                 "cooked"
