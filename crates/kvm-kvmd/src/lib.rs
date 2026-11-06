@@ -6,10 +6,11 @@ use kvm_core::{
     DeviceStatus, Error, PowerAction, Result, Snapshot,
 };
 use reqwest::{Client, Method, StatusCode};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
 use url::Url;
 
 /// Connection parameters. Credentials are supplied separately and are never formatted for logs.
+#[derive(Clone)]
 pub struct Config {
     /// HTTPS device origin or reverse-proxy prefix; the adapter appends `api/`.
     pub endpoint: Url,
@@ -27,13 +28,13 @@ pub enum LoginState {
 }
 
 pub struct Kvmd {
-    client: Client,
+    client: RwLock<Client>,
+    config: Config,
     endpoint: Url,
     profile: DeviceProfile,
     inputs: Mutex<Inputs>,
     auth_headers: reqwest::header::HeaderMap,
     approval_token: Mutex<Option<String>>,
-    cookies: Arc<reqwest::cookie::Jar>,
 }
 
 #[derive(Default)]
@@ -56,6 +57,19 @@ impl Kvmd {
                 "endpoint must be an HTTPS URL without credentials, query or fragment".into(),
             ));
         }
+        let client = Self::build_client(&config)?;
+        Ok(Self {
+            client: RwLock::new(client),
+            endpoint: config.endpoint.clone(),
+            profile: config.profile,
+            config,
+            inputs: Mutex::new(Inputs::default()),
+            auth_headers: reqwest::header::HeaderMap::new(),
+            approval_token: Mutex::new(None),
+        })
+    }
+
+    fn build_client(config: &Config) -> Result<Client> {
         let cookies = Arc::new(reqwest::cookie::Jar::default());
         let mut builder = Client::builder()
             .timeout(config.timeout)
@@ -63,23 +77,14 @@ impl Kvmd {
             .retry(reqwest::retry::never())
             .redirect(reqwest::redirect::Policy::none())
             .danger_accept_invalid_certs(config.insecure_tls);
-        if let Some(pem) = config.trusted_ca_pem {
-            let ca = reqwest::Certificate::from_pem(&pem)
+        if let Some(pem) = &config.trusted_ca_pem {
+            let ca = reqwest::Certificate::from_pem(pem)
                 .map_err(|_| Error::InvalidResponse("invalid CA certificate".into()))?;
             builder = builder.add_root_certificate(ca);
         }
-        let client = builder
+        builder
             .build()
-            .map_err(|_| Error::Transport("could not build HTTP client".into()))?;
-        Ok(Self {
-            client,
-            endpoint: config.endpoint,
-            profile: config.profile,
-            inputs: Mutex::new(Inputs::default()),
-            auth_headers: reqwest::header::HeaderMap::new(),
-            approval_token: Mutex::new(None),
-            cookies,
-        })
+            .map_err(|_| Error::Transport("could not build HTTP client".into()))
     }
 
     /// Builds a client with credentials sent in KVMD's authentication headers.
@@ -137,11 +142,11 @@ impl Kvmd {
         }
         let mut pending = self.approval_token.lock().await;
         *pending = None;
-        self.cookies
-            .add_cookie_str("auth_token=; Max-Age=0; Path=/", &self.endpoint);
+        let mut active = self.client.write().await;
+        *active = Self::build_client(&self.config)?;
+        let candidate = Self::build_client(&self.config)?;
         let url = self.url("auth/login")?;
-        let response = self
-            .client
+        let response = candidate
             .post(url)
             .form(&[("user", username), ("passwd", password)])
             .send()
@@ -177,6 +182,8 @@ impl Kvmd {
                 expires_in: Some(expires_in),
             });
         }
+        self.verify_client(&candidate).await?;
+        *active = candidate;
         Ok(LoginState::Authenticated)
     }
 
@@ -186,8 +193,9 @@ impl Kvmd {
         let token = pending
             .as_ref()
             .ok_or_else(|| Error::InvalidResponse("no approval is pending".into()))?;
-        let response = self
-            .client
+        let mut active = self.client.write().await;
+        let candidate = Self::build_client(&self.config)?;
+        let response = candidate
             .post(self.url("auth/two_step_complete")?)
             .form(&[("two_step_token", token)])
             .send()
@@ -216,8 +224,27 @@ impl Kvmd {
                 "missing approved session token".into(),
             ));
         }
+        self.verify_client(&candidate).await?;
+        *active = candidate;
         *pending = None;
         Ok(LoginState::Authenticated)
+    }
+
+    async fn verify_client(&self, client: &Client) -> Result<()> {
+        let response = client
+            .get(self.url("auth/check")?)
+            .send()
+            .await
+            .map_err(|_| Error::Transport("authentication check failed".into()))?;
+        Self::check(response.status())?;
+        let body: serde_json::Value = response
+            .json()
+            .await
+            .map_err(|_| Error::InvalidResponse("invalid authentication check response".into()))?;
+        if body.get("ok").and_then(serde_json::Value::as_bool) != Some(true) {
+            return Err(Error::Authentication);
+        }
+        Ok(())
     }
 
     fn url(&self, path: &str) -> Result<Url> {
@@ -240,8 +267,8 @@ impl Kvmd {
     }
 
     async fn get(&self, path: &str) -> Result<reqwest::Response> {
-        let response = self
-            .client
+        let active = self.client.read().await;
+        let response = active
             .get(self.url(path)?)
             .headers(self.auth_headers.clone())
             .send()
@@ -295,8 +322,8 @@ impl Kvmd {
     }
 
     async fn input(&self, path: &str, params: &[(&str, String)]) -> Result<()> {
-        let response = self
-            .client
+        let active = self.client.read().await;
+        let response = active
             .request(Method::POST, self.url(path)?)
             .headers(self.auth_headers.clone())
             .query(params)
