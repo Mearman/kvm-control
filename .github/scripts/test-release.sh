@@ -82,8 +82,13 @@ printf '%s\n' '[[]]' > "$MOCK_RELEASES"
 : > "$GITHUB_OUTPUT"
 (cd "$tmp/untagged" && bash "$root/.github/scripts/version.sh")
 test "$(grep '^plan=' "$GITHUB_OUTPUT" | cut -d = -f 2- | jq -r '.[0].tag')" = v0.1.0
-git -C "$tmp/untagged" -c tag.gpgsign=false tag v0.1.0
+git init -q --bare "$tmp/intent-origin"
+git -C "$tmp/untagged" remote add origin "$tmp/intent-origin"
 initial=$(git -C "$tmp/untagged" rev-parse HEAD)
+intent=$(grep '^plan=' "$GITHUB_OUTPUT" | cut -d = -f 2-)
+(cd "$tmp/untagged" && PLAN="$intent" bash "$root/.github/scripts/record-release-intent.sh")
+test "$(git -C "$tmp/intent-origin" rev-list -n 1 v0.1.0)" = "$initial"
+(cd "$tmp/untagged" && PLAN="$intent" bash "$root/.github/scripts/record-release-intent.sh")
 git -C "$tmp/untagged" -c user.name=test -c user.email=test@example.com commit --allow-empty -qm 'feat: after interrupted release'
 later=$(git -C "$tmp/untagged" rev-parse HEAD)
 : > "$GITHUB_OUTPUT"

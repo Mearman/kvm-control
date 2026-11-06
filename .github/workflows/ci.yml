@@ -61,9 +61,11 @@ jobs:
         run: convco check "$BASE..$HEAD"
 
   version:
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main'
     needs: checks
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     outputs:
       plan: ${{ steps.version.outputs.plan }}
       matrix: ${{ steps.version.outputs.matrix }}
@@ -71,7 +73,6 @@ jobs:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           fetch-depth: 0
-          persist-credentials: false
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
       - run: cargo install convco --version 0.7.2 --locked
       - id: version
@@ -81,6 +82,10 @@ jobs:
           ATTEMPT: ${{ github.run_attempt }}
           GH_TOKEN: ${{ github.token }}
         run: bash .github/scripts/version.sh
+      - name: Record release intent
+        env:
+          PLAN: ${{ steps.version.outputs.plan }}
+        run: bash .github/scripts/record-release-intent.sh
 
   archives:
     needs: version
