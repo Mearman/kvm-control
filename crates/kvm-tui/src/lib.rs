@@ -30,6 +30,7 @@ pub struct App {
     pub control: bool,
     /// Most recently decoded video frame, if the stream has delivered one.
     pub video: Option<image::RgbImage>,
+    pending_power: bool,
 }
 
 impl App {
@@ -116,7 +117,40 @@ impl App {
 
     /// Handles one key event. Returns false when the interface should exit.
     pub async fn key(&mut self, device: &dyn Device, code: KeyCode) -> bool {
+        if self.pending_power {
+            self.pending_power = false;
+            if code == KeyCode::Char('y') {
+                match device
+                    .control(
+                        kvm_core::Control::Power(kvm_core::PowerAction::Off),
+                        kvm_core::Confirmation::new(),
+                    )
+                    .await
+                {
+                    Ok(()) => {
+                        self.message = "Power request acknowledged; outcome not verified".into()
+                    }
+                    Err(error) => self.message = error.to_string(),
+                }
+            } else {
+                self.message = "Power request cancelled".into();
+            }
+            return true;
+        }
         match code {
+            KeyCode::Char('p') if !self.control => {
+                if self
+                    .capabilities
+                    .as_ref()
+                    .is_some_and(|c| c.power == Capability::Supported)
+                {
+                    self.pending_power = true;
+                    self.message =
+                        "Confirm power-off button: y confirms, any other key cancels".into();
+                } else {
+                    self.message = "Power capability unsupported or unknown".into();
+                }
+            }
             KeyCode::Esc if self.control => {
                 self.control = false;
                 if let Err(error) = device.release_inputs().await {
@@ -290,7 +324,7 @@ pub fn draw(frame: &mut Frame<'_>, app: &App) {
     let help = if app.control {
         "Input mode: Escape returns to controls"
     } else {
-        "q quit | r refresh | v live video | i input"
+        "q quit | r refresh | v video | i input | p power"
     };
     frame.render_widget(
         Paragraph::new(format!("{help}\n{}", app.message))
@@ -514,6 +548,10 @@ mod tests {
                 keyboard: Capability::Supported,
                 mouse: Capability::Supported,
                 live_video: Capability::Unknown,
+                power: Capability::Supported,
+                switch: Capability::Unknown,
+                gpio: Capability::Unknown,
+                media: Capability::Unknown,
             })
         }
         async fn snapshot(&self) -> kvm_core::Result<kvm_core::Snapshot> {
@@ -545,6 +583,29 @@ mod tests {
             self.calls.lock().unwrap().push("release".into());
             Ok(())
         }
+        async fn control(
+            &self,
+            _: kvm_core::Control,
+            _: kvm_core::Confirmation,
+        ) -> kvm_core::Result<()> {
+            self.calls.lock().unwrap().push("power".into());
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn power_requires_explicit_confirmation() {
+        let device = FakeDevice::default();
+        let mut app = App::default();
+        app.refresh(&device).await;
+        app.key(&device, KeyCode::Char('p')).await;
+        assert!(device.calls.lock().unwrap().is_empty());
+        app.key(&device, KeyCode::Char('n')).await;
+        assert!(device.calls.lock().unwrap().is_empty());
+        app.key(&device, KeyCode::Char('p')).await;
+        app.key(&device, KeyCode::Char('y')).await;
+        assert_eq!(*device.calls.lock().unwrap(), ["power"]);
+        assert!(app.message.contains("not verified"));
     }
 
     #[tokio::test]
