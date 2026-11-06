@@ -110,6 +110,27 @@ impl App {
         };
         let Some((x, y)) = mouse_coordinates(event.column, event.row, viewport) else {
             if let MouseEventKind::Up(button) = event.kind {
+                if !self.enhanced_keyboard {
+                    for (flag, modifier) in [
+                        (crossterm::event::KeyModifiers::CONTROL, "ControlLeft"),
+                        (crossterm::event::KeyModifiers::ALT, "AltLeft"),
+                        (crossterm::event::KeyModifiers::SHIFT, "ShiftLeft"),
+                        (crossterm::event::KeyModifiers::SUPER, "MetaLeft"),
+                    ] {
+                        if self.drag_modifiers.contains(&modifier)
+                            && !event.modifiers.contains(flag)
+                        {
+                            if let Err(error) = device.key(modifier, false).await {
+                                self.control = false;
+                                self.clear_input_state();
+                                self.message = error.to_string();
+                                let _ = device.release_inputs().await;
+                                return;
+                            }
+                            self.drag_modifiers.retain(|held| *held != modifier);
+                        }
+                    }
+                }
                 let name = match button {
                     MouseButton::Left => "left",
                     MouseButton::Right => "right",
@@ -363,8 +384,6 @@ impl App {
                                 (crossterm::event::KeyModifiers::SUPER, "MetaLeft"),
                             ] {
                                 if event.modifiers.contains(flag)
-                                    && !(matches!(code, KeyCode::Modifier(_))
-                                        && event.kind == KeyEventKind::Release)
                                     && key != name
                                     && key
                                         != match name {
@@ -1735,6 +1754,73 @@ mod tests {
         assert!(app.drag_modifiers.is_empty());
         assert!(app.held_modifiers.is_empty());
         assert_eq!(*device.calls.lock().unwrap(), ["release"]);
+    }
+
+    #[tokio::test]
+    async fn modifier_release_reconciles_other_preheld_modifier() {
+        let device = FakeDevice::default();
+        let mut app = App {
+            enhanced_keyboard: true,
+            ..App::default()
+        };
+        app.refresh(&device).await;
+        app.control = true;
+        app.key_event(
+            &device,
+            crossterm::event::KeyEvent::new_with_kind(
+                KeyCode::Modifier(crossterm::event::ModifierKeyCode::LeftControl),
+                crossterm::event::KeyModifiers::SHIFT,
+                KeyEventKind::Release,
+            ),
+        )
+        .await;
+        assert_eq!(
+            *device.calls.lock().unwrap(),
+            ["key:ShiftLeft:true", "key:ControlLeft:false"]
+        );
+    }
+
+    #[tokio::test]
+    async fn outside_mouse_up_reconciles_released_drag_modifier_first() {
+        let device = FakeDevice::default();
+        let mut app = App::default();
+        app.refresh(&device).await;
+        app.control = true;
+        app.video = Some(image::RgbImage::new(2, 4));
+        for (kind, column, modifiers) in [
+            (
+                MouseEventKind::Down(MouseButton::Left),
+                1,
+                crossterm::event::KeyModifiers::SHIFT,
+            ),
+            (
+                MouseEventKind::Up(MouseButton::Left),
+                10,
+                crossterm::event::KeyModifiers::NONE,
+            ),
+        ] {
+            app.mouse(
+                &device,
+                MouseEvent {
+                    kind,
+                    column,
+                    row: 1,
+                    modifiers,
+                },
+                ratatui::layout::Rect::new(0, 0, 4, 4),
+            )
+            .await;
+        }
+        assert_eq!(
+            *device.calls.lock().unwrap(),
+            [
+                "key:ShiftLeft:true",
+                "move:-32768:-32768",
+                "button:left:true",
+                "key:ShiftLeft:false",
+                "button:left:false"
+            ]
+        );
     }
 
     #[tokio::test]
