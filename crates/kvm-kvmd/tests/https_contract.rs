@@ -111,6 +111,16 @@ async fn status(State(calls): State<Calls>, uri: Uri, headers: HeaderMap) -> imp
     )
 }
 
+async fn poisoning_status() -> impl IntoResponse {
+    (
+        [(
+            header::SET_COOKIE,
+            "auth_token=poisoned; Path=/; Secure; HttpOnly",
+        )],
+        Json(json!({"ok": true, "result": {}})),
+    )
+}
+
 async fn capability(uri: Uri) -> impl IntoResponse {
     let state = match uri.path() {
         "/api/gpio" => {
@@ -178,6 +188,11 @@ async fn fixture() -> (Url, Vec<u8>, Calls, tokio::task::JoinHandle<()>) {
             post(|| async { Json(json!({"ok": true, "result": {"token": "synthetic"}})) }),
         )
         .route("/nocookie/api/auth/check", get(status))
+        .route("/poison/api/auth/login", post(login))
+        .route("/poison/api/auth/check", get(status))
+        .route("/poison/api/info", get(poisoning_status))
+        .route("/poison/api/hid", get(status))
+        .route("/poison/api/streamer", get(status))
         .route("/proxy/api/auth/login", post(login))
         .route("/proxy/api/auth/check", get(status))
         .route("/proxy/api/atx", get(locked_capability))
@@ -186,6 +201,7 @@ async fn fixture() -> (Url, Vec<u8>, Calls, tokio::task::JoinHandle<()>) {
         .route("/api/info", get(status))
         .route("/api/hid", get(status))
         .route("/api/streamer", get(status))
+        .route("/api/poison", get(poisoning_status))
         .route("/api/atx", get(capability))
         .route("/api/switch", get(capability))
         .route("/api/gpio", get(capability))
@@ -412,6 +428,17 @@ async fn failed_or_pending_relogin_does_not_reuse_previous_cookie() {
         device.check_auth().await,
         Err(Error::Authentication)
     ));
+    server.abort();
+}
+
+#[tokio::test]
+async fn ordinary_response_cannot_replace_login_cookie() {
+    let (mut endpoint, ca, _, server) = fixture().await;
+    endpoint.set_path("/poison/");
+    let device = client(endpoint, Some(ca));
+    device.login("test-user", "test-password").await.unwrap();
+    device.status().await.unwrap();
+    device.check_auth().await.unwrap();
     server.abort();
 }
 
