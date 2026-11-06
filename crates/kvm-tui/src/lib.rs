@@ -79,12 +79,29 @@ impl App {
             return;
         }
         let Some(video) = &self.video else {
+            if matches!(event.kind, MouseEventKind::Up(_))
+                && let Err(error) = device.release_inputs().await
+            {
+                self.control = false;
+                self.message = error.to_string();
+            }
             return;
         };
         let Some(viewport) = video_viewport(area, video.width(), video.height()) else {
             return;
         };
         let Some((x, y)) = mouse_coordinates(event.column, event.row, viewport) else {
+            if let MouseEventKind::Up(button) = event.kind {
+                let name = match button {
+                    MouseButton::Left => "left",
+                    MouseButton::Right => "right",
+                    MouseButton::Middle => "middle",
+                };
+                if let Err(error) = device.mouse_button(name, false).await {
+                    self.control = false;
+                    self.message = error.to_string();
+                }
+            }
             return;
         };
         let result = match event.kind {
@@ -118,6 +135,15 @@ impl App {
 
     /// Handles one key event. Returns false when the interface should exit.
     pub async fn key(&mut self, device: &dyn Device, code: KeyCode) -> bool {
+        self.key_event(
+            device,
+            crossterm::event::KeyEvent::new(code, crossterm::event::KeyModifiers::NONE),
+        )
+        .await
+    }
+
+    async fn key_event(&mut self, device: &dyn Device, event: crossterm::event::KeyEvent) -> bool {
+        let code = event.code;
         if let Some(operation) = self.pending.take() {
             if code == KeyCode::Char('y') {
                 self.message = match device
@@ -193,11 +219,9 @@ impl App {
             KeyCode::Char('q') if !self.control => return false,
             KeyCode::Char('r') if !self.control => self.refresh(device).await,
             KeyCode::Char('i') if !self.control => {
-                if self
-                    .capabilities
-                    .as_ref()
-                    .is_some_and(|c| c.keyboard == Capability::Supported)
-                {
+                if self.capabilities.as_ref().is_some_and(|c| {
+                    c.keyboard == Capability::Supported || c.mouse == Capability::Supported
+                }) {
                     self.control = true;
                 } else {
                     self.message = "Keyboard control is unsupported or undiscovered".into();
@@ -205,10 +229,43 @@ impl App {
             }
             _ if self.control => {
                 if let Some(key) = key_name(code) {
-                    let result = match device.key(&key, true).await {
-                        Ok(()) => device.key(&key, false).await,
-                        Err(error) => Err(error),
-                    };
+                    let mods = event.modifiers;
+                    let mut modifiers = Vec::new();
+                    if mods.contains(crossterm::event::KeyModifiers::CONTROL) {
+                        modifiers.push("ControlLeft");
+                    }
+                    if mods.contains(crossterm::event::KeyModifiers::ALT) {
+                        modifiers.push("AltLeft");
+                    }
+                    if mods.contains(crossterm::event::KeyModifiers::SUPER) {
+                        modifiers.push("MetaLeft");
+                    }
+                    if mods.contains(crossterm::event::KeyModifiers::SHIFT)
+                        || matches!(code, KeyCode::Char(c) if c.is_ascii_uppercase())
+                    {
+                        modifiers.push("ShiftLeft");
+                    }
+                    let mut result = Ok(());
+                    for modifier in &modifiers {
+                        if let Err(error) = device.key(modifier, true).await {
+                            result = Err(error);
+                            break;
+                        }
+                    }
+                    if result.is_ok() {
+                        result = device.key(&key, true).await;
+                    }
+                    if result.is_ok() {
+                        result = device.key(&key, false).await;
+                    }
+                    if result.is_ok() {
+                        for modifier in modifiers.iter().rev() {
+                            if let Err(error) = device.key(modifier, false).await {
+                                result = Err(error);
+                                break;
+                            }
+                        }
+                    }
                     if let Err(error) = result {
                         self.control = false;
                         let cleanup = device.release_inputs().await;
@@ -312,7 +369,7 @@ fn mouse_coordinates(column: u16, row: u16, area: ratatui::layout::Rect) -> Opti
 
 fn key_name(code: KeyCode) -> Option<String> {
     match code {
-        KeyCode::Char(c) if c.is_ascii_lowercase() => {
+        KeyCode::Char(c) if c.is_ascii_alphabetic() => {
             Some(format!("Key{}", c.to_ascii_uppercase()))
         }
         KeyCode::Char(c) if c.is_ascii_digit() => Some(format!("Digit{c}")),
@@ -429,7 +486,10 @@ impl TerminalModes for SystemTerminal {
     }
 }
 
-struct TerminalGuard<T: TerminalModes>(T);
+struct TerminalGuard<T: TerminalModes> {
+    terminal: T,
+    restored: bool,
+}
 impl<T: TerminalModes> TerminalGuard<T> {
     fn enter(mut terminal: T) -> io::Result<Self> {
         terminal.raw()?;
@@ -444,20 +504,39 @@ impl<T: TerminalModes> TerminalGuard<T> {
             let _ = terminal.cooked();
             return Err(error);
         }
-        Ok(Self(terminal))
+        Ok(Self {
+            terminal,
+            restored: false,
+        })
+    }
+    fn restore(&mut self) -> io::Result<()> {
+        let mouse = self.terminal.mouse_off();
+        let screen = self.terminal.leave();
+        let raw = self.terminal.cooked();
+        self.restored = true;
+        let errors: Vec<String> = [mouse, screen, raw]
+            .into_iter()
+            .filter_map(Result::err)
+            .map(|e| e.to_string())
+            .collect();
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(io::Error::other(errors.join("; ")))
+        }
     }
 }
 impl<T: TerminalModes> Drop for TerminalGuard<T> {
     fn drop(&mut self) {
-        let _ = self.0.mouse_off();
-        let _ = self.0.leave();
-        let _ = self.0.cooked();
+        if !self.restored {
+            let _ = self.restore();
+        }
     }
 }
 
 /// Runs the TUI for an already authenticated device. Input cleanup is attempted on every normal return.
 pub async fn run(device: &dyn Device) -> io::Result<()> {
-    let _guard = TerminalGuard::enter(SystemTerminal)?;
+    let mut guard = TerminalGuard::enter(SystemTerminal)?;
     let picker = ratatui_image::picker::Picker::from_query_stdio()
         .unwrap_or_else(|_| ratatui_image::picker::Picker::halfblocks());
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
@@ -470,7 +549,17 @@ pub async fn run(device: &dyn Device) -> io::Result<()> {
     })
     .await;
     let cleanup = device.release_inputs().await.map_err(io::Error::other);
-    result.and(cleanup)
+    let restored = guard.restore();
+    let errors: Vec<String> = [result, cleanup, restored]
+        .into_iter()
+        .filter_map(Result::err)
+        .map(|e| e.to_string())
+        .collect();
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(io::Error::other(errors.join("; ")))
+    }
 }
 
 async fn run_loop<B: Backend>(
@@ -545,7 +634,14 @@ where
         if let Some(event) = next_event()? {
             match event {
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
-                    if !app.control && key.code == KeyCode::Char('v') {
+                    if !app.control
+                        && app.command.is_none()
+                        && app.pending.is_none()
+                        && key.code == KeyCode::Char('v')
+                    {
+                        drop(stream.take());
+                        app.video = None;
+                        video_tx.send_replace(None);
                         match device.video().await {
                             Ok(mut video) => {
                                 app.video = None;
@@ -576,7 +672,7 @@ where
                                 app.message = error.to_string();
                             }
                         }
-                    } else if !app.key(device, key.code).await {
+                    } else if !app.key_event(device, key).await {
                         break;
                     }
                 }
@@ -743,13 +839,13 @@ mod tests {
                 .iter()
                 .any(|cell| cell.symbol() == "▀")
         );
-        for _ in 0..100 {
-            if device.dropped.load(std::sync::atomic::Ordering::SeqCst) {
-                break;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !device.dropped.load(std::sync::atomic::Ordering::SeqCst) {
+                tokio::task::yield_now().await;
             }
-            tokio::task::yield_now().await;
-        }
-        assert!(device.dropped.load(std::sync::atomic::Ordering::SeqCst));
+        })
+        .await
+        .expect("stream task must release the stream after exit");
     }
 
     #[test]
@@ -776,6 +872,70 @@ mod tests {
         ] {
             assert!(parse_control(input).is_err(), "{input}");
         }
+    }
+
+    #[tokio::test]
+    async fn modifiers_and_outside_mouse_release_are_forwarded() {
+        let device = FakeDevice::default();
+        let mut app = App::default();
+        app.refresh(&device).await;
+        app.key(&device, KeyCode::Char('i')).await;
+        app.key_event(
+            &device,
+            crossterm::event::KeyEvent::new(
+                KeyCode::Char('A'),
+                crossterm::event::KeyModifiers::CONTROL,
+            ),
+        )
+        .await;
+        app.video = Some(image::RgbImage::new(2, 4));
+        let area = ratatui::layout::Rect::new(0, 0, 4, 4);
+        app.mouse(
+            &device,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 1,
+                row: 1,
+                modifiers: crossterm::event::KeyModifiers::NONE,
+            },
+            area,
+        )
+        .await;
+        app.mouse(
+            &device,
+            MouseEvent {
+                kind: MouseEventKind::Up(MouseButton::Left),
+                column: 10,
+                row: 10,
+                modifiers: crossterm::event::KeyModifiers::NONE,
+            },
+            area,
+        )
+        .await;
+        assert_eq!(
+            *device.calls.lock().unwrap(),
+            [
+                "key:ControlLeft:true",
+                "key:ShiftLeft:true",
+                "key:KeyA:true",
+                "key:KeyA:false",
+                "key:ShiftLeft:false",
+                "key:ControlLeft:false",
+                "move:-32768:-32768",
+                "button:left:true",
+                "button:left:false"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn mouse_only_device_can_enter_input_mode() {
+        let device = FakeDevice::default();
+        let mut app = App::default();
+        app.refresh(&device).await;
+        app.capabilities.as_mut().unwrap().keyboard = Capability::Unsupported;
+        app.key(&device, KeyCode::Char('i')).await;
+        assert!(app.control);
     }
 
     #[tokio::test]
