@@ -33,15 +33,16 @@ impl Drop for Mjpeg {
 }
 
 pub(crate) async fn open(device: &Kvmd) -> Result<Box<dyn VideoStream>> {
+    let session = device.client.read().await;
     let mut ws_url = device.url("ws")?;
     ws_url.query_pairs_mut().append_pair("stream", "true");
     let ws_config = tungstenite::protocol::WebSocketConfig::default()
         .max_message_size(Some(MAX_HEADER))
         .max_frame_size(Some(MAX_HEADER));
     let response = tokio::time::timeout(
-        device.timeout,
-        device
-            .video_client
+        device.config.timeout,
+        session
+            .video
             .get(ws_url)
             .headers(device.auth_headers.clone())
             .upgrade()
@@ -95,9 +96,9 @@ pub(crate) async fn open(device: &Kvmd) -> Result<Box<dyn VideoStream>> {
         .join("streamer/stream")
         .map_err(|_| Error::InvalidResponse("invalid stream URL".into()))?;
     let response = tokio::time::timeout(
-        device.timeout,
-        device
-            .video_client
+        device.config.timeout,
+        session
+            .video
             .get(url)
             .headers(device.auth_headers.clone())
             .send(),
@@ -134,7 +135,7 @@ pub(crate) async fn open(device: &Kvmd) -> Result<Box<dyn VideoStream>> {
         pending: bytes::Bytes::new(),
         lease: guard.0.take().expect("lease exists"),
         lease_state,
-        timeout: device.timeout,
+        timeout: device.config.timeout,
         first: true,
         ended: false,
     }))
