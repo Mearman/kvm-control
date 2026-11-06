@@ -61,6 +61,7 @@ async fn device(body: &'static [u8]) -> (Kvmd, Arc<Notify>, tokio::task::JoinHan
         inputs: Default::default(),
         auth_headers: Default::default(),
         approval_token: Default::default(),
+        cookies: Default::default(),
     };
     (device, closed, task)
 }
@@ -158,6 +159,117 @@ async fn trusted_tls_login_cookie_reaches_lease_and_stream() {
     task.await.unwrap();
 }
 
+async fn video_auth_headers(basic: bool) {
+    use tokio_rustls::{
+        TlsAcceptor,
+        rustls::{ServerConfig, pki_types::PrivatePkcs8KeyDer},
+    };
+    let rcgen::CertifiedKey { cert, key_pair } =
+        rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+    let tls = ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(
+            vec![cert.der().clone()],
+            PrivatePkcs8KeyDer::from(key_pair.serialize_der()).into(),
+        )
+        .unwrap();
+    let acceptor = TlsAcceptor::from(Arc::new(tls));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let task = tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        let mut tls = acceptor.accept(socket).await.unwrap();
+        let mut request = Vec::new();
+        let mut byte = [0; 1];
+        while !request.ends_with(b"\r\n\r\n") {
+            tls.read_exact(&mut byte).await.unwrap();
+            request.push(byte[0]);
+            assert!(request.len() < 8192);
+        }
+        let request = String::from_utf8(request).unwrap();
+        let headers = request.to_ascii_lowercase();
+        if basic {
+            assert!(
+                headers.contains(
+                    "authorization: basic dXNlcjpwYXNz"
+                        .to_ascii_lowercase()
+                        .as_str()
+                )
+            );
+        } else {
+            assert!(headers.contains("x-kvmd-user: user"));
+            assert!(headers.contains("x-kvmd-passwd: pass"));
+        }
+        let key = request
+            .lines()
+            .find_map(|line| line.strip_prefix("sec-websocket-key: "))
+            .unwrap();
+        let accept = tokio_tungstenite::tungstenite::handshake::derive_accept_key(key.as_bytes());
+        tls.write_all(format!("HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Accept: {accept}\r\n\r\n").as_bytes()).await.unwrap();
+        let watcher = tokio::spawn(async move {
+            let mut ws = tokio_tungstenite::WebSocketStream::from_raw_socket(
+                tls,
+                tokio_tungstenite::tungstenite::protocol::Role::Server,
+                None,
+            )
+            .await;
+            while let Some(message) = ws.next().await {
+                if message.is_err() {
+                    break;
+                }
+            }
+        });
+        let (socket, _) = listener.accept().await.unwrap();
+        let mut stream = acceptor.accept(socket).await.unwrap();
+        let mut request = [0; 4096];
+        let n = stream.read(&mut request).await.unwrap();
+        let request = std::str::from_utf8(&request[..n])
+            .unwrap()
+            .to_ascii_lowercase();
+        if basic {
+            assert!(request.contains("authorization: basic dxnlcjpwyxnz"));
+        } else {
+            assert!(request.contains("x-kvmd-user: user"));
+            assert!(request.contains("x-kvmd-passwd: pass"));
+        }
+        stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: multipart/x-mixed-replace; boundary=frame\r\n\r\n--frame\r\nContent-Type: image/jpeg\r\nContent-Length: 4\r\n\r\n\xff\xd8\xff\xd9\r\n--frame--\r\n").await.unwrap();
+        watcher.await.unwrap();
+    });
+    let config = Config {
+        endpoint: Url::parse(&format!("https://localhost:{}/proxy/", address.port())).unwrap(),
+        profile: DeviceProfile::PiKvm,
+        trusted_ca_pem: Some(cert.pem().into_bytes()),
+        insecure_tls: false,
+        timeout: Duration::from_secs(3),
+    };
+    let device = if basic {
+        Kvmd::with_basic_auth(config, "user", "pass")
+    } else {
+        Kvmd::with_header_auth(config, "user", "pass")
+    }
+    .unwrap();
+    let mut video = device.video().await.unwrap();
+    assert_eq!(
+        video.next_frame().await.unwrap().unwrap().jpeg,
+        b"\xff\xd8\xff\xd9"
+    );
+    assert!(video.next_frame().await.unwrap().is_none());
+    tokio::time::timeout(Duration::from_secs(3), task)
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test]
+async fn header_auth_reaches_video() {
+    video_auth_headers(false).await;
+}
+
+#[tokio::test]
+async fn basic_auth_reaches_video() {
+    video_auth_headers(true).await;
+}
+
 #[tokio::test]
 async fn cancelled_partial_frame_can_resume() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -192,6 +304,7 @@ async fn cancelled_partial_frame_can_resume() {
         inputs: Default::default(),
         auth_headers: Default::default(),
         approval_token: Default::default(),
+        cookies: Default::default(),
     };
     let mut video = device.video().await.unwrap();
     assert!(
@@ -238,6 +351,7 @@ async fn coalesced_http_response_delivers_multiple_frames() {
         inputs: Default::default(),
         auth_headers: Default::default(),
         approval_token: Default::default(),
+        cookies: Default::default(),
     };
     let mut video = device.video().await.unwrap();
     assert_eq!(
