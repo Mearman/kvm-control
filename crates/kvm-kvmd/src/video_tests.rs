@@ -91,7 +91,7 @@ async fn trusted_tls_login_cookie_reaches_lease_and_stream() {
                 .unwrap()
                 .starts_with("POST /proxy/api/auth/login ")
         );
-        login.write_all(b"HTTP/1.1 200 OK\r\nSet-Cookie: auth_token=synthetic; Path=/\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}").await.unwrap();
+        login.write_all(b"HTTP/1.1 200 OK\r\nSet-Cookie: auth_token=synthetic; Path=/\r\nContent-Length: 23\r\nConnection: close\r\n\r\n{\"ok\":true,\"result\":{}}").await.unwrap();
         login.shutdown().await.unwrap();
         let (socket, _) = listener.accept().await.unwrap();
         let mut tls = acceptor.accept(socket).await.unwrap();
