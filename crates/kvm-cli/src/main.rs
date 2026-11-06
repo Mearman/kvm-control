@@ -6,7 +6,7 @@ use std::{
 
 use base64::{Engine, engine::general_purpose::STANDARD};
 use clap::{Parser, Subcommand, ValueEnum};
-use kvm_core::{Confirmation, Control, Device, DeviceProfile, PowerAction};
+use kvm_core::{Confirmation, Control, ControlOutcome, Device, DeviceProfile, PowerAction};
 use kvm_kvmd::{Config, Kvmd, LoginState};
 use serde_json::{Value, json};
 use url::Url;
@@ -182,11 +182,15 @@ async fn run_control(
     if !confirm {
         return Err("explicit --confirm is required".into());
     }
-    device
+    let outcome = device
         .control(operation, Confirmation::new())
         .await
         .map_err(|e| e.to_string())?;
-    Ok(json!({"accepted": true, "post_state": "unverified"}))
+    let post_state = match outcome {
+        ControlOutcome::ObservedMatching => "observed_matching",
+        ControlOutcome::Unverified => "unverified",
+    };
+    Ok(json!({"accepted": true, "post_state": post_state}))
 }
 
 async fn execute(device: &impl Device, command: Command) -> Result<Value, String> {
@@ -426,9 +430,16 @@ mod tests {
             self.0.lock().unwrap().push(format!("{x},{y}"));
             Ok(())
         }
-        async fn control(&self, operation: Control, _: Confirmation) -> kvm_core::Result<()> {
+        async fn control(
+            &self,
+            operation: Control,
+            _: Confirmation,
+        ) -> kvm_core::Result<ControlOutcome> {
             self.0.lock().unwrap().push(format!("{operation:?}"));
-            Ok(())
+            Ok(match operation {
+                Control::Power(_) => ControlOutcome::Unverified,
+                _ => ControlOutcome::ObservedMatching,
+            })
         }
         async fn release_inputs(&self) -> kvm_core::Result<()> {
             self.0.lock().unwrap().push("release".into());
@@ -473,7 +484,16 @@ mod tests {
                 .unwrap()["post_state"],
             "unverified"
         );
-        assert_eq!(*device.0.lock().unwrap(), ["Power(On)"]);
+        assert_eq!(
+            run_control(&device, Control::Switch { port: 1 }, true)
+                .await
+                .unwrap()["post_state"],
+            "observed_matching"
+        );
+        assert_eq!(
+            *device.0.lock().unwrap(),
+            ["Power(On)", "Switch { port: 1 }"]
+        );
     }
 
     #[test]
