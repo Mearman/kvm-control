@@ -214,6 +214,28 @@ where
     cleanup.map_err(|e| e.to_string())
 }
 
+fn write_snapshot(
+    path: &std::path::Path,
+    bytes: &[u8],
+    write: impl FnOnce(&mut std::fs::File, &[u8]) -> io::Result<()>,
+) -> Result<(), String> {
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|e| format!("cannot create snapshot: {e}"))?;
+    if let Err(error) = write(&mut file, bytes) {
+        drop(file);
+        return match std::fs::remove_file(path) {
+            Ok(()) => Err(format!("cannot write snapshot: {error}")),
+            Err(cleanup) => Err(format!(
+                "cannot write snapshot: {error}; cannot remove partial file: {cleanup}"
+            )),
+        };
+    }
+    Ok(())
+}
+
 async fn execute(device: &impl Device, command: Command) -> Result<Value, String> {
     match command {
         Command::Diagnose | Command::Status => {
@@ -224,20 +246,7 @@ async fn execute(device: &impl Device, command: Command) -> Result<Value, String
         }
         Command::Snapshot { output } => {
             let snapshot = device.snapshot().await.map_err(|e| e.to_string())?;
-            let mut file = std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&output)
-                .map_err(|e| format!("cannot create snapshot: {e}"))?;
-            if let Err(error) = file.write_all(&snapshot.jpeg) {
-                drop(file);
-                return match std::fs::remove_file(&output) {
-                    Ok(()) => Err(format!("cannot write snapshot: {error}")),
-                    Err(cleanup) => Err(format!(
-                        "cannot write snapshot: {error}; cannot remove partial file: {cleanup}"
-                    )),
-                };
-            }
+            write_snapshot(&output, &snapshot.jpeg, |file, bytes| file.write_all(bytes))?;
             Ok(json!({"output": output, "bytes": snapshot.jpeg.len()}))
         }
         Command::Key { key } => {
@@ -491,6 +500,19 @@ mod tests {
             self.0.lock().unwrap().push("release".into());
             Ok(())
         }
+    }
+
+    #[test]
+    fn partial_snapshot_is_removed_after_write_failure() {
+        let path =
+            std::env::temp_dir().join(format!("kvm-cli-snapshot-test-{}", std::process::id()));
+        assert!(!path.exists());
+        let result = write_snapshot(&path, b"jpeg", |file, bytes| {
+            file.write_all(&bytes[..2])?;
+            Err(io::Error::other("synthetic write failure"))
+        });
+        assert!(result.unwrap_err().contains("synthetic write failure"));
+        assert!(!path.exists(), "partial snapshot must be removed");
     }
 
     #[tokio::test]
