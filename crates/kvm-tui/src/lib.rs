@@ -424,6 +424,40 @@ impl App {
                                 }
                             }
                         }
+                        let result = if result.is_ok() && event.kind == KeyEventKind::Release {
+                            let pair = match key.as_str() {
+                                "ShiftRight" => {
+                                    Some(("ShiftLeft", crossterm::event::KeyModifiers::SHIFT))
+                                }
+                                "ControlRight" => {
+                                    Some(("ControlLeft", crossterm::event::KeyModifiers::CONTROL))
+                                }
+                                "AltRight" => {
+                                    Some(("AltLeft", crossterm::event::KeyModifiers::ALT))
+                                }
+                                "MetaRight" => {
+                                    Some(("MetaLeft", crossterm::event::KeyModifiers::SUPER))
+                                }
+                                _ => None,
+                            };
+                            if let Some((left, flag)) = pair
+                                && self.synthetic_modifiers.contains(left)
+                                && !event.modifiers.contains(flag)
+                            {
+                                match device.key(left, false).await {
+                                    Ok(()) => {
+                                        self.synthetic_modifiers.remove(left);
+                                        self.held_modifiers.remove(left);
+                                        Ok(())
+                                    }
+                                    Err(error) => Err(error),
+                                }
+                            } else {
+                                result
+                            }
+                        } else {
+                            result
+                        };
                         if let Err(error) = result {
                             self.control = false;
                             self.clear_input_state();
@@ -1662,6 +1696,76 @@ mod tests {
         assert!(app.drag_modifiers.is_empty());
         assert!(app.held_modifiers.is_empty());
         assert_eq!(*device.calls.lock().unwrap(), ["release"]);
+    }
+
+    #[tokio::test]
+    async fn mixed_synthetic_and_tracked_modifiers_release_both_sides() {
+        use crossterm::event::{KeyModifiers, ModifierKeyCode};
+        for (flag, left, right, left_name, right_name) in [
+            (
+                KeyModifiers::SHIFT,
+                ModifierKeyCode::LeftShift,
+                ModifierKeyCode::RightShift,
+                "ShiftLeft",
+                "ShiftRight",
+            ),
+            (
+                KeyModifiers::CONTROL,
+                ModifierKeyCode::LeftControl,
+                ModifierKeyCode::RightControl,
+                "ControlLeft",
+                "ControlRight",
+            ),
+            (
+                KeyModifiers::ALT,
+                ModifierKeyCode::LeftAlt,
+                ModifierKeyCode::RightAlt,
+                "AltLeft",
+                "AltRight",
+            ),
+            (
+                KeyModifiers::SUPER,
+                ModifierKeyCode::LeftSuper,
+                ModifierKeyCode::RightSuper,
+                "MetaLeft",
+                "MetaRight",
+            ),
+        ] {
+            let device = FakeDevice::default();
+            let mut app = App {
+                enhanced_keyboard: true,
+                ..App::default()
+            };
+            app.refresh(&device).await;
+            app.control = true;
+            for (code, modifiers, kind) in [
+                (KeyCode::Char('a'), flag, KeyEventKind::Press),
+                (KeyCode::Modifier(right), flag, KeyEventKind::Press),
+                (KeyCode::Modifier(left), flag, KeyEventKind::Release),
+                (
+                    KeyCode::Modifier(right),
+                    KeyModifiers::NONE,
+                    KeyEventKind::Release,
+                ),
+            ] {
+                app.key_event(
+                    &device,
+                    crossterm::event::KeyEvent::new_with_kind(code, modifiers, kind),
+                )
+                .await;
+            }
+            assert_eq!(
+                *device.calls.lock().unwrap(),
+                [
+                    format!("key:{left_name}:true"),
+                    "key:KeyA:true".into(),
+                    format!("key:{right_name}:true"),
+                    format!("key:{right_name}:false"),
+                    format!("key:{left_name}:false")
+                ]
+            );
+            assert!(app.held_modifiers.is_empty());
+        }
     }
 
     #[tokio::test]
