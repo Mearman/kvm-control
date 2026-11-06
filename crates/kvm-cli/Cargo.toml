@@ -1,0 +1,17 @@
+[package]
+name = "kvm-cli"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+clap = { version = "4.6.7", features = ["derive"] }
+kvm-core = { version = "0.1.0", path = "../kvm-core" }
+kvm-kvmd = { version = "0.1.0", path = "../kvm-kvmd" }
+rpassword = "7.5.4"
+serde_json.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+url.workspace = true
+
+[dev-dependencies]
+async-trait.workspace = true
