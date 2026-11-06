@@ -61,6 +61,9 @@ impl reqwest::cookie::CookieStore for SessionCookies {
     }
 }
 
+/// A KVMD connection with an explicitly authenticated session.
+///
+/// Cookies are accepted only from login or approval responses. Later `Set-Cookie` headers, including rotation and expiry updates, are ignored. The inspected [PiKVM](https://github.com/pikvm/kvmd/blob/fcb903eb3be70d8eee4aee99e5fcc1c743e3ccef/kvmd/apps/kvmd/api/auth.py) and [GLKVM](https://github.com/gl-inet/glkvm/blob/3e8dd23c4bd638a4650433664cc3b0f3b4d29395/kvmd/apps/kvmd/api/auth.py) revisions issue authentication cookies on login, and GLKVM also issues them on approval. Other firmware requiring cookie rotation is not supported. Server-side expiry or revocation can return an authentication error; call `login` again with fresh credentials and complete any approval. Consequential and input requests are never automatically replayed, and ambiguous outcomes require observation before a caller decides what to do.
 pub struct Kvmd {
     client: RwLock<Session>,
     config: Config,
