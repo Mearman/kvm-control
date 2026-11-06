@@ -236,12 +236,30 @@ impl Device for Kvmd {
     }
 
     async fn snapshot(&self) -> Result<Snapshot> {
-        let bytes = self
-            .get("streamer/snapshot")
-            .await?
-            .bytes()
+        // Limit compressed image data before collecting it, including chunked responses.
+        const MAX_SNAPSHOT_BYTES: usize = 16 * 1024 * 1024;
+        let mut response = self.get("streamer/snapshot").await?;
+        if response
+            .content_length()
+            .is_some_and(|n| n > MAX_SNAPSHOT_BYTES as u64)
+        {
+            return Err(Error::InvalidResponse(
+                "snapshot exceeds the size limit".into(),
+            ));
+        }
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response
+            .chunk()
             .await
-            .map_err(|_| Error::Transport("snapshot read failed".into()))?;
+            .map_err(|_| Error::Transport("snapshot read failed".into()))?
+        {
+            if chunk.len() > MAX_SNAPSHOT_BYTES - bytes.len() {
+                return Err(Error::InvalidResponse(
+                    "snapshot exceeds the size limit".into(),
+                ));
+            }
+            bytes.extend_from_slice(&chunk);
+        }
         if !bytes.starts_with(&[0xff, 0xd8]) || !bytes.ends_with(&[0xff, 0xd9]) {
             return Err(Error::InvalidResponse(
                 "snapshot is not a complete JPEG".into(),

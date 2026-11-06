@@ -64,6 +64,10 @@ async fn fixture() -> (Url, Vec<u8>, Calls, tokio::task::JoinHandle<()>) {
         .route("/api/info", get(status))
         .route("/api/hid", get(status))
         .route("/api/streamer", get(status))
+        .route(
+            "/api/streamer/snapshot",
+            get(|| async { vec![0u8; 16 * 1024 * 1024 + 1] }),
+        )
         .with_state(calls.clone());
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -91,6 +95,16 @@ fn client(endpoint: Url, ca: Option<Vec<u8>>) -> Kvmd {
         timeout: Duration::from_secs(5),
     })
     .unwrap()
+}
+
+#[tokio::test]
+async fn snapshot_rejects_oversized_response() {
+    let (endpoint, ca, _, server) = fixture().await;
+    let device = client(endpoint, Some(ca));
+    assert!(
+        matches!(device.snapshot().await, Err(Error::InvalidResponse(message)) if message.contains("size limit"))
+    );
+    server.abort();
 }
 
 #[tokio::test]
