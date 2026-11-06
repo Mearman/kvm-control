@@ -701,6 +701,8 @@ mod tests {
     struct FakeDevice {
         calls: std::sync::Mutex<Vec<String>>,
         fail_key: bool,
+        video_calls: std::sync::atomic::AtomicUsize,
+        fail_restart: bool,
         video_frame: Option<Vec<u8>>,
         dropped: std::sync::Arc<std::sync::atomic::AtomicBool>,
     }
@@ -727,6 +729,12 @@ mod tests {
     #[async_trait::async_trait]
     impl Device for FakeDevice {
         async fn video(&self) -> kvm_core::Result<Box<dyn kvm_core::VideoStream>> {
+            let calls = self
+                .video_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.fail_restart && calls > 0 {
+                return Err(kvm_core::Error::Transport("restart failed".into()));
+            }
             match &self.video_frame {
                 Some(jpeg) => Ok(Box::new(FakeStream {
                     jpeg: Some(jpeg.clone()),
@@ -846,6 +854,99 @@ mod tests {
         })
         .await
         .expect("stream task must release the stream after exit");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn video_key_is_routed_to_command_and_confirmation() {
+        let device = FakeDevice::default();
+        let mut terminal = Terminal::new(TestBackend::new(60, 16)).unwrap();
+        let sequence = [
+            ':', 'p', 'o', 'w', 'e', 'r', ' ', 'o', 'f', 'f', '\n', 'v', 'q',
+        ];
+        let mut events = sequence.into_iter();
+        run_loop(
+            &mut terminal,
+            &device,
+            &ratatui_image::picker::Picker::halfblocks(),
+            || {
+                let c = events.next().expect("quit event");
+                Ok(Some(Event::Key(crossterm::event::KeyEvent::new(
+                    if c == '\n' {
+                        KeyCode::Enter
+                    } else {
+                        KeyCode::Char(c)
+                    },
+                    crossterm::event::KeyModifiers::NONE,
+                ))))
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            device.video_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        assert!(device.calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn failed_restart_drops_old_stream() {
+        let image = image::RgbImage::from_pixel(8, 8, image::Rgb([220, 10, 10]));
+        let mut jpeg = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new(&mut jpeg)
+            .encode_image(&image)
+            .unwrap();
+        let device = FakeDevice {
+            video_frame: Some(jpeg),
+            fail_restart: true,
+            ..FakeDevice::default()
+        };
+        let mut terminal = Terminal::new(TestBackend::new(60, 16)).unwrap();
+        let mut count = 0;
+        run_loop(
+            &mut terminal,
+            &device,
+            &ratatui_image::picker::Picker::halfblocks(),
+            || {
+                count += 1;
+                let code = if count == 1 || count == 100 {
+                    Some('v')
+                } else if count == 200 {
+                    Some('q')
+                } else {
+                    None
+                };
+                std::thread::yield_now();
+                Ok(code.map(|c| {
+                    Event::Key(crossterm::event::KeyEvent::new(
+                        KeyCode::Char(c),
+                        crossterm::event::KeyModifiers::NONE,
+                    ))
+                }))
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            device.video_calls.load(std::sync::atomic::Ordering::SeqCst),
+            2
+        );
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !device.dropped.load(std::sync::atomic::Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let content = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<String>();
+        assert!(content.contains("restart failed"));
+        assert!(!content.contains('▀'));
     }
 
     #[test]
@@ -1049,6 +1150,7 @@ mod tests {
     struct FakeModes {
         calls: std::rc::Rc<std::cell::RefCell<Vec<&'static str>>>,
         fail_alternate: bool,
+        fail_restore: bool,
     }
     impl TerminalModes for FakeModes {
         fn raw(&mut self) -> io::Result<()> {
@@ -1065,7 +1167,11 @@ mod tests {
         }
         fn leave(&mut self) -> io::Result<()> {
             self.calls.borrow_mut().push("leave");
-            Ok(())
+            if self.fail_restore {
+                Err(io::Error::other("leave failed"))
+            } else {
+                Ok(())
+            }
         }
         fn cooked(&mut self) -> io::Result<()> {
             self.calls.borrow_mut().push("cooked");
@@ -1082,12 +1188,42 @@ mod tests {
     }
 
     #[test]
+    fn restoration_reports_error_and_still_restores_raw_mode() {
+        let calls = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let mut guard = TerminalGuard::enter(FakeModes {
+            calls: calls.clone(),
+            fail_alternate: false,
+            fail_restore: true,
+        })
+        .unwrap();
+        assert!(
+            guard
+                .restore()
+                .unwrap_err()
+                .to_string()
+                .contains("leave failed")
+        );
+        assert_eq!(
+            *calls.borrow(),
+            [
+                "raw",
+                "alternate",
+                "mouse_on",
+                "mouse_off",
+                "leave",
+                "cooked"
+            ]
+        );
+    }
+
+    #[test]
     fn restores_terminal_after_exit_and_failed_setup() {
         for fail in [false, true] {
             let calls = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
             let guard = TerminalGuard::enter(FakeModes {
                 calls: calls.clone(),
                 fail_alternate: fail,
+                fail_restore: false,
             });
             assert_eq!(guard.is_err(), fail);
             drop(guard);
