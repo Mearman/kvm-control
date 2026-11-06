@@ -11,6 +11,15 @@ use rustls::{ServerConfig, ServerConnection, StreamOwned, pki_types::PrivatePkcs
 use serde_json::Value;
 
 fn invoke(command: &[&str], responses: Vec<&'static [u8]>) -> (std::process::Output, Vec<String>) {
+    invoke_with_signal(command, responses, false)
+}
+
+fn invoke_with_signal(
+    command: &[&str],
+    responses: Vec<&'static [u8]>,
+    signal_press: bool,
+) -> (std::process::Output, Vec<String>) {
+    let (sender, receiver) = std::sync::mpsc::channel::<u32>();
     let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
     let config = ServerConfig::builder()
         .with_no_client_auth()
@@ -70,7 +79,22 @@ fn invoke(command: &[&str], responses: Vec<&'static [u8]>) -> (std::process::Out
                     }
                 }
             }
-            requests.push(String::from_utf8(bytes).unwrap());
+            let request = String::from_utf8(bytes).unwrap();
+            if signal_press
+                && request.starts_with("POST /api/hid/events/send_key?key=KeyA&state=true ")
+            {
+                let pid = receiver.recv_timeout(Duration::from_secs(10)).unwrap();
+                assert!(
+                    Command::new("kill")
+                        .args(["-TERM", &pid.to_string()])
+                        .status()
+                        .unwrap()
+                        .success()
+                );
+                requests.push(request);
+                continue;
+            }
+            requests.push(request);
             write!(
                 stream,
                 "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
@@ -99,6 +123,7 @@ fn invoke(command: &[&str], responses: Vec<&'static [u8]>) -> (std::process::Out
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
+    sender.send(child.id()).unwrap();
     child
         .stdin
         .take()
@@ -190,6 +215,17 @@ fn expired_approval_does_not_submit_a_poll() {
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("device approval expired"));
     assert_eq!(requests.len(), 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn sigterm_during_key_press_releases_input() {
+    let ok = b"{\"ok\":true,\"result\":{}}";
+    let (output, requests) = invoke_with_signal(&["key", "KeyA"], vec![ok, ok, ok, ok], true);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("interrupted"));
+    assert!(requests[2].starts_with("POST /api/hid/events/send_key?key=KeyA&state=true "));
+    assert!(requests[3].starts_with("POST /api/hid/events/send_key?key=KeyA&state=false "));
 }
 
 #[test]
