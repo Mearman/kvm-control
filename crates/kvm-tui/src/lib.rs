@@ -159,8 +159,13 @@ impl App {
                         if let Err(error) = device.key(modifier, true).await {
                             self.control = false;
                             self.clear_input_state();
-                            self.message = error.to_string();
-                            let _ = device.release_inputs().await;
+                            let cleanup = device.release_inputs().await;
+                            self.message = match cleanup {
+                                Ok(()) => error.to_string(),
+                                Err(cleanup) => {
+                                    format!("{error}; input cleanup uncertain: {cleanup}")
+                                }
+                            };
                             return;
                         }
                         if self.enhanced_keyboard {
@@ -1217,6 +1222,7 @@ mod tests {
     struct FakeDevice {
         calls: std::sync::Mutex<Vec<String>>,
         fail_key: bool,
+        fail_cleanup: bool,
         fail_mouse_release: bool,
         video_calls: std::sync::atomic::AtomicUsize,
         fail_restart: bool,
@@ -1319,7 +1325,11 @@ mod tests {
         }
         async fn release_inputs(&self) -> kvm_core::Result<()> {
             self.calls.lock().unwrap().push("release".into());
-            Ok(())
+            if self.fail_cleanup {
+                Err(kvm_core::Error::AmbiguousInput("cleanup failed".into()))
+            } else {
+                Ok(())
+            }
         }
         async fn control(
             &self,
@@ -1817,6 +1827,37 @@ mod tests {
         assert_eq!(
             *device.calls.lock().unwrap(),
             ["key:ShiftLeft:true", "key:ControlLeft:false"]
+        );
+    }
+
+    #[tokio::test]
+    async fn outside_modifier_failure_reports_failed_cleanup() {
+        let device = FakeDevice {
+            fail_key: true,
+            fail_cleanup: true,
+            ..FakeDevice::default()
+        };
+        let mut app = App::default();
+        app.refresh(&device).await;
+        app.control = true;
+        app.video = Some(image::RgbImage::new(2, 4));
+        app.mouse(
+            &device,
+            MouseEvent {
+                kind: MouseEventKind::Up(MouseButton::Left),
+                column: 10,
+                row: 1,
+                modifiers: crossterm::event::KeyModifiers::SHIFT,
+            },
+            ratatui::layout::Rect::new(0, 0, 4, 4),
+        )
+        .await;
+        assert!(app.message.contains("failure"));
+        assert!(app.message.contains("input cleanup uncertain"));
+        assert!(app.message.contains("cleanup failed"));
+        assert_eq!(
+            *device.calls.lock().unwrap(),
+            ["key:ShiftLeft:true", "release"]
         );
     }
 
