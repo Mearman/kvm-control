@@ -35,6 +35,7 @@ pub struct App {
     pub video: Option<image::RgbImage>,
     pending: Option<kvm_core::Control>,
     command: Option<String>,
+    submitted: Option<kvm_core::Control>,
 }
 
 impl App {
@@ -86,20 +87,22 @@ impl App {
             return;
         }
         let Some(video) = &self.video else {
-            if matches!(event.kind, MouseEventKind::Up(_))
-                && let Err(error) = device.release_inputs().await
-            {
-                self.control = false;
-                self.message = error.to_string();
+            if matches!(event.kind, MouseEventKind::Up(_)) {
+                self.clear_input_state();
+                if let Err(error) = device.release_inputs().await {
+                    self.control = false;
+                    self.message = error.to_string();
+                }
             }
             return;
         };
         let Some(viewport) = video_viewport(area, video.width(), video.height()) else {
-            if matches!(event.kind, MouseEventKind::Up(_))
-                && let Err(error) = device.release_inputs().await
-            {
-                self.control = false;
-                self.message = error.to_string();
+            if matches!(event.kind, MouseEventKind::Up(_)) {
+                self.clear_input_state();
+                if let Err(error) = device.release_inputs().await {
+                    self.control = false;
+                    self.message = error.to_string();
+                }
             }
             return;
         };
@@ -229,19 +232,8 @@ impl App {
         let code = event.code;
         if let Some(operation) = self.pending.take() {
             if code == KeyCode::Char('y') {
-                self.message = match device
-                    .control(operation, kvm_core::Confirmation::new())
-                    .await
-                {
-                    Ok(kvm_core::ControlOutcome::ObservedMatching) => {
-                        "Request acknowledged; device state matches (causation not established)"
-                            .into()
-                    }
-                    Ok(kvm_core::ControlOutcome::Unverified) => {
-                        "Request acknowledged; outcome not verified".into()
-                    }
-                    Err(error) => error.to_string(),
-                };
+                self.submitted = Some(operation);
+                self.message = "Request submitted; outcome pending".into();
             } else {
                 self.message = "Request cancelled".into();
             }
@@ -359,13 +351,44 @@ impl App {
                                 }
                             }
                         }
+                        let release_key = match key.as_str() {
+                            "ShiftRight"
+                                if !self.held_modifiers.contains("ShiftRight")
+                                    && self.held_modifiers.contains("ShiftLeft") =>
+                            {
+                                "ShiftLeft"
+                            }
+                            "ControlRight"
+                                if !self.held_modifiers.contains("ControlRight")
+                                    && self.held_modifiers.contains("ControlLeft") =>
+                            {
+                                "ControlLeft"
+                            }
+                            "AltRight"
+                                if !self.held_modifiers.contains("AltRight")
+                                    && self.held_modifiers.contains("AltLeft") =>
+                            {
+                                "AltLeft"
+                            }
+                            "MetaRight"
+                                if !self.held_modifiers.contains("MetaRight")
+                                    && self.held_modifiers.contains("MetaLeft") =>
+                            {
+                                "MetaLeft"
+                            }
+                            _ => key.as_str(),
+                        };
                         let result = match event.kind {
                             KeyEventKind::Press => device.key(&key, true).await,
-                            KeyEventKind::Release => device.key(&key, false).await,
+                            KeyEventKind::Release => device.key(release_key, false).await,
                             KeyEventKind::Repeat => Ok(()),
                         };
                         if result.is_ok() && matches!(code, KeyCode::Modifier(_)) {
-                            let name = match key.as_str() {
+                            let name = match if event.kind == KeyEventKind::Release {
+                                release_key
+                            } else {
+                                key.as_str()
+                            } {
                                 "ShiftLeft" => Some("ShiftLeft"),
                                 "ControlLeft" => Some("ControlLeft"),
                                 "AltLeft" => Some("AltLeft"),
@@ -386,6 +409,7 @@ impl App {
                         }
                         if let Err(error) = result {
                             self.control = false;
+                            self.clear_input_state();
                             let cleanup = device.release_inputs().await;
                             self.message = match cleanup {
                                 Ok(()) => error.to_string(),
@@ -412,6 +436,7 @@ impl App {
                     {
                         modifiers.push("ShiftLeft");
                     }
+                    modifiers.retain(|modifier| !self.drag_modifiers.contains(modifier));
                     let mut result = Ok(());
                     for modifier in &modifiers {
                         if let Err(error) = device.key(modifier, true).await {
@@ -851,7 +876,28 @@ where
         }
     }
     let mut stream: Option<StreamTask> = None;
+    let mut control_request: Option<
+        std::pin::Pin<
+            Box<dyn std::future::Future<Output = kvm_core::Result<kvm_core::ControlOutcome>> + '_>,
+        >,
+    > = None;
     loop {
+        if let Some(request) = &mut control_request {
+            let outcome = tokio::select! { outcome = request.as_mut() => Some(outcome), _ = tokio::time::sleep(Duration::from_millis(1)) => None };
+            if let Some(outcome) = outcome {
+                control_request = None;
+                app.message = match outcome {
+                    Ok(kvm_core::ControlOutcome::ObservedMatching) => {
+                        "Request acknowledged; device state matches (causation not established)"
+                            .into()
+                    }
+                    Ok(kvm_core::ControlOutcome::Unverified) => {
+                        "Request acknowledged; outcome not verified".into()
+                    }
+                    Err(error) => error.to_string(),
+                };
+            }
+        }
         terminal
             .draw(|frame| {
                 draw(frame, &app);
@@ -967,7 +1013,20 @@ where
                             }
                         }
                     } else if !app.key_event(device, key).await {
-                        break;
+                        if control_request.is_some() {
+                            app.message = "Request still in flight; wait for outcome".into();
+                        } else {
+                            break;
+                        }
+                    }
+                    if let Some(operation) = app.submitted.take() {
+                        if control_request.is_none() {
+                            control_request = Some(Box::pin(
+                                device.control(operation, kvm_core::Confirmation::new()),
+                            ));
+                        } else {
+                            app.message = "Another request is already in flight".into();
+                        }
                     }
                 }
                 Event::FocusLost => {
@@ -976,6 +1035,10 @@ where
                     app.pending = None;
                     app.command = None;
                     app.message = match device.release_inputs().await {
+                        Ok(()) if control_request.is_some() => {
+                            "Focus lost; inputs released; submitted request remains in flight"
+                                .into()
+                        }
                         Ok(()) => "Focus lost; inputs released".into(),
                         Err(error) => format!("Focus lost; input cleanup uncertain: {error}"),
                     };
@@ -1011,6 +1074,8 @@ mod tests {
         video_frame: Option<Vec<u8>>,
         dropped: std::sync::Arc<std::sync::atomic::AtomicBool>,
         fail_video_after_frame: bool,
+        block_control: bool,
+        control_release: tokio::sync::Notify,
     }
     struct FakeStream {
         jpeg: Option<Vec<u8>>,
@@ -1113,6 +1178,9 @@ mod tests {
             _: kvm_core::Confirmation,
         ) -> kvm_core::Result<kvm_core::ControlOutcome> {
             self.calls.lock().unwrap().push("power".into());
+            if self.block_control {
+                self.control_release.notified().await;
+            }
             Ok(kvm_core::ControlOutcome::Unverified)
         }
     }
@@ -1220,6 +1288,52 @@ mod tests {
         })
         .await
         .expect("stream task must release the stream after exit");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn focus_loss_is_processed_during_submitted_control() {
+        let device = FakeDevice {
+            block_control: true,
+            ..FakeDevice::default()
+        };
+        let mut terminal = Terminal::new(TestBackend::new(60, 16)).unwrap();
+        let mut events = ":power off\ny".chars();
+        let mut focus_sent = false;
+        run_loop(
+            &mut terminal,
+            &device,
+            &ratatui_image::picker::Picker::halfblocks(),
+            false,
+            || {
+                if let Some(c) = events.next() {
+                    return Ok(Some(Event::Key(crossterm::event::KeyEvent::new(
+                        if c == '\n' {
+                            KeyCode::Enter
+                        } else {
+                            KeyCode::Char(c)
+                        },
+                        crossterm::event::KeyModifiers::NONE,
+                    ))));
+                }
+                let calls = device.calls.lock().unwrap().clone();
+                if calls.iter().any(|x| x == "power") && !focus_sent {
+                    focus_sent = true;
+                    return Ok(Some(Event::FocusLost));
+                }
+                if calls.iter().any(|x| x == "release") {
+                    device.control_release.notify_one();
+                    return Ok(Some(Event::Key(crossterm::event::KeyEvent::new(
+                        KeyCode::Char('q'),
+                        crossterm::event::KeyModifiers::NONE,
+                    ))));
+                }
+                std::thread::yield_now();
+                Ok(None)
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(*device.calls.lock().unwrap(), ["power", "release"]);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1485,6 +1599,89 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn failed_enhanced_key_clears_local_modifier_state() {
+        let device = FakeDevice {
+            fail_key: true,
+            ..FakeDevice::default()
+        };
+        let mut app = App {
+            enhanced_keyboard: true,
+            ..App::default()
+        };
+        app.refresh(&device).await;
+        app.control = true;
+        app.held_modifiers.insert("ShiftLeft");
+        app.key_event(
+            &device,
+            crossterm::event::KeyEvent::new(
+                KeyCode::Char('a'),
+                crossterm::event::KeyModifiers::NONE,
+            ),
+        )
+        .await;
+        assert!(app.held_modifiers.is_empty());
+        assert_eq!(*device.calls.lock().unwrap(), ["key:KeyA:true", "release"]);
+    }
+
+    #[tokio::test]
+    async fn mouse_release_without_viewport_clears_local_state() {
+        let device = FakeDevice::default();
+        let mut app = App::default();
+        app.refresh(&device).await;
+        app.control = true;
+        app.drag_modifiers.push("ShiftLeft");
+        app.held_modifiers.insert("ShiftLeft");
+        app.mouse(
+            &device,
+            MouseEvent {
+                kind: MouseEventKind::Up(MouseButton::Left),
+                column: 0,
+                row: 0,
+                modifiers: crossterm::event::KeyModifiers::NONE,
+            },
+            ratatui::layout::Rect::new(0, 0, 4, 4),
+        )
+        .await;
+        assert!(app.drag_modifiers.is_empty());
+        assert!(app.held_modifiers.is_empty());
+        assert_eq!(*device.calls.lock().unwrap(), ["release"]);
+    }
+
+    #[tokio::test]
+    async fn preheld_right_shift_release_releases_synthesised_left() {
+        let device = FakeDevice::default();
+        let mut app = App {
+            enhanced_keyboard: true,
+            ..App::default()
+        };
+        app.refresh(&device).await;
+        app.key(&device, KeyCode::Char('i')).await;
+        app.key_event(
+            &device,
+            crossterm::event::KeyEvent::new_with_kind(
+                KeyCode::Char('a'),
+                crossterm::event::KeyModifiers::SHIFT,
+                KeyEventKind::Press,
+            ),
+        )
+        .await;
+        app.key_event(
+            &device,
+            crossterm::event::KeyEvent::new_with_kind(
+                KeyCode::Modifier(crossterm::event::ModifierKeyCode::RightShift),
+                crossterm::event::KeyModifiers::NONE,
+                KeyEventKind::Release,
+            ),
+        )
+        .await;
+        assert_eq!(
+            *device.calls.lock().unwrap(),
+            ["key:ShiftLeft:true", "key:KeyA:true", "key:ShiftLeft:false"]
+        );
+        assert!(app.held_modifiers.is_empty());
+    }
+
+    #[tokio::test]
     async fn right_shift_is_not_duplicated_and_exit_clears_state() {
         let device = FakeDevice::default();
         let mut app = App {
@@ -1518,6 +1715,44 @@ mod tests {
             ["key:ShiftRight:true", "key:KeyA:true", "release"]
         );
         assert!(app.held_modifiers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn fallback_keyboard_does_not_release_drag_modifier() {
+        let device = FakeDevice::default();
+        let mut app = App::default();
+        app.refresh(&device).await;
+        app.control = true;
+        app.video = Some(image::RgbImage::new(2, 4));
+        app.mouse(
+            &device,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 1,
+                row: 1,
+                modifiers: crossterm::event::KeyModifiers::SHIFT,
+            },
+            ratatui::layout::Rect::new(0, 0, 4, 4),
+        )
+        .await;
+        app.key_event(
+            &device,
+            crossterm::event::KeyEvent::new(
+                KeyCode::Char('a'),
+                crossterm::event::KeyModifiers::SHIFT,
+            ),
+        )
+        .await;
+        assert_eq!(
+            *device.calls.lock().unwrap(),
+            [
+                "key:ShiftLeft:true",
+                "move:-32768:-32768",
+                "button:left:true",
+                "key:KeyA:true",
+                "key:KeyA:false"
+            ]
+        );
     }
 
     #[tokio::test]
@@ -1880,8 +2115,12 @@ mod tests {
             assert!(device.calls.lock().unwrap().is_empty());
             app.key(&device, KeyCode::Char(confirmation)).await;
         }
-        assert_eq!(*device.calls.lock().unwrap(), ["power"]);
-        assert!(app.message.contains("not verified"));
+        assert!(device.calls.lock().unwrap().is_empty());
+        assert!(matches!(
+            app.submitted,
+            Some(kvm_core::Control::Power(kvm_core::PowerAction::Off))
+        ));
+        assert!(app.message.contains("outcome pending"));
     }
 
     #[tokio::test]
