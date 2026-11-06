@@ -29,6 +29,8 @@ pub struct App {
     pub capabilities: Option<Capabilities>,
     pub message: String,
     pub control: bool,
+    /// Most recently decoded video frame, if the stream has delivered one.
+    pub video: Option<image::RgbImage>,
 }
 
 impl App {
@@ -76,7 +78,9 @@ impl App {
         {
             return;
         }
-        let Some((x, y)) = mouse_coordinates(event.column, event.row, area) else {
+        let Some(video) = &self.video else { return; };
+        let Some(viewport) = video_viewport(area, video.width(), video.height()) else { return; };
+        let Some((x, y)) = mouse_coordinates(event.column, event.row, viewport) else {
             return;
         };
         let result = match event.kind {
@@ -152,14 +156,30 @@ impl App {
     }
 }
 
+fn video_viewport(area: ratatui::layout::Rect, width: u32, height: u32) -> Option<ratatui::layout::Rect> {
+    let inner = area.inner(ratatui::layout::Margin::new(1, 1));
+    if width == 0 || height == 0 || inner.width < 2 || inner.height < 2 { return None; }
+    // Half-block cells represent two vertically stacked pixels.
+    let pixel_height = u64::from(inner.height) * 2;
+    let (w, h_pixels) = if u64::from(inner.width) * u64::from(height) <= pixel_height * u64::from(width) {
+        (u64::from(inner.width), u64::from(inner.width) * u64::from(height) / u64::from(width))
+    } else {
+        (pixel_height * u64::from(width) / u64::from(height), pixel_height)
+    };
+    let w = u16::try_from(w).ok()?;
+    let h = u16::try_from(h_pixels.div_ceil(2)).ok()?;
+    if w < 2 || h < 2 { return None; }
+    Some(ratatui::layout::Rect::new(inner.x + (inner.width - w) / 2, inner.y + (inner.height - h) / 2, w, h))
+}
+
 fn mouse_coordinates(column: u16, row: u16, area: ratatui::layout::Rect) -> Option<(i16, i16)> {
-    let width = area.width.checked_sub(2)?;
-    let height = area.height.checked_sub(2)?;
+    let width = area.width;
+    let height = area.height;
     if width < 2 || height < 2 {
         return None;
     }
-    let x = column.checked_sub(area.x.checked_add(1)?)?;
-    let y = row.checked_sub(area.y.checked_add(1)?)?;
+    let x = column.checked_sub(area.x)?;
+    let y = row.checked_sub(area.y)?;
     if x >= width || y >= height {
         return None;
     }
