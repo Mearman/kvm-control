@@ -1005,12 +1005,14 @@ dependencies = [
 name = "kvm-tui"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "clap",
  "crossterm",
  "kvm-core",
  "kvm-kvmd",
  "ratatui",
  "rpassword",
+ "serde_json",
  "tokio",
  "url",
 ]

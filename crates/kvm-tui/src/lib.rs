@@ -7,7 +7,10 @@
 use std::{io, time::Duration};
 
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEventKind},
+    event::{
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, MouseButton,
+        MouseEvent, MouseEventKind,
+    },
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
@@ -58,6 +61,53 @@ impl App {
         }
     }
 
+    /// Forwards mouse events in the viewing area while input mode is active.
+    pub async fn mouse(
+        &mut self,
+        device: &dyn Device,
+        event: MouseEvent,
+        area: ratatui::layout::Rect,
+    ) {
+        if !self.control
+            || !self
+                .capabilities
+                .as_ref()
+                .is_some_and(|c| c.mouse == Capability::Supported)
+        {
+            return;
+        }
+        let Some((x, y)) = mouse_coordinates(event.column, event.row, area) else {
+            return;
+        };
+        let result = match event.kind {
+            MouseEventKind::Moved | MouseEventKind::Drag(_) => device.mouse_move(x, y).await,
+            MouseEventKind::Down(button) | MouseEventKind::Up(button) => {
+                let button = match button {
+                    MouseButton::Left => "left",
+                    MouseButton::Right => "right",
+                    MouseButton::Middle => "middle",
+                };
+                match device.mouse_move(x, y).await {
+                    Ok(()) => {
+                        device
+                            .mouse_button(button, matches!(event.kind, MouseEventKind::Down(_)))
+                            .await
+                    }
+                    Err(error) => Err(error),
+                }
+            }
+            _ => return,
+        };
+        if let Err(error) = result {
+            self.control = false;
+            let cleanup = device.release_inputs().await;
+            self.message = match cleanup {
+                Ok(()) => error.to_string(),
+                Err(cleanup) => format!("{error}; input cleanup uncertain: {cleanup}"),
+            };
+        }
+    }
+
     /// Handles one key event. Returns false when the interface should exit.
     pub async fn key(&mut self, device: &dyn Device, code: KeyCode) -> bool {
         match code {
@@ -82,12 +132,17 @@ impl App {
             }
             _ if self.control => {
                 if let Some(key) = key_name(code) {
-                    if let Err(error) = device.key(&key, true).await {
-                        self.message = error.to_string();
+                    let result = match device.key(&key, true).await {
+                        Ok(()) => device.key(&key, false).await,
+                        Err(error) => Err(error),
+                    };
+                    if let Err(error) = result {
                         self.control = false;
-                    } else if let Err(error) = device.key(&key, false).await {
-                        self.message = error.to_string();
-                        self.control = false;
+                        let cleanup = device.release_inputs().await;
+                        self.message = match cleanup {
+                            Ok(()) => error.to_string(),
+                            Err(cleanup) => format!("{error}; input cleanup uncertain: {cleanup}"),
+                        };
                     }
                 }
             }
@@ -95,6 +150,24 @@ impl App {
         }
         true
     }
+}
+
+fn mouse_coordinates(column: u16, row: u16, area: ratatui::layout::Rect) -> Option<(i16, i16)> {
+    let width = area.width.checked_sub(2)?;
+    let height = area.height.checked_sub(2)?;
+    if width < 2 || height < 2 {
+        return None;
+    }
+    let x = column.checked_sub(area.x.checked_add(1)?)?;
+    let y = row.checked_sub(area.y.checked_add(1)?)?;
+    if x >= width || y >= height {
+        return None;
+    }
+    let scale = |position: u16, size: u16| -> i16 {
+        (i32::from(i16::MIN) + i32::from(position) * (i32::from(u16::MAX)) / i32::from(size - 1))
+            as i16
+    };
+    Some((scale(x, width), scale(y, height)))
 }
 
 fn key_name(code: KeyCode) -> Option<String> {
@@ -165,6 +238,8 @@ trait TerminalModes {
     fn alternate(&mut self) -> io::Result<()>;
     fn leave(&mut self) -> io::Result<()>;
     fn cooked(&mut self) -> io::Result<()>;
+    fn mouse_on(&mut self) -> io::Result<()>;
+    fn mouse_off(&mut self) -> io::Result<()>;
 }
 
 struct SystemTerminal;
@@ -181,6 +256,12 @@ impl TerminalModes for SystemTerminal {
     fn cooked(&mut self) -> io::Result<()> {
         disable_raw_mode()
     }
+    fn mouse_on(&mut self) -> io::Result<()> {
+        execute!(io::stdout(), EnableMouseCapture)
+    }
+    fn mouse_off(&mut self) -> io::Result<()> {
+        execute!(io::stdout(), DisableMouseCapture)
+    }
 }
 
 struct TerminalGuard<T: TerminalModes>(T);
@@ -192,11 +273,18 @@ impl<T: TerminalModes> TerminalGuard<T> {
             let _ = terminal.cooked();
             return Err(error);
         }
+        if let Err(error) = terminal.mouse_on() {
+            let _ = terminal.mouse_off();
+            let _ = terminal.leave();
+            let _ = terminal.cooked();
+            return Err(error);
+        }
         Ok(Self(terminal))
     }
 }
 impl<T: TerminalModes> Drop for TerminalGuard<T> {
     fn drop(&mut self) {
+        let _ = self.0.mouse_off();
         let _ = self.0.leave();
         let _ = self.0.cooked();
     }
@@ -219,12 +307,17 @@ async fn run_loop<B: Backend<Error = io::Error>>(
     app.refresh(device).await;
     loop {
         terminal.draw(|frame| draw(frame, &app))?;
-        if event::poll(Duration::from_millis(100))?
-            && let Event::Key(key) = event::read()?
-            && key.kind == KeyEventKind::Press
-            && !app.key(device, key.code).await
-        {
-            break;
+        if event::poll(Duration::from_millis(100))? {
+            match event::read()? {
+                Event::Key(key) if key.kind == KeyEventKind::Press => {
+                    if !app.key(device, key.code).await {
+                        break;
+                    }
+                }
+                // Mouse events are not forwarded until a video viewport exists.
+                Event::Mouse(_) => {}
+                _ => {}
+            }
         }
     }
     Ok(())
@@ -234,6 +327,113 @@ async fn run_loop<B: Backend<Error = io::Error>>(
 mod tests {
     use super::*;
     use ratatui::backend::TestBackend;
+
+    #[derive(Default)]
+    struct FakeDevice {
+        calls: std::sync::Mutex<Vec<String>>,
+        fail_key: bool,
+    }
+    #[async_trait::async_trait]
+    impl Device for FakeDevice {
+        async fn status(&self) -> kvm_core::Result<DeviceStatus> {
+            Ok(DeviceStatus {
+                info: serde_json::json!({}),
+                hid: serde_json::json!({}),
+                streamer: serde_json::json!({}),
+            })
+        }
+        async fn capabilities(&self) -> kvm_core::Result<Capabilities> {
+            Ok(Capabilities {
+                status: Capability::Supported,
+                snapshot: Capability::Unknown,
+                keyboard: Capability::Supported,
+                mouse: Capability::Supported,
+                live_video: Capability::Unknown,
+            })
+        }
+        async fn snapshot(&self) -> kvm_core::Result<kvm_core::Snapshot> {
+            Err(kvm_core::Error::Unsupported("snapshot".into()))
+        }
+        async fn key(&self, key: &str, pressed: bool) -> kvm_core::Result<()> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("key:{key}:{pressed}"));
+            if self.fail_key {
+                Err(kvm_core::Error::AmbiguousInput("failure".into()))
+            } else {
+                Ok(())
+            }
+        }
+        async fn mouse_button(&self, button: &str, pressed: bool) -> kvm_core::Result<()> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("button:{button}:{pressed}"));
+            Ok(())
+        }
+        async fn mouse_move(&self, x: i16, y: i16) -> kvm_core::Result<()> {
+            self.calls.lock().unwrap().push(format!("move:{x}:{y}"));
+            Ok(())
+        }
+        async fn release_inputs(&self) -> kvm_core::Result<()> {
+            self.calls.lock().unwrap().push("release".into());
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn input_events_are_ordered_and_cleaned_up() {
+        let device = FakeDevice::default();
+        let mut app = App::default();
+        app.refresh(&device).await;
+        app.key(&device, KeyCode::Char('i')).await;
+        app.key(&device, KeyCode::Char('a')).await;
+        let area = ratatui::layout::Rect::new(0, 0, 4, 4);
+        for kind in [
+            MouseEventKind::Down(MouseButton::Left),
+            MouseEventKind::Up(MouseButton::Left),
+        ] {
+            app.mouse(
+                &device,
+                MouseEvent {
+                    kind,
+                    column: 1,
+                    row: 1,
+                    modifiers: crossterm::event::KeyModifiers::NONE,
+                },
+                area,
+            )
+            .await;
+        }
+        app.key(&device, KeyCode::Esc).await;
+        assert_eq!(
+            *device.calls.lock().unwrap(),
+            [
+                "key:KeyA:true",
+                "key:KeyA:false",
+                "move:-32768:-32768",
+                "button:left:true",
+                "move:-32768:-32768",
+                "button:left:false",
+                "release"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn ambiguous_press_is_not_replayed_and_triggers_cleanup() {
+        let device = FakeDevice {
+            fail_key: true,
+            ..FakeDevice::default()
+        };
+        let mut app = App::default();
+        app.refresh(&device).await;
+        app.key(&device, KeyCode::Char('i')).await;
+        app.key(&device, KeyCode::Char('a')).await;
+        assert!(!app.control);
+        assert_eq!(*device.calls.lock().unwrap(), ["key:KeyA:true", "release"]);
+    }
 
     #[test]
     fn renders_unknown_status_and_stream_limitation() {
@@ -280,6 +480,14 @@ mod tests {
             self.calls.borrow_mut().push("cooked");
             Ok(())
         }
+        fn mouse_on(&mut self) -> io::Result<()> {
+            self.calls.borrow_mut().push("mouse_on");
+            Ok(())
+        }
+        fn mouse_off(&mut self) -> io::Result<()> {
+            self.calls.borrow_mut().push("mouse_off");
+            Ok(())
+        }
     }
 
     #[test]
@@ -292,8 +500,29 @@ mod tests {
             });
             assert_eq!(guard.is_err(), fail);
             drop(guard);
-            assert_eq!(*calls.borrow(), ["raw", "alternate", "leave", "cooked"]);
+            let expected = if fail {
+                vec!["raw", "alternate", "leave", "cooked"]
+            } else {
+                vec![
+                    "raw",
+                    "alternate",
+                    "mouse_on",
+                    "mouse_off",
+                    "leave",
+                    "cooked",
+                ]
+            };
+            assert_eq!(*calls.borrow(), expected);
         }
+    }
+
+    #[test]
+    fn maps_mouse_to_signed_device_coordinates() {
+        let area = ratatui::layout::Rect::new(10, 5, 12, 7);
+        assert_eq!(mouse_coordinates(11, 6, area), Some((i16::MIN, i16::MIN)));
+        assert_eq!(mouse_coordinates(20, 10, area), Some((i16::MAX, i16::MAX)));
+        assert_eq!(mouse_coordinates(10, 5, area), None);
+        assert_eq!(mouse_coordinates(21, 10, area), None);
     }
 
     #[test]
