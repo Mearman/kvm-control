@@ -6,7 +6,7 @@ use std::{
 
 use base64::{Engine, engine::general_purpose::STANDARD};
 use clap::{Parser, Subcommand, ValueEnum};
-use kvm_core::{Device, DeviceProfile};
+use kvm_core::{Confirmation, Control, Device, DeviceProfile, PowerAction};
 use kvm_kvmd::{Config, Kvmd, LoginState};
 use serde_json::{Value, json};
 use url::Url;
@@ -49,6 +49,20 @@ enum Auth {
     Header,
 }
 
+#[derive(Clone, Copy, ValueEnum)]
+enum Power {
+    On,
+    Off,
+    OffHard,
+    ResetHard,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum Toggle {
+    On,
+    Off,
+}
+
 #[derive(Subcommand)]
 enum Command {
     /// Check authentication and return device status
@@ -73,6 +87,40 @@ enum Command {
         x: i16,
         #[arg(allow_hyphen_values = true)]
         y: i16,
+    },
+    /// Execute a power operation after explicit confirmation
+    Power {
+        #[arg(value_enum)]
+        action: Power,
+        #[arg(long, required = true)]
+        confirm: bool,
+    },
+    /// Select a KVM switch port after explicit confirmation
+    Switch {
+        port: u32,
+        #[arg(long, required = true)]
+        confirm: bool,
+    },
+    /// Set a GPIO channel after explicit confirmation
+    Gpio {
+        channel: String,
+        #[arg(value_enum)]
+        state: Toggle,
+        #[arg(long, required = true)]
+        confirm: bool,
+    },
+    /// Connect or disconnect virtual media after explicit confirmation
+    MediaConnect {
+        #[arg(value_enum)]
+        state: Toggle,
+        #[arg(long, required = true)]
+        confirm: bool,
+    },
+    /// Select a virtual media image after explicit confirmation
+    MediaSelect {
+        image: String,
+        #[arg(long, required = true)]
+        confirm: bool,
     },
     /// Stream newline-delimited JSON objects containing base64 JPEG frames
     Video {
@@ -126,6 +174,21 @@ async fn write_video(
     Ok(count)
 }
 
+async fn run_control(
+    device: &impl Device,
+    operation: Control,
+    confirm: bool,
+) -> Result<Value, String> {
+    if !confirm {
+        return Err("explicit --confirm is required".into());
+    }
+    device
+        .control(operation, Confirmation::new())
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(json!({"accepted": true, "post_state": "unverified"}))
+}
+
 async fn execute(device: &impl Device, command: Command) -> Result<Value, String> {
     match command {
         Command::Diagnose | Command::Status => {
@@ -176,6 +239,50 @@ async fn execute(device: &impl Device, command: Command) -> Result<Value, String
         Command::Move { x, y } => {
             device.mouse_move(x, y).await.map_err(|e| e.to_string())?;
             Ok(json!({"x": x, "y": y}))
+        }
+        Command::Power { action, confirm } => {
+            run_control(
+                device,
+                Control::Power(match action {
+                    Power::On => PowerAction::On,
+                    Power::Off => PowerAction::Off,
+                    Power::OffHard => PowerAction::OffHard,
+                    Power::ResetHard => PowerAction::ResetHard,
+                }),
+                confirm,
+            )
+            .await
+        }
+        Command::Switch { port, confirm } => {
+            run_control(device, Control::Switch { port }, confirm).await
+        }
+        Command::Gpio {
+            channel,
+            state,
+            confirm,
+        } => {
+            run_control(
+                device,
+                Control::Gpio {
+                    channel,
+                    state: matches!(state, Toggle::On),
+                },
+                confirm,
+            )
+            .await
+        }
+        Command::MediaConnect { state, confirm } => {
+            run_control(
+                device,
+                Control::MediaConnect {
+                    connected: matches!(state, Toggle::On),
+                },
+                confirm,
+            )
+            .await
+        }
+        Command::MediaSelect { image, confirm } => {
+            run_control(device, Control::MediaSelect { image }, confirm).await
         }
         Command::Video { frames } => {
             let mut video = device.video().await.map_err(|e| e.to_string())?;
@@ -319,6 +426,10 @@ mod tests {
             self.0.lock().unwrap().push(format!("{x},{y}"));
             Ok(())
         }
+        async fn control(&self, operation: Control, _: Confirmation) -> kvm_core::Result<()> {
+            self.0.lock().unwrap().push(format!("{operation:?}"));
+            Ok(())
+        }
         async fn release_inputs(&self) -> kvm_core::Result<()> {
             self.0.lock().unwrap().push("release".into());
             Ok(())
@@ -345,6 +456,24 @@ mod tests {
             json!({"x": -1, "y": 2})
         );
         assert_eq!(*device.0.lock().unwrap(), ["-1,2"]);
+    }
+
+    #[tokio::test]
+    async fn control_requires_confirmation_and_reports_unverified() {
+        let device = Fake(Default::default());
+        assert!(
+            run_control(&device, Control::Power(PowerAction::On), false)
+                .await
+                .is_err()
+        );
+        assert!(device.0.lock().unwrap().is_empty());
+        assert_eq!(
+            run_control(&device, Control::Power(PowerAction::On), true)
+                .await
+                .unwrap()["post_state"],
+            "unverified"
+        );
+        assert_eq!(*device.0.lock().unwrap(), ["Power(On)"]);
     }
 
     #[test]
