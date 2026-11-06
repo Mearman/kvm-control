@@ -3,7 +3,7 @@
 use axum::{
     Json, Router,
     extract::{Query, State},
-    routing::post,
+    routing::{get, post},
 };
 use serde_json::{Value, json};
 use std::{
@@ -87,11 +87,13 @@ async fn exercise(delayed: bool) {
     let app = if delayed {
         Router::new()
             .route("/api/auth/login", post(login))
+            .route("/api/auth/check", get(login))
             .route("/api/hid/events/send_key", post(delayed_key))
             .with_state(fixture.clone())
     } else {
         Router::new()
             .route("/api/auth/login", post(login))
+            .route("/api/auth/check", get(login))
             .route("/api/hid/events/send_key", post(key))
             .with_state(events.clone())
     };
@@ -196,6 +198,7 @@ async fn approval_precedes_mcp_initialisation() {
     let fixture = Arc::new(Fixture::default());
     let app = Router::new()
         .route("/api/auth/login", post(approval_login))
+        .route("/api/auth/check", get(login))
         .route("/api/auth/two_step_complete", post(approval_complete))
         .with_state(fixture.clone());
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
