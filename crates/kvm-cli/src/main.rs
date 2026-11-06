@@ -193,6 +193,27 @@ async fn run_control(
     Ok(json!({"accepted": true, "post_state": post_state}))
 }
 
+async fn press_and_release<F, S>(device: &impl Device, press: F, interrupt: S) -> Result<(), String>
+where
+    F: std::future::Future<Output = kvm_core::Result<()>>,
+    S: std::future::Future<Output = io::Result<()>>,
+{
+    let result = tokio::select! {
+        result = press => result.map_err(|e| e.to_string()),
+        signal = interrupt => Err(match signal { Ok(()) => "interrupted; input outcome uncertain".into(), Err(e) => format!("signal handler failed: {e}; input outcome uncertain") }),
+    };
+    let cleanup = device.release_inputs().await;
+    result.map_err(|e| {
+        format!(
+            "{e}; cleanup: {}",
+            cleanup
+                .as_ref()
+                .map_or_else(ToString::to_string, |()| "confirmed".into())
+        )
+    })?;
+    cleanup.map_err(|e| e.to_string())
+}
+
 async fn execute(device: &impl Device, command: Command) -> Result<Value, String> {
     match command {
         Command::Diagnose | Command::Status => {
@@ -220,37 +241,16 @@ async fn execute(device: &impl Device, command: Command) -> Result<Value, String
             Ok(json!({"output": output, "bytes": snapshot.jpeg.len()}))
         }
         Command::Key { key } => {
-            let result = tokio::select! {
-                result = device.key(&key, true) => result.map_err(|e| e.to_string()),
-                signal = tokio::signal::ctrl_c() => Err(match signal { Ok(()) => "interrupted; input outcome uncertain".into(), Err(e) => format!("signal handler failed: {e}; input outcome uncertain") }),
-            };
-            let cleanup = device.release_inputs().await;
-            result.map_err(|e| {
-                format!(
-                    "{e}; cleanup: {}",
-                    cleanup
-                        .as_ref()
-                        .map_or_else(ToString::to_string, |()| "confirmed".into())
-                )
-            })?;
-            cleanup.map_err(|e| e.to_string())?;
+            press_and_release(device, device.key(&key, true), tokio::signal::ctrl_c()).await?;
             Ok(json!({"key": key, "released": true}))
         }
         Command::Click { button } => {
-            let result = tokio::select! {
-                result = device.mouse_button(&button, true) => result.map_err(|e| e.to_string()),
-                signal = tokio::signal::ctrl_c() => Err(match signal { Ok(()) => "interrupted; input outcome uncertain".into(), Err(e) => format!("signal handler failed: {e}; input outcome uncertain") }),
-            };
-            let cleanup = device.release_inputs().await;
-            result.map_err(|e| {
-                format!(
-                    "{e}; cleanup: {}",
-                    cleanup
-                        .as_ref()
-                        .map_or_else(ToString::to_string, |()| "confirmed".into())
-                )
-            })?;
-            cleanup.map_err(|e| e.to_string())?;
+            press_and_release(
+                device,
+                device.mouse_button(&button, true),
+                tokio::signal::ctrl_c(),
+            )
+            .await?;
             Ok(json!({"button": button, "released": true}))
         }
         Command::Move { x, y } => {
@@ -491,6 +491,17 @@ mod tests {
             self.0.lock().unwrap().push("release".into());
             Ok(())
         }
+    }
+
+    #[tokio::test]
+    async fn interruption_releases_an_inflight_press() {
+        let device = Fake(Default::default());
+        let press = std::future::pending::<kvm_core::Result<()>>();
+        let error = press_and_release(&device, press, std::future::ready(Ok(())))
+            .await
+            .unwrap_err();
+        assert!(error.contains("interrupted"));
+        assert_eq!(*device.0.lock().unwrap(), ["release"]);
     }
 
     #[tokio::test]
