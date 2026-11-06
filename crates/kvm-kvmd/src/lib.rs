@@ -1,10 +1,20 @@
-use std::{collections::BTreeSet, time::Duration};
+//! KVMD adapter and continuous MJPEG transport.
+//!
+//! PiKVM's [stream client](https://github.com/pikvm/kvmd/blob/fcb903eb3be70d8eee4aee99e5fcc1c743e3ccef/web/share/js/kvm/stream_mjpeg.js) and [WebSocket handler](https://github.com/pikvm/kvmd/blob/fcb903eb3be70d8eee4aee99e5fcc1c743e3ccef/kvmd/apps/kvmd/server.py), and GLKVM's [stream client](https://github.com/gl-inet/glkvm/blob/3e8dd23c4bd638a4650433664cc3b0f3b4d29395/web/share/js/kvm/stream_mjpeg.js) and [WebSocket handler](https://github.com/gl-inet/glkvm/blob/3e8dd23c4bd638a4650433664cc3b0f3b4d29395/kvmd/apps/kvmd/server.py), use these routes. [uStreamer](https://github.com/pikvm/ustreamer/blob/11fd828ab00c01a39bd0843ef442ef0b6d3cac41/src/ustreamer/http/server.c) emits multipart JPEG with or without Content-Length.
+//!
+//! These sources do not establish compatibility with every firmware version. Only synthetic server tests have been run; no physical device has been verified. The video API supports MJPEG only, does not change encoder settings, and validates JPEG envelope markers rather than decoding images. Capabilities remain unknown until callers attempt the transport.
+
+use std::{collections::BTreeSet, sync::Arc, time::Duration};
+
+mod video;
+#[cfg(test)]
+mod video_tests;
 
 use async_trait::async_trait;
 use kvm_core::{
     Capabilities, Capability, Device, DeviceProfile, DeviceStatus, Error, Result, Snapshot,
 };
-use reqwest::{Client, Method, StatusCode};
+use reqwest::{Client, Method, StatusCode, cookie::Jar};
 use tokio::sync::Mutex;
 use url::Url;
 
@@ -20,6 +30,8 @@ pub struct Config {
 
 pub struct Kvmd {
     client: Client,
+    video_client: Client,
+    timeout: Duration,
     endpoint: Url,
     profile: DeviceProfile,
     inputs: Mutex<Inputs>,
@@ -46,22 +58,33 @@ impl Kvmd {
                 "endpoint must be an HTTPS URL without credentials, query or fragment".into(),
             ));
         }
-        let mut builder = Client::builder()
-            .timeout(config.timeout)
-            .cookie_store(true)
-            .retry(reqwest::retry::never())
-            .redirect(reqwest::redirect::Policy::none())
-            .danger_accept_invalid_certs(config.insecure_tls);
-        if let Some(pem) = config.trusted_ca_pem {
-            let ca = reqwest::Certificate::from_pem(&pem)
-                .map_err(|_| Error::InvalidResponse("invalid CA certificate".into()))?;
-            builder = builder.add_root_certificate(ca);
-        }
-        let client = builder
-            .build()
-            .map_err(|_| Error::Transport("could not build HTTP client".into()))?;
+        let jar = Arc::new(Jar::default());
+        let build_client = |timeout: Option<Duration>| -> Result<Client> {
+            let mut builder = Client::builder()
+                .connect_timeout(config.timeout)
+                .cookie_provider(jar.clone())
+                .http1_only()
+                .retry(reqwest::retry::never())
+                .redirect(reqwest::redirect::Policy::none())
+                .danger_accept_invalid_certs(config.insecure_tls);
+            if let Some(timeout) = timeout {
+                builder = builder.timeout(timeout);
+            }
+            if let Some(pem) = &config.trusted_ca_pem {
+                let ca = reqwest::Certificate::from_pem(pem)
+                    .map_err(|_| Error::InvalidResponse("invalid CA certificate".into()))?;
+                builder = builder.add_root_certificate(ca);
+            }
+            builder
+                .build()
+                .map_err(|_| Error::Transport("could not build HTTP client".into()))
+        };
+        let client = build_client(Some(config.timeout))?;
+        let video_client = build_client(None)?;
         Ok(Self {
             client,
+            video_client,
+            timeout: config.timeout,
             endpoint: config.endpoint,
             profile: config.profile,
             inputs: Mutex::new(Inputs::default()),
@@ -188,6 +211,10 @@ impl Kvmd {
 
 #[async_trait]
 impl Device for Kvmd {
+    async fn video(&self) -> Result<Box<dyn kvm_core::VideoStream>> {
+        video::open(self).await
+    }
+
     async fn status(&self) -> Result<DeviceStatus> {
         Ok(DeviceStatus {
             info: self.json("info").await?,
@@ -204,7 +231,7 @@ impl Device for Kvmd {
             snapshot: Capability::Unknown,
             keyboard: Capability::Unknown,
             mouse: Capability::Unknown,
-            live_video: Capability::Unsupported,
+            live_video: Capability::Unknown,
         })
     }
 
