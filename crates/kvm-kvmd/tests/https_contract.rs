@@ -120,6 +120,15 @@ async fn status(State(calls): State<Calls>, uri: Uri, headers: HeaderMap) -> imp
     (StatusCode::OK, Json(json!({"ok": true, "result": result})))
 }
 
+async fn oversized_length() -> impl IntoResponse {
+    vec![b' '; 4 * 1024 * 1024 + 1]
+}
+
+async fn oversized_chunked() -> axum::body::Body {
+    let chunks = (0..65).map(|_| Ok::<_, std::convert::Infallible>(vec![b' '; 64 * 1024]));
+    axum::body::Body::from_stream(futures_util::stream::iter(chunks))
+}
+
 async fn poisoning_status() -> impl IntoResponse {
     (
         [(
@@ -188,9 +197,18 @@ async fn fixture() -> (Url, Vec<u8>, Calls, tokio::task::JoinHandle<()>) {
     let calls = Calls::default();
     let app = Router::new()
         .route("/api/auth/login", post(login))
+        .route("/long/api/auth/login", post(oversized_length))
+        .route("/chunk/api/auth/login", post(login))
+        .route("/chunk/api/auth/check", get(oversized_chunked))
         .route("/gl/api/auth/login", post(gl_login))
         .route("/gl/api/auth/two_step_complete", post(gl_complete))
         .route("/gl/api/auth/check", get(status))
+        .route("/bigapproval/api/auth/login", post(gl_login))
+        .route(
+            "/bigapproval/api/auth/two_step_complete",
+            post(oversized_chunked),
+        )
+        .route("/bigstatus/api/info", get(oversized_length))
         .route("/nocookie/api/auth/login", post(gl_login))
         .route(
             "/nocookie/api/auth/two_step_complete",
@@ -473,6 +491,36 @@ async fn failed_or_pending_relogin_does_not_reuse_previous_cookie() {
         device.check_auth().await,
         Err(Error::Authentication)
     ));
+    server.abort();
+}
+
+#[tokio::test]
+async fn oversized_json_is_rejected_for_length_and_chunked_responses() {
+    let (endpoint, ca, _, server) = fixture().await;
+    for prefix in ["long", "chunk"] {
+        let mut url = endpoint.clone();
+        url.set_path(&format!("/{prefix}/"));
+        let device = client(url, Some(ca.clone()));
+        assert!(
+            matches!(device.login("test-user", "test-password").await, Err(Error::InvalidResponse(message)) if message.contains("size limit"))
+        );
+    }
+    let mut url = endpoint.clone();
+    url.set_path("/bigapproval/");
+    let device = client(url, Some(ca.clone()));
+    assert!(matches!(
+        device.login("test-user", "test-password").await.unwrap(),
+        LoginState::ApprovalPending { .. }
+    ));
+    assert!(
+        matches!(device.complete_approval().await, Err(Error::InvalidResponse(message)) if message.contains("size limit"))
+    );
+    let mut url = endpoint;
+    url.set_path("/bigstatus/");
+    let device = client(url, Some(ca));
+    assert!(
+        matches!(device.status().await, Err(Error::InvalidResponse(message)) if message.contains("size limit"))
+    );
     server.abort();
 }
 
