@@ -38,6 +38,11 @@ pub struct App {
 }
 
 impl App {
+    fn clear_input_state(&mut self) {
+        self.held_modifiers.clear();
+        self.drag_modifiers.clear();
+    }
+
     /// Refreshes capability and status information through the shared device API.
     pub async fn refresh(&mut self, device: &dyn Device) {
         match device.capabilities().await {
@@ -107,6 +112,7 @@ impl App {
                 };
                 if let Err(error) = device.mouse_button(name, false).await {
                     self.control = false;
+                    self.clear_input_state();
                     let cleanup = device.release_inputs().await;
                     self.message = match cleanup {
                         Ok(()) => error.to_string(),
@@ -138,12 +144,16 @@ impl App {
             }
         }
         let mut modifier_error = None;
-        if !self.enhanced_keyboard && self.drag_modifiers.is_empty() {
+        if !self.enhanced_keyboard {
             for modifier in &modifiers {
+                if self.drag_modifiers.contains(modifier) {
+                    continue;
+                }
                 if let Err(error) = device.key(modifier, true).await {
                     modifier_error = Some(error);
                     break;
                 }
+                self.drag_modifiers.push(modifier);
             }
         }
         let mut result = if let Some(error) = modifier_error {
@@ -197,6 +207,7 @@ impl App {
         }
         if let Err(error) = result {
             self.control = false;
+            self.clear_input_state();
             let cleanup = device.release_inputs().await;
             self.message = match cleanup {
                 Ok(()) => error.to_string(),
@@ -284,6 +295,7 @@ impl App {
             }
             KeyCode::F(12) if self.control => {
                 self.control = false;
+                self.clear_input_state();
                 if let Err(error) = device.release_inputs().await {
                     self.message = error.to_string();
                 }
@@ -329,9 +341,16 @@ impl App {
                             ] {
                                 if event.modifiers.contains(flag)
                                     && !self.held_modifiers.contains(name)
+                                    && !self.held_modifiers.contains(match name {
+                                        "ShiftLeft" => "ShiftRight",
+                                        "ControlLeft" => "ControlRight",
+                                        "AltLeft" => "AltRight",
+                                        _ => "MetaRight",
+                                    })
                                 {
                                     if let Err(error) = device.key(name, true).await {
                                         self.control = false;
+                                        self.clear_input_state();
                                         self.message = error.to_string();
                                         let _ = device.release_inputs().await;
                                         return true;
@@ -351,6 +370,10 @@ impl App {
                                 "ControlLeft" => Some("ControlLeft"),
                                 "AltLeft" => Some("AltLeft"),
                                 "MetaLeft" => Some("MetaLeft"),
+                                "ShiftRight" => Some("ShiftRight"),
+                                "ControlRight" => Some("ControlRight"),
+                                "AltRight" => Some("AltRight"),
+                                "MetaRight" => Some("MetaRight"),
                                 _ => None,
                             };
                             if let Some(name) = name {
@@ -857,6 +880,7 @@ where
             let item = receiver.borrow_and_update().clone();
             app.video = None;
             app.control = false;
+            app.clear_input_state();
             app.message = match item {
                 Some(Err(error)) => error,
                 _ => "Video stream closed".into(),
@@ -948,6 +972,9 @@ where
                 }
                 Event::FocusLost => {
                     app.control = false;
+                    app.clear_input_state();
+                    app.pending = None;
+                    app.command = None;
                     app.message = match device.release_inputs().await {
                         Ok(()) => "Focus lost; inputs released".into(),
                         Err(error) => format!("Focus lost; input cleanup uncertain: {error}"),
@@ -1196,6 +1223,51 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn focus_loss_cancels_pending_confirmation() {
+        let device = FakeDevice::default();
+        let mut terminal = Terminal::new(TestBackend::new(60, 16)).unwrap();
+        let sequence = [
+            Some(':'),
+            Some('p'),
+            Some('o'),
+            Some('w'),
+            Some('e'),
+            Some('r'),
+            Some(' '),
+            Some('o'),
+            Some('f'),
+            Some('f'),
+            Some('\n'),
+            None,
+            Some('y'),
+            Some('q'),
+        ];
+        let mut events = sequence.into_iter();
+        run_loop(
+            &mut terminal,
+            &device,
+            &ratatui_image::picker::Picker::halfblocks(),
+            false,
+            || {
+                Ok(Some(match events.next().expect("quit") {
+                    None => Event::FocusLost,
+                    Some(c) => Event::Key(crossterm::event::KeyEvent::new(
+                        if c == '\n' {
+                            KeyCode::Enter
+                        } else {
+                            KeyCode::Char(c)
+                        },
+                        crossterm::event::KeyModifiers::NONE,
+                    )),
+                }))
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(*device.calls.lock().unwrap(), ["release"]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn video_key_is_routed_to_command_and_confirmation() {
         let device = FakeDevice::default();
         let mut terminal = Terminal::new(TestBackend::new(60, 16)).unwrap();
@@ -1409,6 +1481,91 @@ mod tests {
         assert_eq!(
             *device.calls.lock().unwrap(),
             ["key:KeyA:true", "key:KeyA:false", "release"]
+        );
+    }
+
+    #[tokio::test]
+    async fn right_shift_is_not_duplicated_and_exit_clears_state() {
+        let device = FakeDevice::default();
+        let mut app = App {
+            enhanced_keyboard: true,
+            ..App::default()
+        };
+        app.refresh(&device).await;
+        app.key(&device, KeyCode::Char('i')).await;
+        let shift = KeyCode::Modifier(crossterm::event::ModifierKeyCode::RightShift);
+        app.key_event(
+            &device,
+            crossterm::event::KeyEvent::new_with_kind(
+                shift,
+                crossterm::event::KeyModifiers::SHIFT,
+                KeyEventKind::Press,
+            ),
+        )
+        .await;
+        app.key_event(
+            &device,
+            crossterm::event::KeyEvent::new_with_kind(
+                KeyCode::Char('a'),
+                crossterm::event::KeyModifiers::SHIFT,
+                KeyEventKind::Press,
+            ),
+        )
+        .await;
+        app.key(&device, KeyCode::F(12)).await;
+        assert_eq!(
+            *device.calls.lock().unwrap(),
+            ["key:ShiftRight:true", "key:KeyA:true", "release"]
+        );
+        assert!(app.held_modifiers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn shift_started_during_drag_is_released_outside() {
+        let device = FakeDevice::default();
+        let mut app = App::default();
+        app.refresh(&device).await;
+        app.control = true;
+        app.video = Some(image::RgbImage::new(2, 4));
+        for (kind, column, mods) in [
+            (
+                MouseEventKind::Down(MouseButton::Left),
+                1,
+                crossterm::event::KeyModifiers::NONE,
+            ),
+            (
+                MouseEventKind::Drag(MouseButton::Left),
+                1,
+                crossterm::event::KeyModifiers::SHIFT,
+            ),
+            (
+                MouseEventKind::Up(MouseButton::Left),
+                10,
+                crossterm::event::KeyModifiers::SHIFT,
+            ),
+        ] {
+            app.mouse(
+                &device,
+                MouseEvent {
+                    kind,
+                    column,
+                    row: 1,
+                    modifiers: mods,
+                },
+                ratatui::layout::Rect::new(0, 0, 4, 4),
+            )
+            .await;
+        }
+        assert_eq!(
+            *device.calls.lock().unwrap(),
+            [
+                "move:-32768:-32768",
+                "button:left:true",
+                "key:ShiftLeft:true",
+                "move:-32768:-32768",
+                "button:left:false",
+                "key:ShiftLeft:false"
+            ]
         );
     }
 
