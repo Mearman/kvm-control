@@ -35,7 +35,7 @@ case "$state" in
 esac
 
 if [ "$state" != published ]; then
-  gh release upload "$TAG" dist/* --clobber
+  gh release upload "$TAG" dist/"kvm-control-${TAG}-"*.tar.gz dist/"kvm-control-${TAG}-"*.tar.gz.sha256 --clobber
 fi
 assets=$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases/tags/$TAG" --jq '.assets[] | [.name, .state, .digest] | @tsv')
 for target in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu x86_64-apple-darwin aarch64-apple-darwin; do
