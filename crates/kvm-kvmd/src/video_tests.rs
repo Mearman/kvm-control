@@ -195,6 +195,21 @@ async fn final_boundary_ends_stream_and_closes_lease() {
 }
 
 #[tokio::test]
+async fn boundary_prefix_inside_frame_is_not_a_delimiter() {
+    let (device, closed, server) = device(b"--frame\r\nContent-Type: image/jpeg\r\n\r\n\xff\xd8\r\n--frame-not-a-boundary\xff\xd9\r\n--frame--\r\n").await;
+    let mut video = device.video().await.unwrap();
+    assert_eq!(
+        video.next_frame().await.unwrap().unwrap().jpeg,
+        b"\xff\xd8\r\n--frame-not-a-boundary\xff\xd9"
+    );
+    assert!(video.next_frame().await.unwrap().is_none());
+    tokio::time::timeout(Duration::from_secs(3), closed.notified())
+        .await
+        .unwrap();
+    server.await.unwrap();
+}
+
+#[tokio::test]
 async fn invalid_jpeg_is_rejected() {
     let (device, closed, server) = device(
         b"--frame\r\nContent-Type: image/jpeg\r\nContent-Length: 4\r\n\r\nnope\r\n--frame\r\n",
