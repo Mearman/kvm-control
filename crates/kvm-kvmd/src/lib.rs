@@ -54,7 +54,9 @@ struct Session {
 
 impl std::ops::Deref for Session {
     type Target = Client;
-    fn deref(&self) -> &Client { &self.client }
+    fn deref(&self) -> &Client {
+        &self.client
+    }
 }
 
 #[derive(Default)]
@@ -99,15 +101,22 @@ impl Kvmd {
                 .retry(reqwest::retry::never())
                 .redirect(reqwest::redirect::Policy::none())
                 .danger_accept_invalid_certs(config.insecure_tls);
-            if limited { builder = builder.timeout(config.timeout); }
+            if limited {
+                builder = builder.timeout(config.timeout);
+            }
             if let Some(pem) = &config.trusted_ca_pem {
                 let ca = reqwest::Certificate::from_pem(pem)
                     .map_err(|_| Error::InvalidResponse("invalid CA certificate".into()))?;
                 builder = builder.add_root_certificate(ca);
             }
-            builder.build().map_err(|_| Error::Transport("could not build HTTP client".into()))
+            builder
+                .build()
+                .map_err(|_| Error::Transport("could not build HTTP client".into()))
         };
-        Ok(Session { client: build(true)?, video: build(false)? })
+        Ok(Session {
+            client: build(true)?,
+            video: build(false)?,
+        })
     }
 
     /// Builds a client with credentials sent in KVMD's authentication headers.
