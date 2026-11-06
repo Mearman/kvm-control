@@ -28,6 +28,7 @@ pub struct App {
     pub capabilities: Option<Capabilities>,
     pub message: String,
     pub control: bool,
+    enhanced_keyboard: bool,
     /// Most recently decoded video frame, if the stream has delivered one.
     pub video: Option<image::RgbImage>,
     pending: Option<kvm_core::Control>,
@@ -113,25 +114,57 @@ impl App {
             }
             return;
         };
-        let result = match event.kind {
-            MouseEventKind::Moved | MouseEventKind::Drag(_) => device.mouse_move(x, y).await,
-            MouseEventKind::Down(button) | MouseEventKind::Up(button) => {
-                let button = match button {
-                    MouseButton::Left => "left",
-                    MouseButton::Right => "right",
-                    MouseButton::Middle => "middle",
-                };
-                match device.mouse_move(x, y).await {
-                    Ok(()) => {
-                        device
-                            .mouse_button(button, matches!(event.kind, MouseEventKind::Down(_)))
-                            .await
-                    }
-                    Err(error) => Err(error),
+        let mut modifiers = Vec::new();
+        for (flag, name) in [
+            (crossterm::event::KeyModifiers::CONTROL, "ControlLeft"),
+            (crossterm::event::KeyModifiers::ALT, "AltLeft"),
+            (crossterm::event::KeyModifiers::SHIFT, "ShiftLeft"),
+            (crossterm::event::KeyModifiers::SUPER, "MetaLeft"),
+        ] {
+            if event.modifiers.contains(flag) {
+                modifiers.push(name);
+            }
+        }
+        let mut modifier_error = None;
+        if !self.enhanced_keyboard {
+            for modifier in &modifiers {
+                if let Err(error) = device.key(modifier, true).await {
+                    modifier_error = Some(error);
+                    break;
                 }
             }
-            _ => return,
+        }
+        let mut result = if let Some(error) = modifier_error {
+            Err(error)
+        } else {
+            match event.kind {
+                MouseEventKind::Moved | MouseEventKind::Drag(_) => device.mouse_move(x, y).await,
+                MouseEventKind::Down(button) | MouseEventKind::Up(button) => {
+                    let button = match button {
+                        MouseButton::Left => "left",
+                        MouseButton::Right => "right",
+                        MouseButton::Middle => "middle",
+                    };
+                    match device.mouse_move(x, y).await {
+                        Ok(()) => {
+                            device
+                                .mouse_button(button, matches!(event.kind, MouseEventKind::Down(_)))
+                                .await
+                        }
+                        Err(error) => Err(error),
+                    }
+                }
+                _ => Ok(()),
+            }
         };
+        if !self.enhanced_keyboard && result.is_ok() {
+            for modifier in modifiers.iter().rev() {
+                if let Err(error) = device.key(modifier, false).await {
+                    result = Err(error);
+                    break;
+                }
+            }
+        }
         if let Err(error) = result {
             self.control = false;
             let cleanup = device.release_inputs().await;
@@ -241,6 +274,10 @@ impl App {
                         }
                         None => "Mouse mode unknown; F12 exits".into(),
                     };
+                    if !self.enhanced_keyboard {
+                        self.message
+                            .push_str("; terminal lacks key releases, keys are tapped");
+                    }
                 } else {
                     self.message = "Keyboard and mouse are unsupported or undiscovered".into();
                 }
@@ -252,6 +289,24 @@ impl App {
                     .is_some_and(|c| c.keyboard == Capability::Supported) =>
             {
                 if let Some(key) = key_name(code) {
+                    if self.enhanced_keyboard {
+                        let result = match event.kind {
+                            KeyEventKind::Press => device.key(&key, true).await,
+                            KeyEventKind::Release => device.key(&key, false).await,
+                            KeyEventKind::Repeat => Ok(()),
+                        };
+                        if let Err(error) = result {
+                            self.control = false;
+                            let cleanup = device.release_inputs().await;
+                            self.message = match cleanup {
+                                Ok(()) => error.to_string(),
+                                Err(cleanup) => {
+                                    format!("{error}; input cleanup uncertain: {cleanup}")
+                                }
+                            };
+                        }
+                        return true;
+                    }
                     let mods = event.modifiers;
                     let mut modifiers = Vec::new();
                     if mods.contains(crossterm::event::KeyModifiers::CONTROL) {
@@ -396,6 +451,23 @@ fn key_name(code: KeyCode) -> Option<String> {
             Some(format!("Key{}", c.to_ascii_uppercase()))
         }
         KeyCode::Char(c) if c.is_ascii_digit() => Some(format!("Digit{c}")),
+        KeyCode::Modifier(modifier) => {
+            use crossterm::event::ModifierKeyCode::*;
+            Some(
+                match modifier {
+                    LeftShift => "ShiftLeft",
+                    RightShift => "ShiftRight",
+                    LeftControl => "ControlLeft",
+                    RightControl => "ControlRight",
+                    LeftAlt => "AltLeft",
+                    RightAlt => "AltRight",
+                    LeftSuper => "MetaLeft",
+                    RightSuper => "MetaRight",
+                    _ => return None,
+                }
+                .into(),
+            )
+        }
         KeyCode::F(n @ 1..=24) => Some(format!("F{n}")),
         KeyCode::Delete => Some("Delete".into()),
         KeyCode::Insert => Some("Insert".into()),
@@ -544,6 +616,7 @@ impl TerminalModes for SystemTerminal {
 struct TerminalGuard<T: TerminalModes> {
     terminal: T,
     restored: bool,
+    keyboard: bool,
 }
 impl<T: TerminalModes> TerminalGuard<T> {
     fn enter(mut terminal: T) -> io::Result<Self> {
@@ -562,14 +635,24 @@ impl<T: TerminalModes> TerminalGuard<T> {
         Ok(Self {
             terminal,
             restored: false,
+            keyboard: false,
         })
     }
     fn restore(&mut self) -> io::Result<()> {
+        let keyboard = if self.keyboard {
+            let result = execute!(io::stdout(), crossterm::event::PopKeyboardEnhancementFlags);
+            if result.is_ok() {
+                self.keyboard = false;
+            }
+            result
+        } else {
+            Ok(())
+        };
         let mouse = self.terminal.mouse_off();
         let screen = self.terminal.leave();
         let raw = self.terminal.cooked();
-        self.restored = mouse.is_ok() && screen.is_ok() && raw.is_ok();
-        let errors: Vec<String> = [mouse, screen, raw]
+        self.restored = keyboard.is_ok() && mouse.is_ok() && screen.is_ok() && raw.is_ok();
+        let errors: Vec<String> = [keyboard, mouse, screen, raw]
             .into_iter()
             .filter_map(Result::err)
             .map(|e| e.to_string())
@@ -594,8 +677,20 @@ pub async fn run(device: &dyn Device) -> io::Result<()> {
     let mut guard = TerminalGuard::enter(SystemTerminal)?;
     let picker = ratatui_image::picker::Picker::from_query_stdio()
         .unwrap_or_else(|_| ratatui_image::picker::Picker::halfblocks());
+    let enhanced = crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false);
+    if enhanced {
+        execute!(
+            io::stdout(),
+            crossterm::event::PushKeyboardEnhancementFlags(
+                crossterm::event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                    | crossterm::event::KeyboardEnhancementFlags::REPORT_EVENT_TYPES
+                    | crossterm::event::KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES
+            )
+        )?;
+    }
+    guard.keyboard = enhanced;
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
-    let result = run_loop(&mut terminal, device, &picker, || {
+    let result = run_loop(&mut terminal, device, &picker, enhanced, || {
         if event::poll(Duration::from_millis(25))? {
             Ok(Some(event::read()?))
         } else {
@@ -621,12 +716,16 @@ async fn run_loop<B: Backend>(
     terminal: &mut Terminal<B>,
     device: &dyn Device,
     picker: &ratatui_image::picker::Picker,
+    enhanced: bool,
     mut next_event: impl FnMut() -> io::Result<Option<Event>>,
 ) -> io::Result<()>
 where
     B::Error: std::error::Error + Send + Sync + 'static,
 {
-    let mut app = App::default();
+    let mut app = App {
+        enhanced_keyboard: enhanced,
+        ..App::default()
+    };
     app.refresh(device).await;
     let mut video_rx: Option<
         tokio::sync::watch::Receiver<Option<Result<kvm_core::Snapshot, String>>>,
@@ -693,7 +792,9 @@ where
             match event {
                 Event::Key(key)
                     if key.kind == KeyEventKind::Press
-                        || (app.control && key.kind == KeyEventKind::Repeat) =>
+                        || (app.control
+                            && (key.kind == KeyEventKind::Repeat
+                                || (enhanced && key.kind == KeyEventKind::Release))) =>
                 {
                     if !app.control
                         && app.command.is_none()
@@ -887,6 +988,7 @@ mod tests {
             &mut terminal,
             &device,
             &ratatui_image::picker::Picker::halfblocks(),
+            false,
             || {
                 rounds += 1;
                 if rounds == 1 {
@@ -936,6 +1038,7 @@ mod tests {
             &mut terminal,
             &device,
             &ratatui_image::picker::Picker::halfblocks(),
+            false,
             || {
                 let c = events.next().expect("quit event");
                 Ok(Some(Event::Key(crossterm::event::KeyEvent::new(
@@ -975,6 +1078,7 @@ mod tests {
             &mut terminal,
             &device,
             &ratatui_image::picker::Picker::halfblocks(),
+            false,
             || {
                 count += 1;
                 let code = if count == 1 || count == 100 {
@@ -1106,6 +1210,7 @@ mod tests {
             &mut terminal,
             &device,
             &ratatui_image::picker::Picker::halfblocks(),
+            false,
             || {
                 step += 1;
                 let event = match step {
@@ -1135,6 +1240,130 @@ mod tests {
         assert_eq!(
             *device.calls.lock().unwrap(),
             ["key:KeyA:true", "key:KeyA:false", "release"]
+        );
+    }
+
+    #[tokio::test]
+    async fn enhanced_keys_hold_until_release_and_support_modifier_only() {
+        let device = FakeDevice::default();
+        let mut app = App {
+            enhanced_keyboard: true,
+            ..App::default()
+        };
+        app.refresh(&device).await;
+        app.key(&device, KeyCode::Char('i')).await;
+        let shift = KeyCode::Modifier(crossterm::event::ModifierKeyCode::LeftShift);
+        for (code, kind) in [
+            (shift, KeyEventKind::Press),
+            (KeyCode::Char('a'), KeyEventKind::Press),
+            (KeyCode::Char('a'), KeyEventKind::Release),
+            (shift, KeyEventKind::Release),
+        ] {
+            app.key_event(
+                &device,
+                crossterm::event::KeyEvent::new_with_kind(
+                    code,
+                    crossterm::event::KeyModifiers::NONE,
+                    kind,
+                ),
+            )
+            .await;
+        }
+        assert_eq!(
+            *device.calls.lock().unwrap(),
+            [
+                "key:ShiftLeft:true",
+                "key:KeyA:true",
+                "key:KeyA:false",
+                "key:ShiftLeft:false"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn enhanced_modifier_stays_held_across_mouse_click() {
+        let device = FakeDevice::default();
+        let mut app = App {
+            enhanced_keyboard: true,
+            ..App::default()
+        };
+        app.refresh(&device).await;
+        app.key(&device, KeyCode::Char('i')).await;
+        app.video = Some(image::RgbImage::new(2, 4));
+        let shift = KeyCode::Modifier(crossterm::event::ModifierKeyCode::LeftShift);
+        app.key_event(
+            &device,
+            crossterm::event::KeyEvent::new_with_kind(
+                shift,
+                crossterm::event::KeyModifiers::SHIFT,
+                KeyEventKind::Press,
+            ),
+        )
+        .await;
+        for kind in [
+            MouseEventKind::Down(MouseButton::Left),
+            MouseEventKind::Up(MouseButton::Left),
+        ] {
+            app.mouse(
+                &device,
+                MouseEvent {
+                    kind,
+                    column: 1,
+                    row: 1,
+                    modifiers: crossterm::event::KeyModifiers::SHIFT,
+                },
+                ratatui::layout::Rect::new(0, 0, 4, 4),
+            )
+            .await;
+        }
+        app.key_event(
+            &device,
+            crossterm::event::KeyEvent::new_with_kind(
+                shift,
+                crossterm::event::KeyModifiers::NONE,
+                KeyEventKind::Release,
+            ),
+        )
+        .await;
+        assert_eq!(
+            *device.calls.lock().unwrap(),
+            [
+                "key:ShiftLeft:true",
+                "move:-32768:-32768",
+                "button:left:true",
+                "move:-32768:-32768",
+                "button:left:false",
+                "key:ShiftLeft:false"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn fallback_mouse_click_forwards_modifiers() {
+        let device = FakeDevice::default();
+        let mut app = App::default();
+        app.refresh(&device).await;
+        app.control = true;
+        app.video = Some(image::RgbImage::new(2, 4));
+        app.mouse(
+            &device,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 1,
+                row: 1,
+                modifiers: crossterm::event::KeyModifiers::SHIFT,
+            },
+            ratatui::layout::Rect::new(0, 0, 4, 4),
+        )
+        .await;
+        assert_eq!(
+            *device.calls.lock().unwrap(),
+            [
+                "key:ShiftLeft:true",
+                "move:-32768:-32768",
+                "button:left:true",
+                "key:ShiftLeft:false"
+            ]
         );
     }
 
