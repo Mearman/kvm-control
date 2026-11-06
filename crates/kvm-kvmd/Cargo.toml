@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 async-trait.workspace = true
+bytes = "1"
 futures-util = { version = "0.3", features = ["sink"] }
 base64 = "0.22"
 kvm-core = { path = "../kvm-core" }
