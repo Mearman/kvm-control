@@ -256,6 +256,38 @@ fn client(endpoint: Url, ca: Option<Vec<u8>>) -> Kvmd {
 }
 
 #[tokio::test]
+async fn transport_errors_distinguish_timeout_from_untrusted_tls_without_secrets() {
+    let (endpoint, ca, _, server) = fixture().await;
+    let untrusted = client(endpoint.clone(), None);
+    let tls_error = untrusted
+        .login("synthetic-user", "synthetic-password")
+        .await
+        .unwrap_err()
+        .to_string();
+    assert_eq!(tls_error, "transport error: login: connection failure");
+
+    let timed = Kvmd::new(Config {
+        endpoint,
+        profile: DeviceProfile::PiKvm,
+        trusted_ca_pem: Some(ca),
+        insecure_tls: false,
+        timeout: Duration::from_millis(50),
+    })
+    .unwrap();
+    let timeout_error = timed
+        .login("synthetic-user", "delay")
+        .await
+        .unwrap_err()
+        .to_string();
+    assert_eq!(timeout_error, "transport error: login: timeout");
+    for error in [tls_error, timeout_error] {
+        assert!(!error.contains("localhost"));
+        assert!(!error.contains("synthetic"));
+    }
+    server.abort();
+}
+
+#[tokio::test]
 async fn basic_auth_and_discovered_control_requests() {
     let (endpoint, ca, calls, server) = fixture().await;
     let device = Kvmd::with_basic_auth(

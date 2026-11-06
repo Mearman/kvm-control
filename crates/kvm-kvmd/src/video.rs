@@ -51,7 +51,10 @@ pub(crate) async fn open(device: &Kvmd) -> Result<Box<dyn VideoStream>> {
     )
     .await
     .map_err(|_| Error::Transport("stream lease timed out".into()))?
-    .map_err(|_| Error::Transport("stream lease request failed".into()))?;
+    .map_err(|error| match error {
+        reqwest_websocket::Error::Reqwest(error) => crate::request_error("stream lease", &error),
+        _ => Error::Transport("stream lease: request failure".into()),
+    })?;
     if response.status() != reqwest::StatusCode::SWITCHING_PROTOCOLS {
         Kvmd::check(response.status())?;
         return Err(Error::InvalidResponse(
@@ -105,7 +108,7 @@ pub(crate) async fn open(device: &Kvmd) -> Result<Box<dyn VideoStream>> {
     )
     .await
     .map_err(|_| Error::Transport("video request timed out".into()))?
-    .map_err(|_| Error::Transport("video request failed".into()))?;
+    .map_err(|error| crate::request_error("video request", &error))?;
     Kvmd::check(response.status())?;
     let content_type: mime::Mime = response
         .headers()
@@ -207,7 +210,7 @@ impl Mjpeg {
             }
             result = tokio::time::timeout(self.timeout, self.response.chunk()) => result
                 .map_err(|_| Error::Transport("video read timed out".into()))?
-                .map_err(|_| Error::Transport("video read failed".into()))?,
+                .map_err(|error| crate::request_error("video read", &error))?,
         };
         match chunk {
             Some(chunk) => {

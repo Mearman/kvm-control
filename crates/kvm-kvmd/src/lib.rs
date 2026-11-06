@@ -26,6 +26,17 @@ use reqwest::{Client, Method, StatusCode};
 use tokio::sync::{Mutex, RwLock};
 use url::Url;
 
+fn request_error(context: &'static str, error: &reqwest::Error) -> Error {
+    let kind = if error.is_timeout() {
+        "timeout"
+    } else if error.is_connect() {
+        "connection failure"
+    } else {
+        "request failure"
+    };
+    Error::Transport(format!("{context}: {kind}"))
+}
+
 /// Connection parameters. Credentials are supplied separately and are never formatted for logs.
 #[derive(Clone)]
 pub struct Config {
@@ -221,7 +232,7 @@ impl Kvmd {
             .form(&[("user", username), ("passwd", password)])
             .send()
             .await
-            .map_err(|_| Error::Transport("login request failed".into()))?;
+            .map_err(|error| request_error("login", &error))?;
         Self::check(response.status())?;
         let body: serde_json::Value = response
             .json()
@@ -272,7 +283,7 @@ impl Kvmd {
             .form(&[("two_step_token", token)])
             .send()
             .await
-            .map_err(|_| Error::Transport("approval request failed".into()))?;
+            .map_err(|error| request_error("approval", &error))?;
         Self::check(response.status())?;
         let body: serde_json::Value = response
             .json()
@@ -308,7 +319,7 @@ impl Kvmd {
             .get(self.url("auth/check")?)
             .send()
             .await
-            .map_err(|_| Error::Transport("authentication check failed".into()))?;
+            .map_err(|error| request_error("authentication check", &error))?;
         Self::check(response.status())?;
         let body: serde_json::Value = response
             .json()
@@ -350,7 +361,7 @@ impl Kvmd {
             .headers(self.auth_headers.clone())
             .send()
             .await
-            .map_err(|_| Error::Transport("request failed".into()))?;
+            .map_err(|error| request_error("device request", &error))?;
         Self::check(response.status())?;
         Ok(response)
     }
@@ -511,7 +522,7 @@ impl Device for Kvmd {
         while let Some(chunk) = response
             .chunk()
             .await
-            .map_err(|_| Error::Transport("snapshot read failed".into()))?
+            .map_err(|error| request_error("snapshot read", &error))?
         {
             if chunk.len() > MAX_SNAPSHOT_BYTES - bytes.len() {
                 return Err(Error::InvalidResponse(
