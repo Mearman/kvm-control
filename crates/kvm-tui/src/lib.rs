@@ -2,9 +2,7 @@
 //!
 //! Integration assumptions: connection, authentication and device selection belong to the caller.
 //! The foundation exposes no streaming API, so live video cannot yet be rendered. Capabilities
-//! are treated as authoritative and input is never retried after an error. The foundation uses
-//! boolean capabilities; integration with the forthcoming tri-state capability API must display
-//! Unknown separately from Unsupported and enable controls only when explicitly Supported.
+//! are treated as authoritative and input is never retried after an error.
 
 use std::{io, time::Duration};
 
@@ -13,7 +11,7 @@ use crossterm::{
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
-use kvm_core::{Capabilities, Device, DeviceStatus};
+use kvm_core::{Capabilities, Capability, Device, DeviceStatus};
 use ratatui::{
     Frame, Terminal,
     backend::{Backend, CrosstermBackend},
@@ -35,7 +33,7 @@ impl App {
     pub async fn refresh(&mut self, device: &dyn Device) {
         match device.capabilities().await {
             Ok(capabilities) => {
-                let status_supported = capabilities.status;
+                let status_supported = capabilities.status == Capability::Supported;
                 self.capabilities = Some(capabilities);
                 if status_supported {
                     match device.status().await {
@@ -72,7 +70,11 @@ impl App {
             KeyCode::Char('q') if !self.control => return false,
             KeyCode::Char('r') if !self.control => self.refresh(device).await,
             KeyCode::Char('i') if !self.control => {
-                if self.capabilities.as_ref().is_some_and(|c| c.keyboard) {
+                if self
+                    .capabilities
+                    .as_ref()
+                    .is_some_and(|c| c.keyboard == Capability::Supported)
+                {
                     self.control = true;
                 } else {
                     self.message = "Keyboard control is unsupported or undiscovered".into();
@@ -123,7 +125,7 @@ pub fn draw(frame: &mut Frame<'_>, app: &App) {
     .split(frame.area());
     let capabilities = match &app.capabilities {
         Some(c) => format!(
-            "status: {}  snapshot: {}  keyboard: {}  mouse: {}  live: {}",
+            "status: {:?}  snapshot: {:?}  keyboard: {:?}  mouse: {:?}  live: {:?}",
             c.status, c.snapshot, c.keyboard, c.mouse, c.live_video
         ),
         None => "Capabilities unknown".into(),
@@ -158,27 +160,51 @@ pub fn draw(frame: &mut Frame<'_>, app: &App) {
     );
 }
 
-struct TerminalGuard;
-impl TerminalGuard {
-    fn enter() -> io::Result<Self> {
-        enable_raw_mode()?;
-        if let Err(error) = execute!(io::stdout(), EnterAlternateScreen) {
-            let _ = disable_raw_mode();
-            return Err(error);
-        }
-        Ok(Self)
+trait TerminalModes {
+    fn raw(&mut self) -> io::Result<()>;
+    fn alternate(&mut self) -> io::Result<()>;
+    fn leave(&mut self) -> io::Result<()>;
+    fn cooked(&mut self) -> io::Result<()>;
+}
+
+struct SystemTerminal;
+impl TerminalModes for SystemTerminal {
+    fn raw(&mut self) -> io::Result<()> {
+        enable_raw_mode()
+    }
+    fn alternate(&mut self) -> io::Result<()> {
+        execute!(io::stdout(), EnterAlternateScreen)
+    }
+    fn leave(&mut self) -> io::Result<()> {
+        execute!(io::stdout(), LeaveAlternateScreen)
+    }
+    fn cooked(&mut self) -> io::Result<()> {
+        disable_raw_mode()
     }
 }
-impl Drop for TerminalGuard {
+
+struct TerminalGuard<T: TerminalModes>(T);
+impl<T: TerminalModes> TerminalGuard<T> {
+    fn enter(mut terminal: T) -> io::Result<Self> {
+        terminal.raw()?;
+        if let Err(error) = terminal.alternate() {
+            let _ = terminal.leave();
+            let _ = terminal.cooked();
+            return Err(error);
+        }
+        Ok(Self(terminal))
+    }
+}
+impl<T: TerminalModes> Drop for TerminalGuard<T> {
     fn drop(&mut self) {
-        let _ = execute!(io::stdout(), LeaveAlternateScreen);
-        let _ = disable_raw_mode();
+        let _ = self.0.leave();
+        let _ = self.0.cooked();
     }
 }
 
 /// Runs the TUI for an already authenticated device. Input cleanup is attempted on every normal return.
 pub async fn run(device: &dyn Device) -> io::Result<()> {
-    let _guard = TerminalGuard::enter()?;
+    let _guard = TerminalGuard::enter(SystemTerminal)?;
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
     let result = run_loop(&mut terminal, device).await;
     let cleanup = device.release_inputs().await.map_err(io::Error::other);
@@ -227,6 +253,47 @@ mod tests {
         assert!(content.contains("Capabilities unknown"));
         assert!(content.contains("Status unavailable"));
         assert!(content.contains("Live video unavailable"));
+    }
+
+    struct FakeModes {
+        calls: std::rc::Rc<std::cell::RefCell<Vec<&'static str>>>,
+        fail_alternate: bool,
+    }
+    impl TerminalModes for FakeModes {
+        fn raw(&mut self) -> io::Result<()> {
+            self.calls.borrow_mut().push("raw");
+            Ok(())
+        }
+        fn alternate(&mut self) -> io::Result<()> {
+            self.calls.borrow_mut().push("alternate");
+            if self.fail_alternate {
+                Err(io::Error::other("failed"))
+            } else {
+                Ok(())
+            }
+        }
+        fn leave(&mut self) -> io::Result<()> {
+            self.calls.borrow_mut().push("leave");
+            Ok(())
+        }
+        fn cooked(&mut self) -> io::Result<()> {
+            self.calls.borrow_mut().push("cooked");
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn restores_terminal_after_exit_and_failed_setup() {
+        for fail in [false, true] {
+            let calls = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+            let guard = TerminalGuard::enter(FakeModes {
+                calls: calls.clone(),
+                fail_alternate: fail,
+            });
+            assert_eq!(guard.is_err(), fail);
+            drop(guard);
+            assert_eq!(*calls.borrow(), ["raw", "alternate", "leave", "cooked"]);
+        }
     }
 
     #[test]
