@@ -8,14 +8,12 @@ if [ -z "$tags" ]; then
   plan=$(jq -cn --arg tag "v$next" --arg commit "$(git rev-parse HEAD)" '[{tag:$tag,commit:$commit}]')
 else
 plan='[]'
-baseline=true
 while IFS= read -r tag; do
   state=$(printf '%s' "$releases" | jq -r --arg tag "$tag" '[.[][] | select(.tag_name == $tag) | if .draft then "draft" else "published" end] | if length > 1 then error("duplicate release") else .[0] // "missing" end')
   commit=$(git rev-list -n 1 "$tag")
-  if [ "$state" = draft ] || { [ "$state" = missing ] && [ "$baseline" = false ]; } || { [ "$ATTEMPT" -gt 1 ] && [ "$commit" = "$(git rev-parse HEAD)" ]; }; then
+  if [ "$state" = draft ] || [ "$state" = missing ] || { [ "$ATTEMPT" -gt 1 ] && [ "$commit" = "$(git rev-parse HEAD)" ]; }; then
     plan=$(printf '%s' "$plan" | jq -c --arg tag "$tag" --arg commit "$commit" '. + [{tag:$tag,commit:$commit}]')
   fi
-  baseline=false
 done <<< "$tags"
 latest=$(printf '%s\n' "$tags" | sed -n '$p')
 next=$(convco version --bump)
