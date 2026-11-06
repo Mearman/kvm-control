@@ -410,6 +410,22 @@ impl Kvmd {
     }
 }
 
+fn hid_capability(state: &serde_json::Value, device: &str) -> Capability {
+    match state.get("enabled").and_then(serde_json::Value::as_bool) {
+        Some(false) => Capability::Unsupported,
+        Some(true)
+            if state
+                .get(device)
+                .and_then(|value| value.get("online"))
+                .and_then(serde_json::Value::as_bool)
+                == Some(true) =>
+        {
+            Capability::Supported
+        }
+        _ => Capability::Unknown,
+    }
+}
+
 #[async_trait]
 impl Device for Kvmd {
     async fn status(&self) -> Result<DeviceStatus> {
@@ -421,13 +437,12 @@ impl Device for Kvmd {
     }
 
     async fn capabilities(&self) -> Result<Capabilities> {
-        self.status().await?;
-        // Status endpoints do not establish whether individual control operations are supported.
+        let status = self.status().await?;
         Ok(Capabilities {
             status: Capability::Supported,
             snapshot: Capability::Unknown,
-            keyboard: Capability::Unknown,
-            mouse: Capability::Unknown,
+            keyboard: hid_capability(&status.hid, "keyboard"),
+            mouse: hid_capability(&status.hid, "mouse"),
             live_video: Capability::Unsupported,
             power: self.discover_endpoint("atx").await?,
             switch: self.discover_endpoint("switch").await?,
@@ -681,6 +696,29 @@ mod tests {
             insecure_tls: false,
             timeout: Duration::from_secs(5),
         }
+    }
+
+    #[test]
+    fn hid_capabilities_distinguish_disabled_offline_and_missing() {
+        let online = serde_json::json!({"enabled": true, "keyboard": {"online": true, "outputs": {"available": [], "active": ""}}, "mouse": {"online": false}});
+        assert_eq!(hid_capability(&online, "keyboard"), Capability::Supported);
+        assert_eq!(hid_capability(&online, "mouse"), Capability::Unknown);
+        let disabled = serde_json::json!({"enabled": false, "keyboard": {"online": true}});
+        assert_eq!(
+            hid_capability(&disabled, "keyboard"),
+            Capability::Unsupported
+        );
+        assert_eq!(
+            hid_capability(&serde_json::json!({"enabled": true}), "keyboard"),
+            Capability::Unknown
+        );
+        assert_eq!(
+            hid_capability(
+                &serde_json::json!({"keyboard": {"online": true}}),
+                "keyboard"
+            ),
+            Capability::Unknown
+        );
     }
 
     #[test]
