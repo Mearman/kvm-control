@@ -1,0 +1,164 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+env:
+  CARGO_INCREMENTAL: 0
+  CARGO_PROFILE_DEV_DEBUG: 0
+
+jobs:
+  checks:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: cargo test --workspace --locked
+
+  commits:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - run: cargo install convco --version 0.7.2 --locked
+      - name: Check conventional commits
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+        run: convco check "$BASE..$HEAD"
+
+  version:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: checks
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - run: cargo install convco --version 0.7.2 --locked
+      - id: version
+        name: Calculate release version
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag=$(git tag --merged HEAD --list 'v[0-9]*' --sort=-v:refname | sed -n '1p')
+          if [ -z "$tag" ]; then
+            echo 'A baseline version tag is required before semantic releases.' >&2
+            exit 1
+          fi
+          next=$(convco version --bump)
+          if [ "$next" != "${tag#v}" ]; then
+            echo "tag=v$next" >> "$GITHUB_OUTPUT"
+          fi
+
+  archives:
+    needs: version
+    if: needs.version.outputs.tag != ''
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+          - os: macos-15
+            target: aarch64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - name: Build all interfaces
+        env:
+          TARGET: ${{ matrix.target }}
+        run: cargo build --locked --release --target "$TARGET" --bin kvm-cli --bin kvm-tui --bin kvm-mcp
+      - name: Create and verify archive
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          TAG: ${{ needs.version.outputs.tag }}
+        run: |
+          set -euo pipefail
+          name="kvm-control-${TAG}-${TARGET}.tar.gz"
+          mkdir -p dist
+          for binary in kvm-cli kvm-tui kvm-mcp; do
+            test -x "target/$TARGET/release/$binary"
+          done
+          tar -czf "dist/$name" -C "target/$TARGET/release" kvm-cli kvm-tui kvm-mcp
+          (cd dist && shasum -a 256 "$name" > "$name.sha256" && shasum -a 256 -c "$name.sha256")
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ matrix.target }}
+          path: dist/
+          if-no-files-found: error
+
+  publish:
+    needs: [version, archives]
+    if: needs.version.outputs.tag != '' && needs.archives.result == 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          fetch-depth: 0
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          path: dist
+          merge-multiple: true
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - run: cargo install convco --version 0.7.2 --locked
+      - name: Verify assets and publish draft
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.version.outputs.tag }}
+        run: |
+          set -euo pipefail
+          for target in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu x86_64-apple-darwin aarch64-apple-darwin; do
+            archive="kvm-control-${TAG}-${target}.tar.gz"
+            test -s "dist/$archive"
+            test -s "dist/$archive.sha256"
+            (cd dist && shasum -a 256 -c "$archive.sha256")
+          done
+          convco changelog --unreleased "${TAG#v}" --max-versions 1 --output release-notes.md
+          git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' -c tag.gpgsign=false tag -a "$TAG" -m "$TAG"
+          git push origin "refs/tags/$TAG"
+          gh release create "$TAG" --draft --verify-tag --title "$TAG" --notes-file release-notes.md dist/*
+          gh release edit "$TAG" --draft=false
