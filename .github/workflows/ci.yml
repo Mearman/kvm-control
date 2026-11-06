@@ -68,6 +68,8 @@ jobs:
       - id: version
         name: Calculate release version
         shell: bash
+        env:
+          ATTEMPT: ${{ github.run_attempt }}
         run: |
           set -euo pipefail
           tag=$(git tag --merged HEAD --list 'v[0-9]*' --sort=-v:refname | sed -n '1p')
@@ -75,9 +77,13 @@ jobs:
             echo 'A baseline version tag is required before semantic releases.' >&2
             exit 1
           fi
-          next=$(convco version --bump)
-          if [ "$next" != "${tag#v}" ]; then
-            echo "tag=v$next" >> "$GITHUB_OUTPUT"
+          if [ "$ATTEMPT" -gt 1 ] && [ "$(git rev-list -n 1 "$tag")" = "$(git rev-parse HEAD)" ]; then
+            echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          else
+            next=$(convco version --bump)
+            if [ "$next" != "${tag#v}" ]; then
+              echo "tag=v$next" >> "$GITHUB_OUTPUT"
+            fi
           fi
 
   archives:
@@ -158,7 +164,21 @@ jobs:
             (cd dist && shasum -a 256 -c "$archive.sha256")
           done
           convco changelog --unreleased "${TAG#v}" --max-versions 1 --output release-notes.md
-          git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' -c tag.gpgsign=false tag -a "$TAG" -m "$TAG"
-          git push origin "refs/tags/$TAG"
-          gh release create "$TAG" --draft --verify-tag --title "$TAG" --notes-file release-notes.md dist/*
+          if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
+            if [ "$(git rev-list -n 1 "$TAG")" != "$(git rev-parse HEAD)" ]; then
+              echo "Tag $TAG points to a different commit." >&2
+              exit 1
+            fi
+          else
+            git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' -c tag.gpgsign=false tag -a "$TAG" -m "$TAG"
+            git push origin "refs/tags/$TAG"
+          fi
+          state=$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases" --jq ".[] | select(.tag_name == \"$TAG\") | if .draft then \"draft\" else \"published\" end")
+          case "$state" in
+            published) exit 0 ;;
+            '') gh release create "$TAG" --draft --verify-tag --title "$TAG" --notes-file release-notes.md ;;
+            draft) ;;
+            *) echo "Unexpected release state: $state" >&2; exit 1 ;;
+          esac
+          gh release upload "$TAG" dist/* --clobber
           gh release edit "$TAG" --draft=false
