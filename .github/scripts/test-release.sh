@@ -7,6 +7,13 @@ mkdir -p "$tmp/bin" "$tmp/repo"
 export PATH="$tmp/bin:$PATH" GITHUB_REPOSITORY=example/project ATTEMPT=1 GITHUB_OUTPUT="$tmp/output" MOCK_ASSETS="$tmp/assets" MOCK_LOG="$tmp/log" MOCK_RELEASES="$tmp/releases"
 git -C "$tmp/repo" init -q
 git -C "$tmp/repo" -c user.name=test -c user.email=test@example.com commit --allow-empty -qm 'feat: baseline'
+export MOCK_NEXT=0.1.0
+printf '%s\n' '#!/usr/bin/env bash' 'printf "%s\n" "$MOCK_NEXT"' > "$tmp/bin/convco"
+printf '%s\n' '#!/usr/bin/env bash' 'printf "[]\n"' > "$tmp/bin/gh"
+chmod +x "$tmp/bin/convco" "$tmp/bin/gh"
+(cd "$tmp/repo" && bash "$root/.github/scripts/version.sh")
+grep -q '"tag":"v0.1.0"' "$GITHUB_OUTPUT"
+: > "$GITHUB_OUTPUT"
 git -C "$tmp/repo" -c tag.gpgsign=false tag v1.0.0
 git -C "$tmp/repo" -c user.name=test -c user.email=test@example.com commit --allow-empty -qm 'feat: first release'
 git -C "$tmp/repo" -c tag.gpgsign=false tag v1.1.0
@@ -62,8 +69,19 @@ git -c user.name=test -c user.email=test@example.com commit --allow-empty -qm 'f
 git -c tag.gpgsign=false tag v1.3.0
 printf '%s\n' '[[{"tag_name":"v1.1.0","draft":true},{"tag_name":"v1.3.0","draft":true}]]' > "$MOCK_RELEASES"
 git checkout --detach "$first"
+cp "$MOCK_REMOTE/kvm-control-v1.1.0-aarch64-unknown-linux-gnu.tar.gz.sha256" "$MOCK_REMOTE/kvm-control-v1.1.0-x86_64-unknown-linux-gnu.tar.gz.sha256"
+if TAG=v1.1.0 bash "$root/.github/scripts/release.sh"; then printf '%s\n' 'Cross-target remote checksum was accepted.' >&2; exit 1; fi
+(cd "$MOCK_REMOTE" && shasum -a 256 kvm-control-v1.1.0-x86_64-unknown-linux-gnu.tar.gz > kvm-control-v1.1.0-x86_64-unknown-linux-gnu.tar.gz.sha256)
+cp "$MOCK_REMOTE/kvm-control-v1.1.0-x86_64-unknown-linux-gnu.tar.gz" "$MOCK_REMOTE/kvm-control-v1.1.0-x86_64-unknown-linux-gnu.tar.gz.sha256" dist/
 rm "$tmp/bin/convco"
 real_convco=$(command -v convco)
+mkdir "$tmp/untagged"
+git -C "$tmp/untagged" init -q
+git -C "$tmp/untagged" -c user.name=test -c user.email=test@example.com commit --allow-empty -qm 'feat: initial release'
+printf '%s\n' '[[]]' > "$MOCK_RELEASES"
+: > "$GITHUB_OUTPUT"
+(cd "$tmp/untagged" && bash "$root/.github/scripts/version.sh")
+test "$(grep '^plan=' "$GITHUB_OUTPUT" | cut -d = -f 2- | jq -r '.[0].tag')" = v0.1.0
 cp "$MOCK_ASSETS" "$tmp/invalid-assets"
 for asset in "$MOCK_REMOTE"/*; do
   printf '%s\tuploaded\tsha256:%s\n' "$(basename "$asset")" "$(shasum -a 256 "$asset" | cut -d ' ' -f 1)"
