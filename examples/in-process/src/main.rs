@@ -1,4 +1,5 @@
-//! Run with `cargo run -p kvm-core --example in_process`.
+//! Run with `cargo run --manifest-path examples/in-process/Cargo.toml` from the repository root.
+//! Test with `cargo test --manifest-path examples/in-process/Cargo.toml`.
 //! This consumer uses a synthetic device in process; it needs no hardware or credentials.
 
 use async_trait::async_trait;
