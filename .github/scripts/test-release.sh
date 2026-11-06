@@ -13,7 +13,7 @@ git -C "$tmp/repo" -c tag.gpgsign=false tag v1.1.0
 first=$(git -C "$tmp/repo" rev-parse HEAD)
 git -C "$tmp/repo" -c user.name=test -c user.email=test@example.com commit --allow-empty -qm 'feat: later release'
 second=$(git -C "$tmp/repo" rev-parse HEAD)
-printf '%s\n' '#!/usr/bin/env bash' 'set -e' 'if [[ "$1" == api ]]; then' '  if [[ "$*" == *--slurp* ]]; then cat "$MOCK_RELEASES"; elif [[ "$*" == *releases/tags/* ]]; then cat "$MOCK_ASSETS"; else printf "draft\n"; fi' 'else printf "%s %s\n" "$(git rev-parse HEAD)" "$*" >> "$MOCK_LOG"; fi' > "$tmp/bin/gh"
+printf '%s\n' '#!/usr/bin/env bash' 'set -e' 'if [[ "$1" == api ]]; then' '  if [[ "$*" == *--slurp* ]]; then cat "$MOCK_RELEASES"; elif [[ "$*" == *releases/tags/* ]]; then cat "$MOCK_ASSETS"; else if [[ ${MOCK_PUBLISHED:-} ]]; then printf "published\n"; else printf "draft\n"; fi; fi' 'elif [[ "$1 $2" == "release download" ]]; then cp "$MOCK_REMOTE"/* "$5"/; else printf "%s %s\n" "$(git rev-parse HEAD)" "$*" >> "$MOCK_LOG"; fi' > "$tmp/bin/gh"
 printf '%s\n' '#!/usr/bin/env bash' 'if [[ "$1" == changelog ]]; then printf "notes from %s\n" "$(git describe --tags --abbrev=0)" > release-notes.md; else printf "%s\n" "$MOCK_NEXT"; fi' > "$tmp/bin/convco"
 chmod +x "$tmp/bin/gh" "$tmp/bin/convco"
 cd "$tmp/repo"
@@ -37,6 +37,9 @@ for tag in v1.1.0 v1.2.0; do
     done
   done
 done
+export MOCK_REMOTE="$tmp/remote"
+mkdir "$MOCK_REMOTE"
+cp dist/* "$MOCK_REMOTE"/
 git init -q --bare "$tmp/origin"
 git remote add origin "$tmp/origin"
 PLAN="$plan" bash "$root/.github/scripts/publish-plan.sh"
@@ -44,6 +47,12 @@ grep -q "$first release edit v1.1.0 --draft=false" "$MOCK_LOG"
 grep -q "$second release edit v1.2.0 --draft=false" "$MOCK_LOG"
 test "$(grep -n -- '--draft=false' "$MOCK_LOG" | cut -d: -f2- | cut -d' ' -f1 | tr '\n' ' ')" = "$first $second "
 grep -q "$first release edit v1.1.0 --title v1.1.0 --notes-file release-notes.md" "$MOCK_LOG"
+export MOCK_PUBLISHED=1
+printf 'different local archive\n' > dist/kvm-control-v1.1.0-x86_64-unknown-linux-gnu.tar.gz
+(cd dist && shasum -a 256 kvm-control-v1.1.0-x86_64-unknown-linux-gnu.tar.gz > kvm-control-v1.1.0-x86_64-unknown-linux-gnu.tar.gz.sha256)
+git checkout --detach "$first"
+TAG=v1.1.0 bash "$root/.github/scripts/release.sh"
+unset MOCK_PUBLISHED
 printf 'bad\n' > "$MOCK_ASSETS"
 : > "$MOCK_LOG"
 if PLAN="$plan" bash "$root/.github/scripts/publish-plan.sh"; then printf '%s\n' 'Missing remote assets were accepted.' >&2; exit 1; fi
@@ -52,6 +61,19 @@ git checkout --detach "$second"
 git -c user.name=test -c user.email=test@example.com commit --allow-empty -qm 'feat: third release'
 git -c tag.gpgsign=false tag v1.3.0
 printf '%s\n' '[[{"tag_name":"v1.1.0","draft":true},{"tag_name":"v1.3.0","draft":true}]]' > "$MOCK_RELEASES"
+git checkout --detach "$first"
+rm "$tmp/bin/convco"
+real_convco=$(command -v convco)
+cp "$MOCK_ASSETS" "$tmp/invalid-assets"
+for asset in "$MOCK_REMOTE"/*; do
+  printf '%s\tuploaded\tsha256:%s\n' "$(basename "$asset")" "$(shasum -a 256 "$asset" | cut -d ' ' -f 1)"
+done > "$MOCK_ASSETS"
+TAG=v1.1.0 bash "$root/.github/scripts/release.sh"
+grep -q 'first release' release-notes.md
+if grep -q 'later release' release-notes.md; then printf '%s\n' 'Release notes include a later commit.' >&2; exit 1; fi
+git checkout --detach "$second"
+printf '%s\n' '#!/usr/bin/env bash' 'printf "%s\n" "$MOCK_NEXT"' > "$tmp/bin/convco"
+chmod +x "$tmp/bin/convco"
 export MOCK_NEXT=1.3.0
 : > "$GITHUB_OUTPUT"
 bash "$root/.github/scripts/version.sh"
