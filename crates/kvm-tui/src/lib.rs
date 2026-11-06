@@ -461,16 +461,27 @@ pub async fn run(device: &dyn Device) -> io::Result<()> {
     let picker = ratatui_image::picker::Picker::from_query_stdio()
         .unwrap_or_else(|_| ratatui_image::picker::Picker::halfblocks());
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
-    let result = run_loop(&mut terminal, device, &picker).await;
+    let result = run_loop(&mut terminal, device, &picker, || {
+        if event::poll(Duration::from_millis(25))? {
+            Ok(Some(event::read()?))
+        } else {
+            Ok(None)
+        }
+    })
+    .await;
     let cleanup = device.release_inputs().await.map_err(io::Error::other);
     result.and(cleanup)
 }
 
-async fn run_loop<B: Backend<Error = io::Error>>(
+async fn run_loop<B: Backend>(
     terminal: &mut Terminal<B>,
     device: &dyn Device,
     picker: &ratatui_image::picker::Picker,
-) -> io::Result<()> {
+    mut next_event: impl FnMut() -> io::Result<Option<Event>>,
+) -> io::Result<()>
+where
+    B::Error: std::error::Error + Send + Sync + 'static,
+{
     let mut app = App::default();
     app.refresh(device).await;
     let (video_tx, mut video_rx) =
@@ -483,26 +494,28 @@ async fn run_loop<B: Backend<Error = io::Error>>(
     }
     let mut stream: Option<StreamTask> = None;
     loop {
-        terminal.draw(|frame| {
-            draw(frame, &app);
-            if let Some(image) = &app.video {
-                let areas = Layout::vertical([
-                    Constraint::Length(3),
-                    Constraint::Min(3),
-                    Constraint::Length(4),
-                ])
-                .split(frame.area());
-                if let Some(area) = video_viewport(areas[1], image.width(), image.height()) {
-                    let mut protocol =
-                        picker.new_resize_protocol(image::DynamicImage::ImageRgb8(image.clone()));
-                    frame.render_stateful_widget(
-                        ratatui_image::StatefulImage::default(),
-                        area,
-                        &mut protocol,
-                    );
+        terminal
+            .draw(|frame| {
+                draw(frame, &app);
+                if let Some(image) = &app.video {
+                    let areas = Layout::vertical([
+                        Constraint::Length(3),
+                        Constraint::Min(3),
+                        Constraint::Length(4),
+                    ])
+                    .split(frame.area());
+                    if let Some(area) = video_viewport(areas[1], image.width(), image.height()) {
+                        let mut protocol = picker
+                            .new_resize_protocol(image::DynamicImage::ImageRgb8(image.clone()));
+                        frame.render_stateful_widget(
+                            ratatui_image::StatefulImage::default(),
+                            area,
+                            &mut protocol,
+                        );
+                    }
                 }
-            }
-        })?;
+            })
+            .map_err(io::Error::other)?;
         if video_rx.has_changed().unwrap_or(false) {
             let item = video_rx.borrow_and_update().clone();
             if let Some(item) = item {
@@ -529,8 +542,8 @@ async fn run_loop<B: Backend<Error = io::Error>>(
                 }
             }
         }
-        if event::poll(Duration::from_millis(25))? {
-            match event::read()? {
+        if let Some(event) = next_event()? {
+            match event {
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
                     if !app.control && key.code == KeyCode::Char('v') {
                         match device.video().await {
@@ -573,7 +586,7 @@ async fn run_loop<B: Backend<Error = io::Error>>(
                         Constraint::Min(3),
                         Constraint::Length(4),
                     ])
-                    .split(terminal.size()?.into());
+                    .split(terminal.size().map_err(io::Error::other)?.into());
                     app.mouse(device, mouse, areas[1]).await;
                 }
                 _ => {}
@@ -592,11 +605,39 @@ mod tests {
     struct FakeDevice {
         calls: std::sync::Mutex<Vec<String>>,
         fail_key: bool,
+        video_frame: Option<Vec<u8>>,
+        dropped: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+    struct FakeStream {
+        jpeg: Option<Vec<u8>>,
+        dropped: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+    impl Drop for FakeStream {
+        fn drop(&mut self) {
+            self.dropped
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+    #[async_trait::async_trait]
+    impl kvm_core::VideoStream for FakeStream {
+        async fn next_frame(&mut self) -> kvm_core::Result<Option<kvm_core::Snapshot>> {
+            if let Some(jpeg) = self.jpeg.take() {
+                Ok(Some(kvm_core::Snapshot { jpeg }))
+            } else {
+                std::future::pending().await
+            }
+        }
     }
     #[async_trait::async_trait]
     impl Device for FakeDevice {
         async fn video(&self) -> kvm_core::Result<Box<dyn kvm_core::VideoStream>> {
-            Err(kvm_core::Error::Unsupported("video".into()))
+            match &self.video_frame {
+                Some(jpeg) => Ok(Box::new(FakeStream {
+                    jpeg: Some(jpeg.clone()),
+                    dropped: self.dropped.clone(),
+                })),
+                None => Err(kvm_core::Error::Unsupported("video".into())),
+            }
         }
         async fn status(&self) -> kvm_core::Result<DeviceStatus> {
             Ok(DeviceStatus {
@@ -655,6 +696,60 @@ mod tests {
             self.calls.lock().unwrap().push("power".into());
             Ok(kvm_core::ControlOutcome::Unverified)
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fake_stream_runs_through_ui_and_releases_on_exit() {
+        let image = image::RgbImage::from_pixel(8, 8, image::Rgb([220, 10, 10]));
+        let mut jpeg = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new(&mut jpeg)
+            .encode_image(&image)
+            .unwrap();
+        let device = FakeDevice {
+            video_frame: Some(jpeg),
+            ..FakeDevice::default()
+        };
+        let mut terminal = Terminal::new(TestBackend::new(40, 16)).unwrap();
+        let mut rounds = 0;
+        let result = run_loop(
+            &mut terminal,
+            &device,
+            &ratatui_image::picker::Picker::halfblocks(),
+            || {
+                rounds += 1;
+                if rounds == 1 {
+                    Ok(Some(Event::Key(crossterm::event::KeyEvent::new(
+                        KeyCode::Char('v'),
+                        crossterm::event::KeyModifiers::NONE,
+                    ))))
+                } else if rounds == 100 {
+                    Ok(Some(Event::Key(crossterm::event::KeyEvent::new(
+                        KeyCode::Char('q'),
+                        crossterm::event::KeyModifiers::NONE,
+                    ))))
+                } else {
+                    std::thread::yield_now();
+                    Ok(None)
+                }
+            },
+        )
+        .await;
+        assert!(result.is_ok());
+        assert!(
+            terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .any(|cell| cell.symbol() == "▀")
+        );
+        for _ in 0..100 {
+            if device.dropped.load(std::sync::atomic::Ordering::SeqCst) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(device.dropped.load(std::sync::atomic::Ordering::SeqCst));
     }
 
     #[test]
