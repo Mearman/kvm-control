@@ -12,7 +12,7 @@ use axum::{
 };
 use axum_server::tls_rustls::RustlsConfig;
 use kvm_core::{Capability, Device, DeviceProfile, Error};
-use kvm_kvmd::{Config, Kvmd};
+use kvm_kvmd::{Config, Kvmd, LoginState};
 use serde_json::json;
 use url::Url;
 
@@ -31,6 +31,23 @@ async fn login(State(calls): State<Calls>, uri: Uri, body: String) -> impl IntoR
             "auth_token=synthetic; Path=/; Secure; HttpOnly",
         )],
         Json(json!({"ok": true, "result": {}})),
+    )
+}
+
+async fn gl_login() -> impl IntoResponse {
+    Json(
+        json!({"ok": true, "result": {"two_step_required": true, "two_step_token": "synthetic-approval", "expires_in": 60}}),
+    )
+}
+
+async fn gl_complete(body: String) -> impl IntoResponse {
+    assert_eq!(body, "two_step_token=synthetic-approval");
+    (
+        [(
+            header::SET_COOKIE,
+            "auth_token=synthetic; Path=/; Secure; HttpOnly",
+        )],
+        Json(json!({"ok": true, "result": {"token": "synthetic"}})),
     )
 }
 
@@ -60,6 +77,8 @@ async fn fixture() -> (Url, Vec<u8>, Calls, tokio::task::JoinHandle<()>) {
     let calls = Calls::default();
     let app = Router::new()
         .route("/api/auth/login", post(login))
+        .route("/gl/api/auth/login", post(gl_login))
+        .route("/gl/api/auth/two_step_complete", post(gl_complete))
         .route("/api/auth/check", get(status))
         .route("/api/info", get(status))
         .route("/api/hid", get(status))
@@ -95,6 +114,24 @@ fn client(endpoint: Url, ca: Option<Vec<u8>>) -> Kvmd {
         timeout: Duration::from_secs(5),
     })
     .unwrap()
+}
+
+#[tokio::test]
+async fn gl_approval_is_not_reported_as_authenticated() {
+    let (mut endpoint, ca, _, server) = fixture().await;
+    endpoint.set_path("/gl/");
+    let device = client(endpoint, Some(ca));
+    assert_eq!(
+        device.login("test-user", "test-password").await.unwrap(),
+        LoginState::ApprovalPending {
+            expires_in: Some(60)
+        }
+    );
+    assert_eq!(
+        device.complete_approval().await.unwrap(),
+        LoginState::Authenticated
+    );
+    server.abort();
 }
 
 #[tokio::test]
