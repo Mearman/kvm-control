@@ -13,8 +13,9 @@ kvm-kvmd = { version = "0.1.0", path = "../kvm-kvmd" }
 ratatui = "0.30.2"
 ratatui-image = { version = "10.0.6", default-features = false, features = ["crossterm"] }
 rpassword = "7.5.4"
-tokio.workspace = true
+tokio = { workspace = true, features = ["signal"] }
 url.workspace = true
+zeroize = "1.9.1"
 
 [dev-dependencies]
 async-trait.workspace = true

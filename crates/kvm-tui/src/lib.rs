@@ -22,13 +22,13 @@ use ratatui::{
 };
 
 /// State displayed by the interface. Device responses are untrusted screen content.
-#[derive(Default)]
 pub struct App {
     pub status: Option<DeviceStatus>,
     pub capabilities: Option<Capabilities>,
     pub message: String,
     pub control: bool,
     enhanced_keyboard: bool,
+    cell_size: (u16, u16),
     drag_modifiers: Vec<&'static str>,
     held_modifiers: std::collections::BTreeSet<&'static str>,
     synthetic_modifiers: std::collections::BTreeSet<&'static str>,
@@ -37,6 +37,26 @@ pub struct App {
     pending: Option<kvm_core::Control>,
     command: Option<String>,
     submitted: Option<kvm_core::Control>,
+}
+
+impl Default for App {
+    fn default() -> Self {
+        Self {
+            status: None,
+            capabilities: None,
+            message: String::new(),
+            control: false,
+            enhanced_keyboard: false,
+            cell_size: (1, 2),
+            drag_modifiers: Vec::new(),
+            held_modifiers: Default::default(),
+            synthetic_modifiers: Default::default(),
+            video: None,
+            pending: None,
+            command: None,
+            submitted: None,
+        }
+    }
 }
 
 impl App {
@@ -98,7 +118,8 @@ impl App {
             }
             return;
         };
-        let Some(viewport) = video_viewport(area, video.width(), video.height()) else {
+        let Some(viewport) = video_viewport(area, video.width(), video.height(), self.cell_size)
+        else {
             if matches!(event.kind, MouseEventKind::Up(_)) {
                 self.clear_input_state();
                 if let Err(error) = device.release_inputs().await {
@@ -108,7 +129,7 @@ impl App {
             }
             return;
         };
-        let Some((x, y)) = mouse_coordinates(event.column, event.row, viewport) else {
+        let Some((x, y)) = video_mouse_coordinates(event.column, event.row, &viewport) else {
             if let MouseEventKind::Up(button) = event.kind {
                 if !self.enhanced_keyboard {
                     for (flag, modifier) in [
@@ -586,6 +607,7 @@ impl App {
                         modifiers.push("MetaLeft");
                     }
                     if mods.contains(crossterm::event::KeyModifiers::SHIFT)
+                        || code == KeyCode::BackTab
                         || matches!(code, KeyCode::Char(c) if c.is_ascii_uppercase() || "_+{}|:\"~<>?!@#$%^&*()".contains(c))
                     {
                         modifiers.push("ShiftLeft");
@@ -659,39 +681,90 @@ fn parse_control(text: &str) -> Result<kvm_core::Control, &'static str> {
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct VideoViewport {
+    cells: ratatui::layout::Rect,
+    pixels: (u32, u32),
+    cell_size: (u16, u16),
+}
+
+fn fit_pixels(width: u32, height: u32, max_width: u32, max_height: u32) -> (u32, u32) {
+    let ratio =
+        (f64::from(max_width) / f64::from(width)).min(f64::from(max_height) / f64::from(height));
+    (
+        (f64::from(width) * ratio).round().max(1.0) as u32,
+        (f64::from(height) * ratio).round().max(1.0) as u32,
+    )
+}
+
 fn video_viewport(
     area: ratatui::layout::Rect,
     width: u32,
     height: u32,
-) -> Option<ratatui::layout::Rect> {
+    cell_size: (u16, u16),
+) -> Option<VideoViewport> {
     let inner = area.inner(ratatui::layout::Margin::new(1, 1));
-    if width == 0 || height == 0 || inner.width < 2 || inner.height < 2 {
+    if width == 0
+        || height == 0
+        || cell_size.0 == 0
+        || cell_size.1 == 0
+        || inner.width < 2
+        || inner.height < 2
+    {
         return None;
     }
-    // Half-block cells represent two vertically stacked pixels.
-    let pixel_height = u64::from(inner.height) * 2;
-    let (w, h_pixels) =
-        if u64::from(inner.width) * u64::from(height) <= pixel_height * u64::from(width) {
-            (
-                u64::from(inner.width),
-                u64::from(inner.width) * u64::from(height) / u64::from(width),
-            )
-        } else {
-            (
-                pixel_height * u64::from(width) / u64::from(height),
-                pixel_height,
-            )
-        };
-    let w = u16::try_from(w).ok()?;
-    let h = u16::try_from(h_pixels.div_ceil(2)).ok()?;
-    if w < 2 || h < 2 {
+    let (cw, ch) = (u32::from(cell_size.0), u32::from(cell_size.1));
+    let (pixel_width, pixel_height) = fit_pixels(
+        width,
+        height,
+        u32::from(inner.width) * cw,
+        u32::from(inner.height) * ch,
+    );
+    let w = u16::try_from(pixel_width.div_ceil(cw)).ok()?;
+    let h = u16::try_from(pixel_height.div_ceil(ch)).ok()?;
+    if w < 2 || h < 2 || w > inner.width || h > inner.height {
         return None;
     }
-    Some(ratatui::layout::Rect::new(
-        inner.x + (inner.width - w) / 2,
-        inner.y + (inner.height - h) / 2,
-        w,
-        h,
+    let pixels = fit_pixels(width, height, u32::from(w) * cw, u32::from(h) * ch);
+    Some(VideoViewport {
+        cells: ratatui::layout::Rect::new(
+            inner.x + (inner.width - w) / 2,
+            inner.y + (inner.height - h) / 2,
+            w,
+            h,
+        ),
+        pixels,
+        cell_size,
+    })
+}
+
+fn video_mouse_coordinates(column: u16, row: u16, viewport: &VideoViewport) -> Option<(i16, i16)> {
+    let x = u32::from(column.checked_sub(viewport.cells.x)?);
+    let y = u32::from(row.checked_sub(viewport.cells.y)?);
+    let axis = |cell: u32, cell_size: u16, pixels: u32| -> Option<i16> {
+        let cell_size = u32::from(cell_size);
+        let start = cell.checked_mul(cell_size)?;
+        if start >= pixels {
+            return None;
+        }
+        let last = (pixels - 1) / cell_size;
+        if last == 0 {
+            return None;
+        }
+        let centre = (start + (cell_size - 1) / 2).min(pixels - 1);
+        let first_centre = ((cell_size - 1) / 2).min(pixels - 1);
+        let last_centre = (last * cell_size + (cell_size - 1) / 2).min(pixels - 1);
+        let value = i64::from(i16::MIN)
+            + i64::from(centre - first_centre) * i64::from(u16::MAX)
+                / i64::from(last_centre - first_centre);
+        Some(value as i16)
+    };
+    if x >= u32::from(viewport.cells.width) || y >= u32::from(viewport.cells.height) {
+        return None;
+    }
+    Some((
+        axis(x, viewport.cell_size.0, viewport.pixels.0)?,
+        axis(y, viewport.cell_size.1, viewport.pixels.1)?,
     ))
 }
 
@@ -771,7 +844,7 @@ fn key_name(code: KeyCode) -> Option<String> {
         KeyCode::Esc => Some("Escape".into()),
         KeyCode::Enter => Some("Enter".into()),
         KeyCode::Backspace => Some("Backspace".into()),
-        KeyCode::Tab => Some("Tab".into()),
+        KeyCode::Tab | KeyCode::BackTab => Some("Tab".into()),
         KeyCode::Up => Some("ArrowUp".into()),
         KeyCode::Down => Some("ArrowDown".into()),
         KeyCode::Left => Some("ArrowLeft".into()),
@@ -805,20 +878,22 @@ pub fn draw(frame: &mut Frame<'_>, app: &App) {
         areas[1],
     );
     if let Some(image) = &app.video {
-        if let Some(viewport) = video_viewport(areas[1], image.width(), image.height()) {
+        if let Some(viewport) =
+            video_viewport(areas[1], image.width(), image.height(), app.cell_size)
+        {
             let scaled = image::imageops::resize(
                 image,
-                u32::from(viewport.width),
-                u32::from(viewport.height) * 2,
+                u32::from(viewport.cells.width),
+                u32::from(viewport.cells.height) * 2,
                 image::imageops::FilterType::Triangle,
             );
-            for y in 0..viewport.height {
-                for x in 0..viewport.width {
+            for y in 0..viewport.cells.height {
+                for x in 0..viewport.cells.width {
                     let top = scaled.get_pixel(u32::from(x), u32::from(y) * 2).0;
                     let bottom = scaled.get_pixel(u32::from(x), u32::from(y) * 2 + 1).0;
                     if let Some(cell) = frame
                         .buffer_mut()
-                        .cell_mut((viewport.x + x, viewport.y + y))
+                        .cell_mut((viewport.cells.x + x, viewport.cells.y + y))
                     {
                         cell.set_symbol("▀")
                             .set_fg(ratatui::style::Color::Rgb(top[0], top[1], top[2]))
@@ -966,6 +1041,8 @@ impl Drop for InputCleanup {
 /// Runs the TUI for an already authenticated device. Cancellation schedules best-effort input release while the runtime remains active.
 pub async fn run(device: std::sync::Arc<dyn Device>) -> io::Result<()> {
     let mut input_cleanup = InputCleanup(Some(device.clone()));
+    #[cfg(unix)]
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let mut guard = TerminalGuard::enter(SystemTerminal)?;
     let picker = ratatui_image::picker::Picker::from_query_stdio()
         .unwrap_or_else(|_| ratatui_image::picker::Picker::halfblocks());
@@ -982,16 +1059,27 @@ pub async fn run(device: std::sync::Arc<dyn Device>) -> io::Result<()> {
     }
     guard.keyboard = enhanced;
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
-    let result = run_loop(&mut terminal, device.as_ref(), &picker, enhanced, || {
+    let run = run_loop(&mut terminal, device.as_ref(), &picker, enhanced, || {
         if event::poll(Duration::from_millis(25))? {
             Ok(Some(event::read()?))
         } else {
             Ok(None)
         }
-    })
-    .await;
+    });
+    #[cfg(unix)]
+    let result = wait_for_termination(run, &mut terminate).await;
+    #[cfg(not(unix))]
+    let result = run.await;
     let cleanup = device.release_inputs().await.map_err(io::Error::other);
     input_cleanup.0 = None;
+    finish_terminal(result, cleanup, &mut guard)
+}
+
+fn finish_terminal<T: TerminalModes>(
+    result: io::Result<()>,
+    cleanup: io::Result<()>,
+    guard: &mut TerminalGuard<T>,
+) -> io::Result<()> {
     let restored = guard.restore();
     let errors: Vec<String> = [result, cleanup, restored]
         .into_iter()
@@ -1003,6 +1091,14 @@ pub async fn run(device: std::sync::Arc<dyn Device>) -> io::Result<()> {
     } else {
         Err(io::Error::other(errors.join("; ")))
     }
+}
+
+#[cfg(unix)]
+async fn wait_for_termination<F: std::future::Future<Output = io::Result<()>>>(
+    run: F,
+    terminate: &mut tokio::signal::unix::Signal,
+) -> io::Result<()> {
+    tokio::select! { result = run => result, _ = terminate.recv() => Err(io::Error::other("terminated by SIGTERM")) }
 }
 
 async fn run_loop<B: Backend>(
@@ -1017,6 +1113,7 @@ where
 {
     let mut app = App {
         enhanced_keyboard: enhanced,
+        cell_size: picker.font_size(),
         ..App::default()
     };
     app.refresh(device).await;
@@ -1062,12 +1159,15 @@ where
                         Constraint::Length(4),
                     ])
                     .split(frame.area());
-                    if let Some(area) = video_viewport(areas[1], image.width(), image.height()) {
+                    if let Some(area) =
+                        video_viewport(areas[1], image.width(), image.height(), app.cell_size)
+                    {
                         let mut protocol = picker
                             .new_resize_protocol(image::DynamicImage::ImageRgb8(image.clone()));
                         frame.render_stateful_widget(
-                            ratatui_image::StatefulImage::default(),
-                            area,
+                            ratatui_image::StatefulImage::default()
+                                .resize(ratatui_image::Resize::Scale(None)),
+                            area.cells,
                             &mut protocol,
                         );
                     }
@@ -2535,6 +2635,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn backtab_sends_shift_tab() {
+        let device = FakeDevice::default();
+        let mut app = App::default();
+        app.refresh(&device).await;
+        app.control = true;
+        app.key(&device, KeyCode::BackTab).await;
+        assert_eq!(
+            *device.calls.lock().unwrap(),
+            [
+                "key:ShiftLeft:true",
+                "key:Tab:true",
+                "key:Tab:false",
+                "key:ShiftLeft:false"
+            ]
+        );
+    }
+
+    #[test]
+    fn viewport_accounts_for_two_fits_and_cell_padding() {
+        let area = ratatui::layout::Rect::new(0, 0, 82, 42);
+        let viewport = video_viewport(area, 640, 480, (8, 16)).unwrap();
+        assert_eq!(viewport.cells, ratatui::layout::Rect::new(1, 5, 80, 30));
+        assert_eq!(viewport.pixels, (640, 480));
+        assert_eq!(
+            video_mouse_coordinates(1, 5, &viewport),
+            Some((i16::MIN, i16::MIN))
+        );
+        assert_eq!(
+            video_mouse_coordinates(80, 34, &viewport),
+            Some((i16::MAX, i16::MAX))
+        );
+        let padded =
+            video_viewport(ratatui::layout::Rect::new(0, 0, 12, 12), 100, 31, (8, 16)).unwrap();
+        assert_eq!(padded.cells, ratatui::layout::Rect::new(1, 5, 10, 2));
+        assert_eq!(padded.pixels, (80, 25));
+        assert_eq!(
+            video_mouse_coordinates(10, 6, &padded),
+            Some((i16::MAX, i16::MAX))
+        );
+        assert_eq!(video_mouse_coordinates(10, 7, &padded), None);
+    }
+
+    #[tokio::test]
     async fn punctuation_includes_shift_and_balanced_key_events() {
         let device = FakeDevice::default();
         let mut app = App::default();
@@ -2791,6 +2934,86 @@ mod tests {
             self.calls.borrow_mut().push("mouse_off");
             Ok(())
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sigterm_process_releases_input_and_restores_terminal() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::process::{Command, Stdio};
+        const CHILD: &str = "KVM_SIGTERM_TEST_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                let mut signal =
+                    tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                        .unwrap();
+                let calls = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+                let mut guard = TerminalGuard::enter(FakeModes {
+                    calls: calls.clone(),
+                    fail_alternate: false,
+                    fail_restore: false,
+                })
+                .unwrap();
+                let device = FakeDevice::default();
+                println!("SIGTERM_READY");
+                std::io::stdout().flush().unwrap();
+                let result = wait_for_termination(std::future::pending(), &mut signal).await;
+                let cleanup = device.release_inputs().await.map_err(io::Error::other);
+                assert!(finish_terminal(result, cleanup, &mut guard).is_err());
+                assert_eq!(*device.calls.lock().unwrap(), ["release"]);
+                assert_eq!(
+                    *calls.borrow(),
+                    [
+                        "raw",
+                        "alternate",
+                        "mouse_on",
+                        "mouse_off",
+                        "leave",
+                        "cooked"
+                    ]
+                );
+                println!("SIGTERM_CLEANED");
+            });
+            return;
+        }
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::sigterm_process_releases_input_and_restores_terminal",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut output = BufReader::new(child.stdout.take().unwrap());
+        let mut line = String::new();
+        loop {
+            line.clear();
+            assert_ne!(
+                output.read_line(&mut line).unwrap(),
+                0,
+                "child exited before readiness"
+            );
+            if line.contains("SIGTERM_READY") {
+                break;
+            }
+        }
+        assert!(
+            Command::new("kill")
+                .args(["-TERM", &child.id().to_string()])
+                .status()
+                .unwrap()
+                .success()
+        );
+        let mut rest = String::new();
+        std::io::Read::read_to_string(&mut output, &mut rest).unwrap();
+        assert!(child.wait().unwrap().success());
+        assert!(rest.contains("SIGTERM_CLEANED"));
     }
 
     #[test]
