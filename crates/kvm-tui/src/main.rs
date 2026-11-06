@@ -88,6 +88,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         state = device.complete_approval().await?;
     }
-    kvm_tui::run(&device).await?;
+    kvm_tui::run(std::sync::Arc::new(device)).await?;
     Ok(())
 }
