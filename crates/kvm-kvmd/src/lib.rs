@@ -186,68 +186,6 @@ impl Kvmd {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn config(endpoint: &str) -> Config {
-        Config {
-            endpoint: Url::parse(endpoint).unwrap(),
-            profile: DeviceProfile::PiKvm,
-            trusted_ca_pem: None,
-            insecure_tls: false,
-            timeout: Duration::from_secs(5),
-        }
-    }
-
-    #[test]
-    fn paths_include_api_and_preserve_proxy_prefix() {
-        let client = Kvmd::new(config("https://example.com/proxy")).unwrap();
-        assert_eq!(
-            client.url("auth/login").unwrap().as_str(),
-            "https://example.com/proxy/api/auth/login"
-        );
-        assert_eq!(
-            client.url("hid/events/send_key").unwrap().as_str(),
-            "https://example.com/proxy/api/hid/events/send_key"
-        );
-        let client = Kvmd::new(config("https://example.com/")).unwrap();
-        assert_eq!(
-            client.url("info").unwrap().as_str(),
-            "https://example.com/api/info"
-        );
-    }
-
-    #[test]
-    fn rejects_insecure_and_credential_bearing_endpoints() {
-        for endpoint in [
-            "http://example.com/",
-            "https://user:password@example.com/",
-            "https://example.com/?token=x",
-            "https://example.com/#fragment",
-        ] {
-            assert!(Kvmd::new(config(endpoint)).is_err());
-        }
-    }
-
-    #[test]
-    fn auth_statuses_are_distinguished() {
-        assert!(matches!(
-            Kvmd::check(StatusCode::UNAUTHORIZED),
-            Err(Error::Authentication)
-        ));
-        assert!(matches!(
-            Kvmd::check(StatusCode::FORBIDDEN),
-            Err(Error::Authentication)
-        ));
-        assert!(matches!(
-            Kvmd::check(StatusCode::NOT_FOUND),
-            Err(Error::Http(404))
-        ));
-        assert!(Kvmd::check(StatusCode::OK).is_ok());
-    }
-}
-
 #[async_trait]
 impl Device for Kvmd {
     async fn status(&self) -> Result<DeviceStatus> {
@@ -271,12 +209,30 @@ impl Device for Kvmd {
     }
 
     async fn snapshot(&self) -> Result<Snapshot> {
-        let bytes = self
-            .get("streamer/snapshot")
-            .await?
-            .bytes()
+        // Limit compressed image data before collecting it, including chunked responses.
+        const MAX_SNAPSHOT_BYTES: usize = 16 * 1024 * 1024;
+        let mut response = self.get("streamer/snapshot").await?;
+        if response
+            .content_length()
+            .is_some_and(|n| n > MAX_SNAPSHOT_BYTES as u64)
+        {
+            return Err(Error::InvalidResponse(
+                "snapshot exceeds the size limit".into(),
+            ));
+        }
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response
+            .chunk()
             .await
-            .map_err(|_| Error::Transport("snapshot read failed".into()))?;
+            .map_err(|_| Error::Transport("snapshot read failed".into()))?
+        {
+            if chunk.len() > MAX_SNAPSHOT_BYTES - bytes.len() {
+                return Err(Error::InvalidResponse(
+                    "snapshot exceeds the size limit".into(),
+                ));
+            }
+            bytes.extend_from_slice(&chunk);
+        }
         if !bytes.starts_with(&[0xff, 0xd8]) || !bytes.ends_with(&[0xff, 0xd9]) {
             return Err(Error::InvalidResponse(
                 "snapshot is not a complete JPEG".into(),
@@ -366,5 +322,67 @@ impl Device for Kvmd {
         } else {
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config(endpoint: &str) -> Config {
+        Config {
+            endpoint: Url::parse(endpoint).unwrap(),
+            profile: DeviceProfile::PiKvm,
+            trusted_ca_pem: None,
+            insecure_tls: false,
+            timeout: Duration::from_secs(5),
+        }
+    }
+
+    #[test]
+    fn paths_include_api_and_preserve_proxy_prefix() {
+        let client = Kvmd::new(config("https://example.com/proxy")).unwrap();
+        assert_eq!(
+            client.url("auth/login").unwrap().as_str(),
+            "https://example.com/proxy/api/auth/login"
+        );
+        assert_eq!(
+            client.url("hid/events/send_key").unwrap().as_str(),
+            "https://example.com/proxy/api/hid/events/send_key"
+        );
+        let client = Kvmd::new(config("https://example.com/")).unwrap();
+        assert_eq!(
+            client.url("info").unwrap().as_str(),
+            "https://example.com/api/info"
+        );
+    }
+
+    #[test]
+    fn rejects_insecure_and_credential_bearing_endpoints() {
+        for endpoint in [
+            "http://example.com/",
+            "https://user:password@example.com/",
+            "https://example.com/?token=x",
+            "https://example.com/#fragment",
+        ] {
+            assert!(Kvmd::new(config(endpoint)).is_err());
+        }
+    }
+
+    #[test]
+    fn auth_statuses_are_distinguished() {
+        assert!(matches!(
+            Kvmd::check(StatusCode::UNAUTHORIZED),
+            Err(Error::Authentication)
+        ));
+        assert!(matches!(
+            Kvmd::check(StatusCode::FORBIDDEN),
+            Err(Error::Authentication)
+        ));
+        assert!(matches!(
+            Kvmd::check(StatusCode::NOT_FOUND),
+            Err(Error::Http(404))
+        ));
+        assert!(Kvmd::check(StatusCode::OK).is_ok());
     }
 }
