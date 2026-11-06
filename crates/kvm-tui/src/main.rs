@@ -1,6 +1,6 @@
 use clap::{Parser, ValueEnum};
 use kvm_core::DeviceProfile;
-use kvm_kvmd::{Config, Kvmd};
+use kvm_kvmd::{Config, Kvmd, LoginState};
 use std::{
     io::{self, Write},
     path::PathBuf,
@@ -77,8 +77,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         insecure_tls: args.insecure_tls,
         timeout: Duration::from_secs(15),
     })?;
-    device.login(&username, &password).await?;
+    let mut state = device.login(&username, &password).await?;
     drop(password);
+    while let LoginState::ApprovalPending { expires_in } = state {
+        eprintln!(
+            "Device approval required (expiry: {expires_in:?} seconds). Approve on the device, then press Enter; type q to cancel."
+        );
+        if prompt("Continue")?.eq_ignore_ascii_case("q") {
+            return Err("device approval cancelled".into());
+        }
+        state = device.complete_approval().await?;
+    }
     kvm_tui::run(&device).await?;
     Ok(())
 }

@@ -372,9 +372,14 @@ async fn run_loop<B: Backend<Error = io::Error>>(
 ) -> io::Result<()> {
     let mut app = App::default();
     app.refresh(device).await;
-    let (video_tx, mut video_rx) = tokio::sync::watch::channel::<Option<Result<kvm_core::Snapshot, String>>>(None);
+    let (video_tx, mut video_rx) =
+        tokio::sync::watch::channel::<Option<Result<kvm_core::Snapshot, String>>>(None);
     struct StreamTask(tokio::task::JoinHandle<()>);
-    impl Drop for StreamTask { fn drop(&mut self) { self.0.abort(); } }
+    impl Drop for StreamTask {
+        fn drop(&mut self) {
+            self.0.abort();
+        }
+    }
     let mut stream: Option<StreamTask> = None;
     loop {
         terminal.draw(|frame| draw(frame, &app))?;
@@ -382,11 +387,25 @@ async fn run_loop<B: Backend<Error = io::Error>>(
             let item = video_rx.borrow_and_update().clone();
             if let Some(item) = item {
                 match item {
-                    Ok(frame) => match image::load_from_memory_with_format(&frame.jpeg, image::ImageFormat::Jpeg) {
-                        Ok(image) => { app.video = Some(image.to_rgb8()); app.message = "Live video (character-cell fallback)".into(); }
-                        Err(error) => { app.video = None; app.message = format!("Invalid video frame: {error}"); stream = None; }
+                    Ok(frame) => match image::load_from_memory_with_format(
+                        &frame.jpeg,
+                        image::ImageFormat::Jpeg,
+                    ) {
+                        Ok(image) => {
+                            app.video = Some(image.to_rgb8());
+                            app.message = "Live video (character-cell fallback)".into();
+                        }
+                        Err(error) => {
+                            app.video = None;
+                            app.message = format!("Invalid video frame: {error}");
+                            drop(stream.take());
+                        }
                     },
-                    Err(error) => { app.video = None; app.message = error; stream = None; }
+                    Err(error) => {
+                        app.video = None;
+                        app.message = error;
+                        drop(stream.take());
+                    }
                 }
             }
         }
@@ -398,15 +417,25 @@ async fn run_loop<B: Backend<Error = io::Error>>(
                             Ok(mut video) => {
                                 app.video = None;
                                 let sender = video_tx.clone();
-                                stream = Some(StreamTask(tokio::spawn(async move {
+                                drop(stream.replace(StreamTask(tokio::spawn(async move {
                                     loop {
                                         match video.next_frame().await {
-                                            Ok(Some(frame)) => { sender.send_replace(Some(Ok(frame))); }
-                                            Ok(None) => { sender.send_replace(Some(Err("Video stream ended".into()))); break; }
-                                            Err(error) => { sender.send_replace(Some(Err(error.to_string()))); break; }
+                                            Ok(Some(frame)) => {
+                                                sender.send_replace(Some(Ok(frame)));
+                                            }
+                                            Ok(None) => {
+                                                sender.send_replace(Some(Err(
+                                                    "Video stream ended".into(),
+                                                )));
+                                                break;
+                                            }
+                                            Err(error) => {
+                                                sender.send_replace(Some(Err(error.to_string())));
+                                                break;
+                                            }
                                         }
                                     }
-                                })));
+                                }))));
                                 app.message = "Waiting for video".into();
                             }
                             Err(error) => {
@@ -548,6 +577,22 @@ mod tests {
         app.key(&device, KeyCode::Char('a')).await;
         assert!(!app.control);
         assert_eq!(*device.calls.lock().unwrap(), ["key:KeyA:true", "release"]);
+    }
+
+    #[test]
+    fn video_frame_renders_to_test_backend() {
+        let mut terminal = Terminal::new(TestBackend::new(30, 14)).unwrap();
+        let app = App {
+            video: Some(image::RgbImage::from_pixel(8, 8, image::Rgb([255, 0, 0]))),
+            ..App::default()
+        };
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        let cells = terminal.backend().buffer().content();
+        assert!(
+            cells.iter().any(
+                |cell| cell.symbol() == "▀" && cell.fg == ratatui::style::Color::Rgb(255, 0, 0)
+            )
+        );
     }
 
     #[test]
