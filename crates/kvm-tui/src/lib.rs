@@ -71,10 +71,9 @@ impl App {
         area: ratatui::layout::Rect,
     ) {
         if !self.control
-            || !self
-                .capabilities
-                .as_ref()
-                .is_some_and(|c| c.mouse == Capability::Supported)
+            || !self.capabilities.as_ref().is_some_and(|c| {
+                c.mouse == Capability::Supported && c.mouse_mode == kvm_core::MouseMode::Absolute
+            })
         {
             return;
         }
@@ -810,6 +809,7 @@ mod tests {
                 snapshot: Capability::Unknown,
                 keyboard: Capability::Supported,
                 mouse: Capability::Supported,
+                mouse_mode: kvm_core::MouseMode::Absolute,
                 live_video: Capability::Unknown,
                 power: Capability::Supported,
                 switch: Capability::Unknown,
@@ -1143,6 +1143,34 @@ mod tests {
                 "key:Digit1:false",
                 "key:ShiftLeft:false"
             ]
+        );
+    }
+
+    #[tokio::test]
+    async fn mouse_forwarding_requires_absolute_mode() {
+        let device = FakeDevice::default();
+        let mut app = App::default();
+        app.refresh(&device).await;
+        app.control = true;
+        app.video = Some(image::RgbImage::new(2, 4));
+        let event = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 1,
+            row: 1,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        };
+        for mode in [kvm_core::MouseMode::Relative, kvm_core::MouseMode::Unknown] {
+            app.capabilities.as_mut().unwrap().mouse_mode = mode;
+            app.mouse(&device, event, ratatui::layout::Rect::new(0, 0, 4, 4))
+                .await;
+        }
+        assert!(device.calls.lock().unwrap().is_empty());
+        app.capabilities.as_mut().unwrap().mouse_mode = kvm_core::MouseMode::Absolute;
+        app.mouse(&device, event, ratatui::layout::Rect::new(0, 0, 4, 4))
+            .await;
+        assert_eq!(
+            *device.calls.lock().unwrap(),
+            ["move:-32768:-32768", "button:left:true"]
         );
     }
 
