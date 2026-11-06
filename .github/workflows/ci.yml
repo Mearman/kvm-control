@@ -32,6 +32,9 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - name: Install release test dependency
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo install convco --version 0.7.2 --locked
       - name: Test release recovery
         if: matrix.os == 'ubuntu-latest'
         run: bash .github/scripts/test-release.sh
@@ -103,7 +106,7 @@ jobs:
       - name: Build all interfaces
         env:
           TARGET: ${{ matrix.target }}
-        run: cargo build --locked --release --target "$TARGET" --bin kvm-cli --bin kvm-tui --bin kvm-mcp
+        run: cargo build --locked --release --target "$TARGET" --workspace --bins
       - name: Create and verify archive
         shell: bash
         env:
@@ -113,10 +116,12 @@ jobs:
           set -euo pipefail
           name="kvm-control-${TAG}-${TARGET}.tar.gz"
           mkdir -p dist
-          for binary in kvm-cli kvm-tui kvm-mcp; do
+          cargo metadata --no-deps --format-version 1 | jq -r '.packages[].targets[] | select(.kind | index("bin")) | .name' > binaries.txt
+          test -s binaries.txt
+          while IFS= read -r binary; do
             test -x "target/$TARGET/release/$binary"
-          done
-          tar -czf "dist/$name" -C "target/$TARGET/release" kvm-cli kvm-tui kvm-mcp
+          done < binaries.txt
+          tar -czf "dist/$name" -C "target/$TARGET/release" -T "$GITHUB_WORKSPACE/binaries.txt"
           (cd dist && shasum -a 256 "$name" > "$name.sha256" && shasum -a 256 -c "$name.sha256")
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
