@@ -12,8 +12,8 @@ mod video_tests;
 
 use async_trait::async_trait;
 use kvm_core::{
-    Capabilities, Capability, Confirmation, Control, Device, DeviceProfile, DeviceStatus, Error,
-    PowerAction, Result, Snapshot,
+    Capabilities, Capability, Confirmation, Control, ControlOutcome, Device, DeviceProfile,
+    DeviceStatus, Error, PowerAction, Result, Snapshot,
 };
 use reqwest::{Client, Method, StatusCode, cookie::Jar};
 use tokio::sync::Mutex;
@@ -434,7 +434,12 @@ impl Device for Kvmd {
         .await
     }
 
-    async fn control(&self, operation: Control, _confirmation: Confirmation) -> Result<()> {
+    async fn control(
+        &self,
+        operation: Control,
+        _confirmation: Confirmation,
+    ) -> Result<ControlOutcome> {
+        let observed = operation.clone();
         let (capability, path, params) = match operation {
             Control::Power(action) => (
                 "atx",
@@ -481,7 +486,59 @@ impl Device for Kvmd {
         }
         self.input(path, &params)
             .await
-            .map_err(|error| Error::AmbiguousControl(error.to_string()))
+            .map_err(|error| Error::AmbiguousControl(error.to_string()))?;
+        let state = self.json(capability).await.map_err(|_| {
+            Error::AmbiguousControl("request acknowledged but observation failed".into())
+        })?;
+        let verified = match observed {
+            Control::Power(PowerAction::On) => {
+                state
+                    .pointer("/leds/power")
+                    .and_then(serde_json::Value::as_bool)
+                    == Some(true)
+            }
+            Control::Power(PowerAction::Off | PowerAction::OffHard) => {
+                state
+                    .pointer("/leds/power")
+                    .and_then(serde_json::Value::as_bool)
+                    == Some(false)
+            }
+            Control::Power(PowerAction::ResetHard) => false,
+            Control::Switch { port } => {
+                state
+                    .pointer("/summary/active_port")
+                    .and_then(serde_json::Value::as_u64)
+                    == Some(u64::from(port))
+            }
+            Control::Gpio {
+                channel,
+                state: expected,
+            } => {
+                state
+                    .pointer("/state/outputs")
+                    .and_then(|v| v.get(&channel))
+                    .and_then(|v| v.get("state"))
+                    .and_then(serde_json::Value::as_bool)
+                    == Some(expected)
+            }
+            Control::MediaConnect { connected } => {
+                state
+                    .pointer("/drive/connected")
+                    .and_then(serde_json::Value::as_bool)
+                    == Some(connected)
+            }
+            Control::MediaSelect { image } => {
+                state
+                    .pointer("/drive/image/name")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(image.as_str())
+            }
+        };
+        Ok(if verified {
+            ControlOutcome::ObservedMatching
+        } else {
+            ControlOutcome::Unverified
+        })
     }
 
     async fn release_inputs(&self) -> Result<()> {
