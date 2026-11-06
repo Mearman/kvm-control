@@ -14,6 +14,61 @@ const MAX_FRAME: usize = 16 * 1024 * 1024;
 const MAX_BOUNDARY: usize = 70;
 const PING_INTERVAL: Duration = Duration::from_secs(15);
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{
+        pin::Pin,
+        task::{Context, Poll},
+    };
+
+    struct BlockedSink;
+    impl futures_util::Sink<Message> for BlockedSink {
+        type Error = ();
+        fn poll_ready(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+        ) -> Poll<std::result::Result<(), ()>> {
+            Poll::Pending
+        }
+        fn start_send(self: Pin<&mut Self>, _: Message) -> std::result::Result<(), ()> {
+            unreachable!()
+        }
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+        ) -> Poll<std::result::Result<(), ()>> {
+            Poll::Pending
+        }
+        fn poll_close(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+        ) -> Poll<std::result::Result<(), ()>> {
+            Poll::Pending
+        }
+    }
+
+    #[tokio::test]
+    async fn blocked_ping_is_timed_out() {
+        assert!(!send_ping(&mut BlockedSink, Duration::from_millis(10)).await);
+    }
+
+    #[test]
+    fn coalesced_chunk_is_split_without_rejecting_later_frames() {
+        let mut buffer = Vec::new();
+        let mut pending = bytes::Bytes::new();
+        absorb_chunk(
+            &mut buffer,
+            &mut pending,
+            bytes::Bytes::from_static(b"frame-oneframe-two"),
+            9,
+        )
+        .unwrap();
+        assert_eq!(buffer, b"frame-one");
+        assert_eq!(pending, b"frame-two"[..]);
+    }
+}
+
 struct Mjpeg {
     response: reqwest::Response,
     boundary: Vec<u8>,
@@ -67,7 +122,7 @@ pub(crate) async fn open(device: &Kvmd) -> Result<Box<dyn VideoStream>> {
         loop {
             tokio::select! {
                 _ = interval.tick() => {
-                    if !matches!(tokio::time::timeout(PING_INTERVAL, socket.send(Message::Text(r#"{"event_type":"ping","event":{}}"#.into()))).await, Ok(Ok(()))) { break; }
+                    if !send_ping(&mut socket, PING_INTERVAL).await { break; }
                 }
                 message = socket.next() => match message {
                     Some(Ok(Message::Close { .. })) | None | Some(Err(_)) => break,
@@ -140,6 +195,37 @@ pub(crate) async fn open(device: &Kvmd) -> Result<Box<dyn VideoStream>> {
     }))
 }
 
+async fn send_ping<S: futures_util::Sink<Message> + Unpin>(
+    socket: &mut S,
+    timeout: Duration,
+) -> bool {
+    matches!(
+        tokio::time::timeout(
+            timeout,
+            socket.send(Message::Text(r#"{"event_type":"ping","event":{}}"#.into()))
+        )
+        .await,
+        Ok(Ok(()))
+    )
+}
+
+fn absorb_chunk(
+    buffer: &mut Vec<u8>,
+    pending: &mut bytes::Bytes,
+    chunk: bytes::Bytes,
+    limit: usize,
+) -> Result<()> {
+    let count = chunk.len().min(limit.saturating_sub(buffer.len()));
+    if count == 0 {
+        return Err(Error::InvalidResponse(
+            "multipart data exceeds limit".into(),
+        ));
+    }
+    buffer.extend_from_slice(&chunk[..count]);
+    *pending = chunk.slice(count..);
+    Ok(())
+}
+
 fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack
         .windows(needle.len())
@@ -147,6 +233,10 @@ fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 }
 
 impl Mjpeg {
+    fn absorb(&mut self, chunk: bytes::Bytes, limit: usize) -> Result<()> {
+        absorb_chunk(&mut self.buffer, &mut self.pending, chunk, limit)
+    }
+
     async fn fill(&mut self, limit: usize) -> Result<bool> {
         if !*self.lease_state.borrow() {
             return Err(Error::Transport("stream lease ended".into()));
@@ -175,14 +265,7 @@ impl Mjpeg {
         };
         match chunk {
             Some(chunk) => {
-                let count = chunk.len().min(limit.saturating_sub(self.buffer.len()));
-                if count == 0 {
-                    return Err(Error::InvalidResponse(
-                        "multipart data exceeds limit".into(),
-                    ));
-                }
-                self.buffer.extend_from_slice(&chunk[..count]);
-                self.pending = chunk.slice(count..);
+                self.absorb(chunk, limit)?;
                 Ok(true)
             }
             None => Ok(false),
