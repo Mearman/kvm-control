@@ -130,6 +130,37 @@ async fn control(State(calls): State<Calls>, uri: Uri) -> impl IntoResponse {
     Json(json!({"ok": true, "result": {}}))
 }
 
+async fn locked_capability(State(calls): State<Calls>, headers: HeaderMap) -> impl IntoResponse {
+    let authenticated =
+        headers.get(header::COOKIE).and_then(|v| v.to_str().ok()) == Some("auth_token=synthetic");
+    calls.0.lock().unwrap().push("capability-start".into());
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    if !authenticated {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({"ok": false, "result": {}})),
+        );
+    }
+    (
+        StatusCode::OK,
+        Json(json!({"ok": true, "result": {"enabled": true, "leds": {"power": false}}})),
+    )
+}
+
+async fn locked_control(State(calls): State<Calls>, headers: HeaderMap) -> impl IntoResponse {
+    let authenticated =
+        headers.get(header::COOKIE).and_then(|v| v.to_str().ok()) == Some("auth_token=synthetic");
+    calls.0.lock().unwrap().push("control-submit".into());
+    if authenticated {
+        (StatusCode::OK, Json(json!({"ok": true, "result": {}})))
+    } else {
+        (
+            StatusCode::FORBIDDEN,
+            Json(json!({"ok": false, "result": {}})),
+        )
+    }
+}
+
 async fn fixture() -> (Url, Vec<u8>, Calls, tokio::task::JoinHandle<()>) {
     let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
     let pem = certified.cert.pem().into_bytes();
@@ -149,6 +180,8 @@ async fn fixture() -> (Url, Vec<u8>, Calls, tokio::task::JoinHandle<()>) {
         .route("/nocookie/api/auth/check", get(status))
         .route("/proxy/api/auth/login", post(login))
         .route("/proxy/api/auth/check", get(status))
+        .route("/proxy/api/atx", get(locked_capability))
+        .route("/proxy/api/atx/power", post(locked_control))
         .route("/api/auth/check", get(status))
         .route("/api/info", get(status))
         .route("/api/hid", get(status))
@@ -283,6 +316,47 @@ async fn basic_auth_and_discovered_control_requests() {
     ] {
         assert!(calls.iter().any(|v| v == path), "missing {path}");
     }
+    server.abort();
+}
+
+#[tokio::test]
+async fn control_keeps_session_across_concurrent_relogin() {
+    let (mut endpoint, ca, calls, server) = fixture().await;
+    endpoint.set_path("/proxy/");
+    let device = Arc::new(client(endpoint, Some(ca)));
+    device.login("test-user", "test-password").await.unwrap();
+    let control_device = device.clone();
+    let control_task = tokio::spawn(async move {
+        control_device
+            .control(Control::Power(PowerAction::Off), Confirmation::new())
+            .await
+    });
+    loop {
+        if calls
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|v| v == "capability-start")
+        {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    let login_device = device.clone();
+    let login_task = tokio::spawn(async move { login_device.login("test-user", "bad").await });
+    assert_eq!(
+        control_task.await.unwrap().unwrap(),
+        ControlOutcome::ObservedMatching
+    );
+    assert!(matches!(
+        login_task.await.unwrap(),
+        Err(Error::Authentication)
+    ));
+    let calls = calls.0.lock().unwrap();
+    let submit = calls.iter().position(|v| v == "control-submit").unwrap();
+    let relogin = calls.iter().position(|v| v.contains("passwd=bad")).unwrap();
+    assert!(submit < relogin);
     server.abort();
 }
 
