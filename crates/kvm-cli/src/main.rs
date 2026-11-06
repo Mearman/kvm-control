@@ -208,12 +208,22 @@ async fn execute(device: &impl Device, command: Command) -> Result<Value, String
                 .create_new(true)
                 .open(&output)
                 .map_err(|e| format!("cannot create snapshot: {e}"))?;
-            file.write_all(&snapshot.jpeg)
-                .map_err(|e| format!("cannot write snapshot: {e}"))?;
+            if let Err(error) = file.write_all(&snapshot.jpeg) {
+                drop(file);
+                return match std::fs::remove_file(&output) {
+                    Ok(()) => Err(format!("cannot write snapshot: {error}")),
+                    Err(cleanup) => Err(format!(
+                        "cannot write snapshot: {error}; cannot remove partial file: {cleanup}"
+                    )),
+                };
+            }
             Ok(json!({"output": output, "bytes": snapshot.jpeg.len()}))
         }
         Command::Key { key } => {
-            let result = device.key(&key, true).await;
+            let result = tokio::select! {
+                result = device.key(&key, true) => result.map_err(|e| e.to_string()),
+                signal = tokio::signal::ctrl_c() => Err(match signal { Ok(()) => "interrupted; input outcome uncertain".into(), Err(e) => format!("signal handler failed: {e}; input outcome uncertain") }),
+            };
             let cleanup = device.release_inputs().await;
             result.map_err(|e| {
                 format!(
@@ -227,7 +237,10 @@ async fn execute(device: &impl Device, command: Command) -> Result<Value, String
             Ok(json!({"key": key, "released": true}))
         }
         Command::Click { button } => {
-            let result = device.mouse_button(&button, true).await;
+            let result = tokio::select! {
+                result = device.mouse_button(&button, true) => result.map_err(|e| e.to_string()),
+                signal = tokio::signal::ctrl_c() => Err(match signal { Ok(()) => "interrupted; input outcome uncertain".into(), Err(e) => format!("signal handler failed: {e}; input outcome uncertain") }),
+            };
             let cleanup = device.release_inputs().await;
             result.map_err(|e| {
                 format!(
@@ -336,11 +349,14 @@ async fn run(cli: Cli) -> Result<Value, String> {
                     if tokio::time::Instant::now() >= deadline {
                         return Err("device approval expired".into());
                     }
-                    tokio::time::sleep(Duration::from_secs(1)).await;
-                    state = device
-                        .complete_approval()
-                        .await
-                        .map_err(|e| e.to_string())?;
+                    tokio::time::timeout_at(deadline, async {
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                        device.complete_approval().await
+                    })
+                    .await
+                    .map_err(|_| "device approval expired")?
+                    .map(|next| state = next)
+                    .map_err(|e| e.to_string())?;
                 }
             }
             device
@@ -359,8 +375,20 @@ async fn run(cli: Cli) -> Result<Value, String> {
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
+    let is_video = matches!(cli.command, Command::Video { .. });
     match run(cli).await {
-        Ok(value) => println!("{}", json!({"ok": true, "result": value})),
+        Ok(value) => {
+            if !is_video
+                && let Err(error) = writeln!(
+                    io::stdout().lock(),
+                    "{}",
+                    json!({"ok": true, "result": value})
+                )
+            {
+                eprintln!("cannot write output: {error}");
+                std::process::exit(1);
+            }
+        }
         Err(error) => {
             eprintln!("{}", json!({"ok": false, "error": error}));
             std::process::exit(1);
@@ -387,6 +415,24 @@ mod tests {
                 jpeg: vec![0xff, 0xd8, 0xff, 0xd9],
             }))
         }
+    }
+
+    struct BrokenOutput;
+    impl Write for BrokenOutput {
+        fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+            Err(io::Error::from(io::ErrorKind::BrokenPipe))
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn video_reports_broken_output() {
+        let error = write_video(&mut Frames(1), &mut BrokenOutput, None)
+            .await
+            .unwrap_err();
+        assert!(error.contains("cannot write video frame"));
     }
 
     #[tokio::test]

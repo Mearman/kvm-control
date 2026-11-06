@@ -4,6 +4,7 @@ use std::{
     process::{Command, Stdio},
     sync::Arc,
     thread,
+    time::{Duration, Instant},
 };
 
 use rustls::{ServerConfig, ServerConnection, StreamOwned, pki_types::PrivatePkcs8KeyDer};
@@ -20,10 +21,30 @@ fn invoke(command: &[&str], responses: Vec<&'static [u8]>) -> (std::process::Out
         .unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
+    listener.set_nonblocking(true).unwrap();
     let server = thread::spawn(move || {
         let mut requests = Vec::new();
         for response in responses {
-            let (socket, _) = listener.accept().unwrap();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let socket = loop {
+                match listener.accept() {
+                    Ok((socket, _)) => break socket,
+                    Err(e)
+                        if e.kind() == std::io::ErrorKind::WouldBlock
+                            && Instant::now() < deadline =>
+                    {
+                        thread::sleep(Duration::from_millis(10))
+                    }
+                    Err(e) => panic!("fake device accept failed: {e}"),
+                }
+            };
+            socket.set_nonblocking(false).unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            socket
+                .set_write_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
             let mut stream = StreamOwned::new(
                 ServerConnection::new(Arc::new(config.clone())).unwrap(),
                 socket,
@@ -32,6 +53,7 @@ fn invoke(command: &[&str], responses: Vec<&'static [u8]>) -> (std::process::Out
             let mut buffer = [0; 1024];
             loop {
                 let count = stream.read(&mut buffer).unwrap();
+                assert_ne!(count, 0, "fake device received incomplete request");
                 bytes.extend_from_slice(&buffer[..count]);
                 if let Some(pos) = bytes.windows(4).position(|part| part == b"\r\n\r\n") {
                     let header = String::from_utf8_lossy(&bytes[..pos]);
@@ -128,6 +150,15 @@ fn approval_pending_is_reported_and_polled_before_status() {
     assert!(requests[1].starts_with("POST /api/auth/two_step_complete "));
     assert!(requests[2].starts_with("POST /api/auth/two_step_complete "));
     assert!(requests[3].starts_with("GET /api/info "));
+}
+
+#[test]
+fn expired_approval_does_not_submit_a_poll() {
+    let login = b"{\"ok\":true,\"result\":{\"two_step_required\":true,\"two_step_token\":\"synthetic-approval\",\"expires_in\":0}}";
+    let (output, requests) = invoke(&["status"], vec![login]);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("device approval expired"));
+    assert_eq!(requests.len(), 1);
 }
 
 #[test]
