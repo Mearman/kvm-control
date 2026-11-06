@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use kvm_core::{
-    Capabilities, Capability, Confirmation, Control, ControlOutcome, Device, DeviceStatus, Result,
-    Snapshot,
+    Capabilities, Capability, Confirmation, Control, ControlOutcome, Device, DeviceStatus,
+    MouseMode, Result, Snapshot,
 };
 use kvm_mcp::Server;
 use rmcp::ServiceExt;
@@ -28,6 +28,7 @@ impl Device for Fake {
             snapshot: Capability::Unknown,
             keyboard: Capability::Unknown,
             mouse: Capability::Unknown,
+            mouse_mode: MouseMode::Relative,
             live_video: Capability::Unsupported,
             power: Capability::Unknown,
             switch: Capability::Unknown,
@@ -108,6 +109,7 @@ async fn protocol_round_trip() {
     let capabilities: Value =
         serde_json::from_str(caps["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
     assert_eq!(capabilities["snapshot"], "Unknown");
+    assert_eq!(capabilities["mouse_mode"], "Relative");
     assert_eq!(capabilities["live_video"], "Unsupported");
     let image = call(&mut write, &mut lines, json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"snapshot","arguments":{}}})).await;
     assert_eq!(image["result"]["content"][0]["type"], "image");
