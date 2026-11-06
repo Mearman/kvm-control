@@ -1,8 +1,7 @@
 //! In-process terminal interface for an already connected `kvm_core::Device`.
 //!
 //! Integration assumptions: connection, authentication and device selection belong to the caller.
-//! The foundation exposes no streaming API, so live video cannot yet be rendered. Capabilities
-//! are treated as authoritative and input is never retried after an error.
+//! Video frames are rendered using coloured character cells; input is never retried after an error.
 
 use std::{io, time::Duration};
 
@@ -52,8 +51,7 @@ impl App {
                 } else {
                     self.status = None;
                 }
-                self.message =
-                    "Live video unavailable: streaming is not exposed by the core API".into();
+                self.message = "Press v to open live video".into();
             }
             Err(error) => {
                 self.capabilities = None;
@@ -78,8 +76,12 @@ impl App {
         {
             return;
         }
-        let Some(video) = &self.video else { return; };
-        let Some(viewport) = video_viewport(area, video.width(), video.height()) else { return; };
+        let Some(video) = &self.video else {
+            return;
+        };
+        let Some(viewport) = video_viewport(area, video.width(), video.height()) else {
+            return;
+        };
         let Some((x, y)) = mouse_coordinates(event.column, event.row, viewport) else {
             return;
         };
@@ -156,20 +158,40 @@ impl App {
     }
 }
 
-fn video_viewport(area: ratatui::layout::Rect, width: u32, height: u32) -> Option<ratatui::layout::Rect> {
+fn video_viewport(
+    area: ratatui::layout::Rect,
+    width: u32,
+    height: u32,
+) -> Option<ratatui::layout::Rect> {
     let inner = area.inner(ratatui::layout::Margin::new(1, 1));
-    if width == 0 || height == 0 || inner.width < 2 || inner.height < 2 { return None; }
+    if width == 0 || height == 0 || inner.width < 2 || inner.height < 2 {
+        return None;
+    }
     // Half-block cells represent two vertically stacked pixels.
     let pixel_height = u64::from(inner.height) * 2;
-    let (w, h_pixels) = if u64::from(inner.width) * u64::from(height) <= pixel_height * u64::from(width) {
-        (u64::from(inner.width), u64::from(inner.width) * u64::from(height) / u64::from(width))
-    } else {
-        (pixel_height * u64::from(width) / u64::from(height), pixel_height)
-    };
+    let (w, h_pixels) =
+        if u64::from(inner.width) * u64::from(height) <= pixel_height * u64::from(width) {
+            (
+                u64::from(inner.width),
+                u64::from(inner.width) * u64::from(height) / u64::from(width),
+            )
+        } else {
+            (
+                pixel_height * u64::from(width) / u64::from(height),
+                pixel_height,
+            )
+        };
     let w = u16::try_from(w).ok()?;
     let h = u16::try_from(h_pixels.div_ceil(2)).ok()?;
-    if w < 2 || h < 2 { return None; }
-    Some(ratatui::layout::Rect::new(inner.x + (inner.width - w) / 2, inner.y + (inner.height - h) / 2, w, h))
+    if w < 2 || h < 2 {
+        return None;
+    }
+    Some(ratatui::layout::Rect::new(
+        inner.x + (inner.width - w) / 2,
+        inner.y + (inner.height - h) / 2,
+        w,
+        h,
+    ))
 }
 
 fn mouse_coordinates(column: u16, row: u16, area: ratatui::layout::Rect) -> Option<(i16, i16)> {
@@ -228,22 +250,47 @@ pub fn draw(frame: &mut Frame<'_>, app: &App) {
             .block(Block::default().title("Capabilities").borders(Borders::ALL)),
         areas[0],
     );
-    let status = match &app.status {
-        Some(s) => format!("Info: {}\nHID: {}\nStreamer: {}", s.info, s.hid, s.streamer),
-        None => "Status unavailable".into(),
-    };
     frame.render_widget(
-        Paragraph::new(status).wrap(Wrap { trim: false }).block(
-            Block::default()
-                .title("Device status")
-                .borders(Borders::ALL),
-        ),
+        Block::default().title("Live video").borders(Borders::ALL),
         areas[1],
     );
+    if let Some(image) = &app.video {
+        if let Some(viewport) = video_viewport(areas[1], image.width(), image.height()) {
+            let scaled = image::imageops::resize(
+                image,
+                u32::from(viewport.width),
+                u32::from(viewport.height) * 2,
+                image::imageops::FilterType::Triangle,
+            );
+            for y in 0..viewport.height {
+                for x in 0..viewport.width {
+                    let top = scaled.get_pixel(u32::from(x), u32::from(y) * 2).0;
+                    let bottom = scaled.get_pixel(u32::from(x), u32::from(y) * 2 + 1).0;
+                    if let Some(cell) = frame
+                        .buffer_mut()
+                        .cell_mut((viewport.x + x, viewport.y + y))
+                    {
+                        cell.set_symbol("▀")
+                            .set_fg(ratatui::style::Color::Rgb(top[0], top[1], top[2]))
+                            .set_bg(ratatui::style::Color::Rgb(bottom[0], bottom[1], bottom[2]));
+                    }
+                }
+            }
+        }
+    } else {
+        let status = match &app.status {
+            Some(s) => format!("Info: {}\nHID: {}\nStreamer: {}", s.info, s.hid, s.streamer),
+            None => "Status unavailable".into(),
+        };
+        frame.render_widget(
+            Paragraph::new(status).wrap(Wrap { trim: false }),
+            areas[1].inner(ratatui::layout::Margin::new(1, 1)),
+        );
+    }
     let help = if app.control {
         "Input mode: Escape returns to controls"
     } else {
-        "q quit | r refresh | i keyboard input"
+        "q quit | r refresh | v live video | i input"
     };
     frame.render_widget(
         Paragraph::new(format!("{help}\n{}", app.message))
@@ -325,17 +372,61 @@ async fn run_loop<B: Backend<Error = io::Error>>(
 ) -> io::Result<()> {
     let mut app = App::default();
     app.refresh(device).await;
+    let (video_tx, mut video_rx) = tokio::sync::watch::channel::<Option<Result<kvm_core::Snapshot, String>>>(None);
+    struct StreamTask(tokio::task::JoinHandle<()>);
+    impl Drop for StreamTask { fn drop(&mut self) { self.0.abort(); } }
+    let mut stream: Option<StreamTask> = None;
     loop {
         terminal.draw(|frame| draw(frame, &app))?;
-        if event::poll(Duration::from_millis(100))? {
+        if video_rx.has_changed().unwrap_or(false) {
+            let item = video_rx.borrow_and_update().clone();
+            if let Some(item) = item {
+                match item {
+                    Ok(frame) => match image::load_from_memory_with_format(&frame.jpeg, image::ImageFormat::Jpeg) {
+                        Ok(image) => { app.video = Some(image.to_rgb8()); app.message = "Live video (character-cell fallback)".into(); }
+                        Err(error) => { app.video = None; app.message = format!("Invalid video frame: {error}"); stream = None; }
+                    },
+                    Err(error) => { app.video = None; app.message = error; stream = None; }
+                }
+            }
+        }
+        if event::poll(Duration::from_millis(25))? {
             match event::read()? {
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
-                    if !app.key(device, key.code).await {
+                    if !app.control && key.code == KeyCode::Char('v') {
+                        match device.video().await {
+                            Ok(mut video) => {
+                                app.video = None;
+                                let sender = video_tx.clone();
+                                stream = Some(StreamTask(tokio::spawn(async move {
+                                    loop {
+                                        match video.next_frame().await {
+                                            Ok(Some(frame)) => { sender.send_replace(Some(Ok(frame))); }
+                                            Ok(None) => { sender.send_replace(Some(Err("Video stream ended".into()))); break; }
+                                            Err(error) => { sender.send_replace(Some(Err(error.to_string()))); break; }
+                                        }
+                                    }
+                                })));
+                                app.message = "Waiting for video".into();
+                            }
+                            Err(error) => {
+                                app.video = None;
+                                app.message = error.to_string();
+                            }
+                        }
+                    } else if !app.key(device, key.code).await {
                         break;
                     }
                 }
-                // Mouse events are not forwarded until a video viewport exists.
-                Event::Mouse(_) => {}
+                Event::Mouse(mouse) => {
+                    let areas = Layout::vertical([
+                        Constraint::Length(3),
+                        Constraint::Min(3),
+                        Constraint::Length(4),
+                    ])
+                    .split(terminal.size()?.into());
+                    app.mouse(device, mouse, areas[1]).await;
+                }
                 _ => {}
             }
         }
@@ -355,6 +446,9 @@ mod tests {
     }
     #[async_trait::async_trait]
     impl Device for FakeDevice {
+        async fn video(&self) -> kvm_core::Result<Box<dyn kvm_core::VideoStream>> {
+            Err(kvm_core::Error::Unsupported("video".into()))
+        }
         async fn status(&self) -> kvm_core::Result<DeviceStatus> {
             Ok(DeviceStatus {
                 info: serde_json::json!({}),
@@ -409,6 +503,7 @@ mod tests {
         app.refresh(&device).await;
         app.key(&device, KeyCode::Char('i')).await;
         app.key(&device, KeyCode::Char('a')).await;
+        app.video = Some(image::RgbImage::new(2, 4));
         let area = ratatui::layout::Rect::new(0, 0, 4, 4);
         for kind in [
             MouseEventKind::Down(MouseButton::Left),
@@ -538,7 +633,7 @@ mod tests {
 
     #[test]
     fn maps_mouse_to_signed_device_coordinates() {
-        let area = ratatui::layout::Rect::new(10, 5, 12, 7);
+        let area = ratatui::layout::Rect::new(11, 6, 10, 5);
         assert_eq!(mouse_coordinates(11, 6, area), Some((i16::MIN, i16::MIN)));
         assert_eq!(mouse_coordinates(20, 10, area), Some((i16::MAX, i16::MAX)));
         assert_eq!(mouse_coordinates(10, 5, area), None);
