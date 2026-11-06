@@ -74,7 +74,7 @@ if TAG=v1.1.0 bash "$root/.github/scripts/release.sh"; then printf '%s\n' 'Cross
 (cd "$MOCK_REMOTE" && shasum -a 256 kvm-control-v1.1.0-x86_64-unknown-linux-gnu.tar.gz > kvm-control-v1.1.0-x86_64-unknown-linux-gnu.tar.gz.sha256)
 cp "$MOCK_REMOTE/kvm-control-v1.1.0-x86_64-unknown-linux-gnu.tar.gz" "$MOCK_REMOTE/kvm-control-v1.1.0-x86_64-unknown-linux-gnu.tar.gz.sha256" dist/
 rm "$tmp/bin/convco"
-real_convco=$(command -v convco)
+command -v convco >/dev/null
 mkdir "$tmp/untagged"
 git -C "$tmp/untagged" init -q
 git -C "$tmp/untagged" -c user.name=test -c user.email=test@example.com commit --allow-empty -qm 'feat: initial release'
