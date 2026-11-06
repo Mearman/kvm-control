@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use base64::{Engine, engine::general_purpose::STANDARD};
-use kvm_core::{Confirmation, Control, Device, PowerAction};
+use kvm_core::{Confirmation, Control, ControlOutcome, Device, PowerAction};
 use rmcp::{
     ServerHandler,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
@@ -193,7 +193,17 @@ impl Server {
                 "Explicit confirmation is required",
             )]);
         }
-        result(self.device.control(operation, Confirmation::new()).await)
+        match self.device.control(operation, Confirmation::new()).await {
+            Ok(ControlOutcome::ObservedMatching) => {
+                CallToolResult::success(vec![ContentBlock::text(
+                    "ObservedMatching: observed state matches the request; causation is not established",
+                )])
+            }
+            Ok(ControlOutcome::Unverified) => CallToolResult::success(vec![ContentBlock::text(
+                "Unverified: acknowledgement does not establish the effect",
+            )]),
+            Err(error) => CallToolResult::error(vec![ContentBlock::text(error.to_string())]),
+        }
     }
 
     #[tool(

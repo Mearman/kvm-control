@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use kvm_core::{
-    Capabilities, Capability, Confirmation, Control, Device, DeviceStatus, Result, Snapshot,
+    Capabilities, Capability, Confirmation, Control, ControlOutcome, Device, DeviceStatus, Result,
+    Snapshot,
 };
 use kvm_mcp::Server;
 use rmcp::ServiceExt;
@@ -52,9 +53,12 @@ impl Device for Fake {
     async fn release_inputs(&self) -> Result<()> {
         Ok(())
     }
-    async fn control(&self, _: Control, _: Confirmation) -> Result<()> {
+    async fn control(&self, operation: Control, _: Confirmation) -> Result<ControlOutcome> {
         self.0.fetch_add(1, Ordering::SeqCst);
-        Ok(())
+        Ok(match operation {
+            Control::Switch { .. } => ControlOutcome::ObservedMatching,
+            _ => ControlOutcome::Unverified,
+        })
     }
 }
 
@@ -117,4 +121,45 @@ async fn protocol_round_trip() {
     drop(lines);
     let fake = task.await.unwrap();
     assert_eq!(fake.0.load(Ordering::SeqCst), 0);
+
+    let fake = Arc::new(Fake(AtomicUsize::new(0)));
+    let (client, server) = tokio::io::duplex(16384);
+    let server_fake = fake.clone();
+    let task = tokio::spawn(async move {
+        Server::new(server_fake, false, true)
+            .serve(server)
+            .await
+            .unwrap()
+            .waiting()
+            .await
+            .unwrap()
+    });
+    let (read, mut write) = tokio::io::split(client);
+    let mut lines = BufReader::new(read).lines();
+    call(&mut write, &mut lines, json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"test","version":"1"}}})).await;
+    write
+        .write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n")
+        .await
+        .unwrap();
+    let no_confirmation = call(&mut write, &mut lines, json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"consequential","arguments":{"operation":{"kind":"switch","port":1,"confirmed":false}}}})).await;
+    assert_eq!(no_confirmation["result"]["isError"], true);
+    assert_eq!(fake.0.load(Ordering::SeqCst), 0);
+    let observed = call(&mut write, &mut lines, json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"consequential","arguments":{"operation":{"kind":"switch","port":1,"confirmed":true}}}})).await;
+    assert!(
+        observed["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("ObservedMatching")
+    );
+    let unverified = call(&mut write, &mut lines, json!({"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"consequential","arguments":{"operation":{"kind":"power","action":"on","confirmed":true}}}})).await;
+    assert!(
+        unverified["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("Unverified")
+    );
+    assert_eq!(fake.0.load(Ordering::SeqCst), 2);
+    drop(write);
+    drop(lines);
+    task.await.unwrap();
 }
