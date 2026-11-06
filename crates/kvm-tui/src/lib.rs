@@ -219,7 +219,7 @@ impl App {
                 self.command = Some(String::new());
                 self.message = "Control: power on|off|off-hard|reset-hard; switch PORT; gpio CHANNEL on|off; media connect|disconnect|select IMAGE".into();
             }
-            KeyCode::Esc if self.control => {
+            KeyCode::F(12) if self.control => {
                 self.control = false;
                 if let Err(error) = device.release_inputs().await {
                     self.message = error.to_string();
@@ -232,8 +232,17 @@ impl App {
                     c.keyboard == Capability::Supported || c.mouse == Capability::Supported
                 }) {
                     self.control = true;
+                    self.message = match self.capabilities.as_ref().map(|c| c.mouse_mode) {
+                        Some(kvm_core::MouseMode::Absolute) => {
+                            "Input mode: F12 exits; Escape is remote".into()
+                        }
+                        Some(mode) => {
+                            format!("Mouse mode {mode:?}: viewport mouse unavailable; F12 exits")
+                        }
+                        None => "Mouse mode unknown; F12 exits".into(),
+                    };
                 } else {
-                    self.message = "Keyboard control is unsupported or undiscovered".into();
+                    self.message = "Keyboard and mouse are unsupported or undiscovered".into();
                 }
             }
             _ if self.control
@@ -419,6 +428,7 @@ fn key_name(code: KeyCode) -> Option<String> {
             ' ' => Some("Space".into()),
             _ => None,
         },
+        KeyCode::Esc => Some("Escape".into()),
         KeyCode::Enter => Some("Enter".into()),
         KeyCode::Backspace => Some("Backspace".into()),
         KeyCode::Tab => Some("Tab".into()),
@@ -488,7 +498,7 @@ pub fn draw(frame: &mut Frame<'_>, app: &App) {
         );
     }
     let help = if app.control {
-        "Input mode: Escape returns to controls"
+        "Input mode: F12 returns to controls; Escape is sent remotely"
     } else {
         "q quit | r refresh | v video | i input | : control"
     };
@@ -1109,7 +1119,7 @@ mod tests {
                         KeyEventKind::Repeat,
                     ),
                     3 => crossterm::event::KeyEvent::new(
-                        KeyCode::Esc,
+                        KeyCode::F(12),
                         crossterm::event::KeyModifiers::NONE,
                     ),
                     _ => crossterm::event::KeyEvent::new(
@@ -1278,7 +1288,7 @@ mod tests {
             )
             .await;
         }
-        app.key(&device, KeyCode::Esc).await;
+        app.key(&device, KeyCode::F(12)).await;
         assert_eq!(
             *device.calls.lock().unwrap(),
             [
