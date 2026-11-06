@@ -25,7 +25,7 @@ printf '%s\n' '#!/usr/bin/env bash' 'if [[ "$1" == changelog ]]; then printf "no
 chmod +x "$tmp/bin/gh" "$tmp/bin/convco"
 cd "$tmp/repo"
 export MOCK_NEXT=1.2.0
-printf '%s\n' '[[{"tag_name":"v1.1.0","draft":true}]]' > "$MOCK_RELEASES"
+printf '%s\n' '[[{"tag_name":"v1.0.0","draft":false},{"tag_name":"v1.1.0","draft":true}]]' > "$MOCK_RELEASES"
 bash "$root/.github/scripts/version.sh"
 plan=$(grep '^plan=' "$GITHUB_OUTPUT" | cut -d = -f 2-)
 test "$(printf '%s' "$plan" | jq -r 'map(.tag) | join(",")')" = 'v1.1.0,v1.2.0'
@@ -67,7 +67,7 @@ if grep -q "$second release" "$MOCK_LOG"; then printf '%s\n' 'A later release ra
 git checkout --detach "$second"
 git -c user.name=test -c user.email=test@example.com commit --allow-empty -qm 'feat: third release'
 git -c tag.gpgsign=false tag v1.3.0
-printf '%s\n' '[[{"tag_name":"v1.1.0","draft":true},{"tag_name":"v1.3.0","draft":true}]]' > "$MOCK_RELEASES"
+printf '%s\n' '[[{"tag_name":"v1.0.0","draft":false},{"tag_name":"v1.1.0","draft":true},{"tag_name":"v1.3.0","draft":true}]]' > "$MOCK_RELEASES"
 git checkout --detach "$first"
 cp "$MOCK_REMOTE/kvm-control-v1.1.0-aarch64-unknown-linux-gnu.tar.gz.sha256" "$MOCK_REMOTE/kvm-control-v1.1.0-x86_64-unknown-linux-gnu.tar.gz.sha256"
 if TAG=v1.1.0 bash "$root/.github/scripts/release.sh"; then printf '%s\n' 'Cross-target remote checksum was accepted.' >&2; exit 1; fi
@@ -82,6 +82,15 @@ printf '%s\n' '[[]]' > "$MOCK_RELEASES"
 : > "$GITHUB_OUTPUT"
 (cd "$tmp/untagged" && bash "$root/.github/scripts/version.sh")
 test "$(grep '^plan=' "$GITHUB_OUTPUT" | cut -d = -f 2- | jq -r '.[0].tag')" = v0.1.0
+git -C "$tmp/untagged" -c tag.gpgsign=false tag v0.1.0
+initial=$(git -C "$tmp/untagged" rev-parse HEAD)
+git -C "$tmp/untagged" -c user.name=test -c user.email=test@example.com commit --allow-empty -qm 'feat: after interrupted release'
+later=$(git -C "$tmp/untagged" rev-parse HEAD)
+: > "$GITHUB_OUTPUT"
+(cd "$tmp/untagged" && bash "$root/.github/scripts/version.sh")
+test "$(grep '^plan=' "$GITHUB_OUTPUT" | cut -d = -f 2- | jq -r 'map(.tag) | join(",")')" = 'v0.1.0,v0.1.1'
+test "$(grep '^plan=' "$GITHUB_OUTPUT" | cut -d = -f 2- | jq -r '.[0].commit')" = "$initial"
+test "$(grep '^plan=' "$GITHUB_OUTPUT" | cut -d = -f 2- | jq -r '.[1].commit')" = "$later"
 cp "$MOCK_ASSETS" "$tmp/invalid-assets"
 for asset in "$MOCK_REMOTE"/*; do
   printf '%s\tuploaded\tsha256:%s\n' "$(basename "$asset")" "$(shasum -a 256 "$asset" | cut -d ' ' -f 1)"
@@ -93,6 +102,7 @@ git checkout --detach "$second"
 printf '%s\n' '#!/usr/bin/env bash' 'printf "%s\n" "$MOCK_NEXT"' > "$tmp/bin/convco"
 chmod +x "$tmp/bin/convco"
 export MOCK_NEXT=1.3.0
+printf '%s\n' '[[{"tag_name":"v1.0.0","draft":false},{"tag_name":"v1.1.0","draft":true},{"tag_name":"v1.3.0","draft":true}]]' > "$MOCK_RELEASES"
 : > "$GITHUB_OUTPUT"
 bash "$root/.github/scripts/version.sh"
 test "$(grep '^plan=' "$GITHUB_OUTPUT" | cut -d = -f 2- | jq -r 'map(.tag) | join(",")')" = 'v1.1.0,v1.2.0,v1.3.0'
