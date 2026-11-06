@@ -10,6 +10,7 @@ use kvm_core::{Confirmation, Control, ControlOutcome, Device, DeviceProfile, Pow
 use kvm_kvmd::{Config, Kvmd, LoginState};
 use serde_json::{Value, json};
 use url::Url;
+use zeroize::Zeroizing;
 
 #[derive(Parser)]
 #[command(name = "kvm", version, about = "Control a KVMD-compatible device")]
@@ -193,6 +194,20 @@ async fn run_control(
     Ok(json!({"accepted": true, "post_state": post_state}))
 }
 
+async fn termination_signal() -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => result,
+            _ = terminate.recv() => Ok(()),
+        }
+    }
+    #[cfg(not(unix))]
+    tokio::signal::ctrl_c().await
+}
+
 async fn press_and_release<F, S>(device: &impl Device, press: F, interrupt: S) -> Result<(), String>
 where
     F: std::future::Future<Output = kvm_core::Result<()>>,
@@ -255,14 +270,14 @@ async fn execute(device: &impl Device, command: Command) -> Result<Value, String
             Ok(json!({"output": output, "bytes": snapshot.jpeg.len()}))
         }
         Command::Key { key } => {
-            press_and_release(device, device.key(&key, true), tokio::signal::ctrl_c()).await?;
+            press_and_release(device, device.key(&key, true), termination_signal()).await?;
             Ok(json!({"key": key, "released": true}))
         }
         Command::Click { button } => {
             press_and_release(
                 device,
                 device.mouse_button(&button, true),
-                tokio::signal::ctrl_c(),
+                termination_signal(),
             )
             .await?;
             Ok(json!({"button": button, "released": true}))
@@ -344,14 +359,13 @@ async fn run(cli: Cli) -> Result<Value, String> {
         insecure_tls: cli.insecure_tls,
         timeout: Duration::from_secs(30),
     };
-    let secret = password(cli.password_stdin)?;
+    let secret = Zeroizing::new(password(cli.password_stdin)?);
     let device = match cli.auth {
         Auth::Cookie => {
             let device = Kvmd::new(config).map_err(|e| e.to_string())?;
-            let mut state = device
-                .login(&cli.username, &secret)
-                .await
-                .map_err(|e| e.to_string())?;
+            let login = device.login(&cli.username, &secret).await;
+            drop(secret);
+            let mut state = login.map_err(|e| e.to_string())?;
             if let LoginState::ApprovalPending { expires_in } = state {
                 eprintln!(
                     "{}",
@@ -376,13 +390,13 @@ async fn run(cli: Cli) -> Result<Value, String> {
             device
         }
         Auth::Header => {
-            let device = Kvmd::with_header_auth(config, &cli.username, &secret)
-                .map_err(|e| e.to_string())?;
+            let device = Kvmd::with_header_auth(config, &cli.username, &secret);
+            drop(secret);
+            let device = device.map_err(|e| e.to_string())?;
             device.check_auth().await.map_err(|e| e.to_string())?;
             device
         }
     };
-    drop(secret);
     execute(&device, cli.command).await
 }
 
