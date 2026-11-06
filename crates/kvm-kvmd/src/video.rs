@@ -18,6 +18,7 @@ struct Mjpeg {
     response: reqwest::Response,
     boundary: Vec<u8>,
     buffer: Vec<u8>,
+    pending: bytes::Bytes,
     lease: JoinHandle<()>,
     lease_state: watch::Receiver<bool>,
     timeout: Duration,
@@ -42,6 +43,7 @@ pub(crate) async fn open(device: &Kvmd) -> Result<Box<dyn VideoStream>> {
         device
             .video_client
             .get(ws_url)
+            .headers(device.auth_headers.clone())
             .upgrade()
             .web_socket_config(ws_config)
             .send(),
@@ -65,7 +67,7 @@ pub(crate) async fn open(device: &Kvmd) -> Result<Box<dyn VideoStream>> {
         loop {
             tokio::select! {
                 _ = interval.tick() => {
-                    if socket.send(Message::Text(r#"{"event_type":"ping","event":{}}"#.into())).await.is_err() { break; }
+                    if !matches!(tokio::time::timeout(PING_INTERVAL, socket.send(Message::Text(r#"{"event_type":"ping","event":{}}"#.into()))).await, Ok(Ok(()))) { break; }
                 }
                 message = socket.next() => match message {
                     Some(Ok(Message::Close { .. })) | None | Some(Err(_)) => break,
@@ -92,10 +94,17 @@ pub(crate) async fn open(device: &Kvmd) -> Result<Box<dyn VideoStream>> {
     let url = url
         .join("streamer/stream")
         .map_err(|_| Error::InvalidResponse("invalid stream URL".into()))?;
-    let response = tokio::time::timeout(device.timeout, device.video_client.get(url).send())
-        .await
-        .map_err(|_| Error::Transport("video request timed out".into()))?
-        .map_err(|_| Error::Transport("video request failed".into()))?;
+    let response = tokio::time::timeout(
+        device.timeout,
+        device
+            .video_client
+            .get(url)
+            .headers(device.auth_headers.clone())
+            .send(),
+    )
+    .await
+    .map_err(|_| Error::Transport("video request timed out".into()))?
+    .map_err(|_| Error::Transport("video request failed".into()))?;
     Kvmd::check(response.status())?;
     let content_type: mime::Mime = response
         .headers()
@@ -122,6 +131,7 @@ pub(crate) async fn open(device: &Kvmd) -> Result<Box<dyn VideoStream>> {
         response,
         boundary,
         buffer: Vec::new(),
+        pending: bytes::Bytes::new(),
         lease: guard.0.take().expect("lease exists"),
         lease_state,
         timeout: device.timeout,
@@ -141,6 +151,19 @@ impl Mjpeg {
         if !*self.lease_state.borrow() {
             return Err(Error::Transport("stream lease ended".into()));
         }
+        if !self.pending.is_empty() {
+            let count = self
+                .pending
+                .len()
+                .min(limit.saturating_sub(self.buffer.len()));
+            if count == 0 {
+                return Err(Error::InvalidResponse(
+                    "multipart data exceeds limit".into(),
+                ));
+            }
+            self.buffer.extend_from_slice(&self.pending.split_to(count));
+            return Ok(true);
+        }
         let chunk = tokio::select! {
             changed = self.lease_state.changed() => {
                 let _ = changed;
@@ -152,12 +175,14 @@ impl Mjpeg {
         };
         match chunk {
             Some(chunk) => {
-                if self.buffer.len().saturating_add(chunk.len()) > limit {
+                let count = chunk.len().min(limit.saturating_sub(self.buffer.len()));
+                if count == 0 {
                     return Err(Error::InvalidResponse(
                         "multipart data exceeds limit".into(),
                     ));
                 }
-                self.buffer.extend_from_slice(&chunk);
+                self.buffer.extend_from_slice(&chunk[..count]);
+                self.pending = chunk.slice(count..);
                 Ok(true)
             }
             None => Ok(false),
@@ -231,47 +256,62 @@ impl VideoStream for Mjpeg {
         if !jpeg {
             return Err(Error::InvalidResponse("frame is not JPEG".into()));
         }
-        self.buffer.drain(..end + 4);
+        let body_start = end + 4;
         let delimiter = [b"\r\n".as_slice(), self.boundary.as_slice()].concat();
         let size = if let Some(length) = length {
             if length > MAX_FRAME {
                 return Err(Error::InvalidResponse("frame exceeds limit".into()));
             }
-            while self.buffer.len() < length + delimiter.len() + 2 {
+            while self.buffer.len() < body_start + length + delimiter.len() + 2 {
                 if !self.fill(MAX_FRAME + MAX_HEADER).await? {
                     return Err(Error::InvalidResponse("truncated frame".into()));
                 }
             }
-            if !self.buffer[length..].starts_with(&delimiter) {
+            if !self.buffer[body_start + length..].starts_with(&delimiter) {
                 return Err(Error::InvalidResponse("invalid frame boundary".into()));
             }
             length
         } else {
-            self.until(&delimiter, MAX_FRAME + delimiter.len() + 2)
-                .await?
+            let mut offset = body_start;
+            loop {
+                if let Some(relative) = find(&self.buffer[offset..], &delimiter) {
+                    let pos = offset + relative;
+                    while self.buffer.len() < pos + delimiter.len() + 2 {
+                        if !self.fill(MAX_FRAME + MAX_HEADER).await? {
+                            return Err(Error::InvalidResponse("truncated boundary".into()));
+                        }
+                    }
+                    let suffix = &self.buffer[pos + delimiter.len()..pos + delimiter.len() + 2];
+                    if suffix == b"\r\n" || suffix == b"--" {
+                        break pos - body_start;
+                    }
+                    offset = pos + 1;
+                } else {
+                    if self.buffer.len() >= body_start + MAX_FRAME + delimiter.len() + 2 {
+                        return Err(Error::InvalidResponse("frame exceeds limit".into()));
+                    }
+                    if !self.fill(MAX_FRAME + MAX_HEADER).await? {
+                        return Err(Error::InvalidResponse("truncated frame".into()));
+                    }
+                }
+            }
         };
         if size > MAX_FRAME
-            || !self.buffer[..size].starts_with(&[0xff, 0xd8])
-            || !self.buffer[..size].ends_with(&[0xff, 0xd9])
+            || !self.buffer[body_start..body_start + size].starts_with(&[0xff, 0xd8])
+            || !self.buffer[body_start..body_start + size].ends_with(&[0xff, 0xd9])
         {
             return Err(Error::InvalidResponse("invalid JPEG frame".into()));
         }
-        let frame = self.buffer[..size].to_vec();
-        self.buffer.drain(..size + delimiter.len());
-        while self.buffer.len() < 2 {
-            if !self.fill(MAX_HEADER).await? {
-                return Err(Error::InvalidResponse("truncated boundary".into()));
-            }
-        }
-        if self.buffer.starts_with(b"--") {
-            self.buffer.drain(..2);
+        let frame = self.buffer[body_start..body_start + size].to_vec();
+        let suffix_start = body_start + size + delimiter.len();
+        let suffix = &self.buffer[suffix_start..suffix_start + 2];
+        if suffix == b"--" {
             self.ended = true;
             self.lease.abort();
-        } else if self.buffer.starts_with(b"\r\n") {
-            self.buffer.drain(..2);
-        } else {
+        } else if suffix != b"\r\n" {
             return Err(Error::InvalidResponse("invalid boundary suffix".into()));
         }
+        self.buffer.drain(..suffix_start + 2);
         Ok(Some(Snapshot { jpeg: frame }))
     }
 }

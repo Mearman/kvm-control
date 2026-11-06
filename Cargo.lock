@@ -732,6 +732,7 @@ dependencies = [
  "async-trait",
  "axum",
  "axum-server",
+ "bytes",
  "futures-util",
  "kvm-core",
  "mime",

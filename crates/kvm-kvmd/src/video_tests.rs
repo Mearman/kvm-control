@@ -59,6 +59,8 @@ async fn device(body: &'static [u8]) -> (Kvmd, Arc<Notify>, tokio::task::JoinHan
         endpoint: Url::parse(&format!("http://{address}/proxy/")).unwrap(),
         profile: DeviceProfile::PiKvm,
         inputs: Default::default(),
+        auth_headers: Default::default(),
+        approval_token: Default::default(),
     };
     (device, closed, task)
 }
@@ -67,13 +69,13 @@ async fn device(body: &'static [u8]) -> (Kvmd, Arc<Notify>, tokio::task::JoinHan
 async fn trusted_tls_login_cookie_reaches_lease_and_stream() {
     use tokio_rustls::TlsAcceptor;
     use tokio_rustls::rustls::{ServerConfig, pki_types::PrivatePkcs8KeyDer};
-    let rcgen::CertifiedKey { cert, signing_key } =
+    let rcgen::CertifiedKey { cert, key_pair } =
         rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
     let tls = ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(
             vec![cert.der().clone()],
-            PrivatePkcs8KeyDer::from(signing_key.serialize_der()).into(),
+            PrivatePkcs8KeyDer::from(key_pair.serialize_der()).into(),
         )
         .unwrap();
     let acceptor = TlsAcceptor::from(Arc::new(tls));
@@ -89,7 +91,7 @@ async fn trusted_tls_login_cookie_reaches_lease_and_stream() {
                 .unwrap()
                 .starts_with("POST /proxy/api/auth/login ")
         );
-        login.write_all(b"HTTP/1.1 200 OK\r\nSet-Cookie: auth_token=synthetic; Path=/\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}").await.unwrap();
+        login.write_all(b"HTTP/1.1 200 OK\r\nSet-Cookie: auth_token=synthetic; Path=/\r\nContent-Length: 23\r\nConnection: close\r\n\r\n{\"ok\":true,\"result\":{}}").await.unwrap();
         login.shutdown().await.unwrap();
         let (socket, _) = listener.accept().await.unwrap();
         let mut tls = acceptor.accept(socket).await.unwrap();
@@ -183,6 +185,21 @@ async fn final_boundary_ends_stream_and_closes_lease() {
     assert_eq!(
         video.next_frame().await.unwrap().unwrap().jpeg,
         b"\xff\xd8\xff\xd9"
+    );
+    assert!(video.next_frame().await.unwrap().is_none());
+    tokio::time::timeout(Duration::from_secs(3), closed.notified())
+        .await
+        .unwrap();
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn boundary_prefix_inside_frame_is_not_a_delimiter() {
+    let (device, closed, server) = device(b"--frame\r\nContent-Type: image/jpeg\r\n\r\n\xff\xd8\r\n--frame-not-a-boundary\xff\xd9\r\n--frame--\r\n").await;
+    let mut video = device.video().await.unwrap();
+    assert_eq!(
+        video.next_frame().await.unwrap().unwrap().jpeg,
+        b"\xff\xd8\r\n--frame-not-a-boundary\xff\xd9"
     );
     assert!(video.next_frame().await.unwrap().is_none());
     tokio::time::timeout(Duration::from_secs(3), closed.notified())
