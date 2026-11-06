@@ -7,7 +7,7 @@ use std::{
 use base64::{Engine, engine::general_purpose::STANDARD};
 use clap::{Parser, Subcommand, ValueEnum};
 use kvm_core::{Device, DeviceProfile};
-use kvm_kvmd::{Config, Kvmd};
+use kvm_kvmd::{Config, Kvmd, LoginState};
 use serde_json::{Value, json};
 use url::Url;
 
@@ -201,10 +201,28 @@ async fn run(cli: Cli) -> Result<Value, String> {
     let device = match cli.auth {
         Auth::Cookie => {
             let device = Kvmd::new(config).map_err(|e| e.to_string())?;
-            device
+            let mut state = device
                 .login(&cli.username, &secret)
                 .await
                 .map_err(|e| e.to_string())?;
+            if let LoginState::ApprovalPending { expires_in } = state {
+                eprintln!(
+                    "{}",
+                    json!({"event": "approval_pending", "expires_in": expires_in, "message": "Approve this login on the device"})
+                );
+                let expiry = expires_in.ok_or("approval has no expiry")?;
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(expiry);
+                while matches!(state, LoginState::ApprovalPending { .. }) {
+                    if tokio::time::Instant::now() >= deadline {
+                        return Err("device approval expired".into());
+                    }
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    state = device
+                        .complete_approval()
+                        .await
+                        .map_err(|e| e.to_string())?;
+                }
+            }
             device
         }
         Auth::Header => {

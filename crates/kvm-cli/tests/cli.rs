@@ -90,7 +90,10 @@ fn invoke(command: &[&str], responses: Vec<&'static [u8]>) -> (std::process::Out
 #[test]
 fn status_is_json_and_authentication_is_not_leaked() {
     let body = b"{\"ok\":true,\"result\":{\"online\":true}}";
-    let (output, requests) = invoke(&["status"], vec![b"", body, body, body]);
+    let (output, requests) = invoke(
+        &["status"],
+        vec![b"{\"ok\":true,\"result\":{}}", body, body, body],
+    );
     assert!(
         output.status.success(),
         "{}",
@@ -105,8 +108,38 @@ fn status_is_json_and_authentication_is_not_leaked() {
 }
 
 #[test]
+fn approval_pending_is_reported_and_polled_before_status() {
+    let login = b"{\"ok\":true,\"result\":{\"two_step_required\":true,\"two_step_token\":\"synthetic-approval\",\"expires_in\":60}}";
+    let pending = b"{\"ok\":true,\"result\":{\"status\":\"pending\"}}";
+    let approved = b"{\"ok\":true,\"result\":{\"token\":\"synthetic-session\"}}";
+    let body = b"{\"ok\":true,\"result\":{\"online\":true}}";
+    let (output, requests) = invoke(
+        &["status"],
+        vec![login, pending, approved, body, body, body],
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("approval_pending"));
+    assert!(!stderr.contains("synthetic-approval"));
+    assert!(requests[1].starts_with("POST /api/auth/two_step_complete "));
+    assert!(requests[2].starts_with("POST /api/auth/two_step_complete "));
+    assert!(requests[3].starts_with("GET /api/info "));
+}
+
+#[test]
 fn key_press_is_followed_by_release() {
-    let (output, requests) = invoke(&["key", "KeyA"], vec![b"", b"", b""]);
+    let (output, requests) = invoke(
+        &["key", "KeyA"],
+        vec![
+            b"{\"ok\":true,\"result\":{}}",
+            b"{\"ok\":true,\"result\":{}}",
+            b"{\"ok\":true,\"result\":{}}",
+        ],
+    );
     assert!(
         output.status.success(),
         "{}",
