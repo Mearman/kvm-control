@@ -23,6 +23,7 @@ pub struct Kvmd {
     endpoint: Url,
     profile: DeviceProfile,
     inputs: Mutex<Inputs>,
+    auth_headers: reqwest::header::HeaderMap,
 }
 
 #[derive(Default)]
@@ -64,7 +65,29 @@ impl Kvmd {
             endpoint: config.endpoint,
             profile: config.profile,
             inputs: Mutex::new(Inputs::default()),
+            auth_headers: reqwest::header::HeaderMap::new(),
         })
+    }
+
+    /// Builds a client with credentials sent in KVMD's authentication headers.
+    pub fn with_header_auth(config: Config, username: &str, password: &str) -> Result<Self> {
+        use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
+        let mut device = Self::new(config)?;
+        let mut headers = HeaderMap::new();
+        for (name, value) in [("x-kvmd-user", username), ("x-kvmd-passwd", password)] {
+            let mut value = HeaderValue::from_str(value)
+                .map_err(|_| Error::InvalidResponse("invalid authentication header".into()))?;
+            value.set_sensitive(true);
+            headers.insert(HeaderName::from_static(name), value);
+        }
+        // Rebuilding here would lose the configured CA and TLS policy, so headers are held by the device instead.
+        device.auth_headers = headers;
+        Ok(device)
+    }
+
+    /// Checks whether the server accepts the configured authentication.
+    pub async fn check_auth(&self) -> Result<()> {
+        self.json("auth/check").await.map(|_| ())
     }
 
     /// Returns the explicitly selected device profile.
@@ -116,6 +139,7 @@ impl Kvmd {
         let response = self
             .client
             .get(self.url(path)?)
+            .headers(self.auth_headers.clone())
             .send()
             .await
             .map_err(|_| Error::Transport("request failed".into()))?;
@@ -145,6 +169,7 @@ impl Kvmd {
         let response = self
             .client
             .request(Method::POST, self.url(path)?)
+            .headers(self.auth_headers.clone())
             .query(params)
             .send()
             .await
