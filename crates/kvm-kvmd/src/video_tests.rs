@@ -208,6 +208,54 @@ async fn cancelled_partial_frame_can_resume() {
 }
 
 #[tokio::test]
+async fn coalesced_http_response_delivers_multiple_frames() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        let mut ws = tokio_tungstenite::accept_async(socket).await.unwrap();
+        let watcher = tokio::spawn(async move {
+            while let Some(message) = ws.next().await {
+                if message.is_err() {
+                    break;
+                }
+            }
+        });
+        let (mut http, _) = listener.accept().await.unwrap();
+        let mut request = [0; 4096];
+        assert!(http.read(&mut request).await.unwrap() > 0);
+        let response = b"HTTP/1.1 200 OK\r\nContent-Type: multipart/x-mixed-replace; boundary=frame\r\n\r\n--frame\r\nContent-Type: image/jpeg\r\nContent-Length: 5\r\n\r\n\xff\xd8a\xff\xd9\r\n--frame\r\nContent-Type: image/jpeg\r\nContent-Length: 5\r\n\r\n\xff\xd8b\xff\xd9\r\n--frame--\r\n";
+        http.write_all(response).await.unwrap();
+        watcher.await.unwrap();
+    });
+    let client = reqwest::Client::builder().http1_only().build().unwrap();
+    let device = Kvmd {
+        client: client.clone(),
+        video_client: client,
+        timeout: Duration::from_secs(3),
+        endpoint: Url::parse(&format!("http://{address}/proxy/")).unwrap(),
+        profile: DeviceProfile::PiKvm,
+        inputs: Default::default(),
+        auth_headers: Default::default(),
+        approval_token: Default::default(),
+    };
+    let mut video = device.video().await.unwrap();
+    assert_eq!(
+        video.next_frame().await.unwrap().unwrap().jpeg,
+        b"\xff\xd8a\xff\xd9"
+    );
+    assert_eq!(
+        video.next_frame().await.unwrap().unwrap().jpeg,
+        b"\xff\xd8b\xff\xd9"
+    );
+    assert!(video.next_frame().await.unwrap().is_none());
+    tokio::time::timeout(Duration::from_secs(3), server)
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test]
 async fn continuous_frames_and_drop_close_lease() {
     let body = b"--frame\r\nContent-Type: image/jpeg\r\nContent-Length: 5\r\n\r\n\xff\xd8a\xff\xd9\r\n--frame\r\nContent-Type: image/jpeg\r\n\r\n\xff\xd8b\xff\xd9\r\n--frame\r\n";
     let (device, closed, server) = device(body).await;
