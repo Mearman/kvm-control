@@ -105,10 +105,12 @@ async fn status(State(calls): State<Calls>, uri: Uri, headers: HeaderMap) -> imp
             Json(json!({"ok": false, "result": {}})),
         );
     }
-    (
-        StatusCode::OK,
-        Json(json!({"ok": true, "result": {"online": true}})),
-    )
+    let result = if uri.path().ends_with("/hid") {
+        json!({"enabled": true, "online": true, "keyboard": {"online": true, "outputs": {"available": [], "active": ""}}, "mouse": {"online": true, "absolute": true, "outputs": {"available": [], "active": ""}}})
+    } else {
+        json!({"online": true})
+    };
+    (StatusCode::OK, Json(json!({"ok": true, "result": result})))
 }
 
 async fn poisoning_status() -> impl IntoResponse {
@@ -525,7 +527,8 @@ async fn cookie_login_and_status_over_verified_tls() {
     assert_eq!(status.info["online"], true);
     let capabilities = device.capabilities().await.unwrap();
     assert_eq!(capabilities.status, Capability::Supported);
-    assert_eq!(capabilities.keyboard, Capability::Unknown);
+    assert_eq!(capabilities.keyboard, Capability::Supported);
+    assert_eq!(capabilities.mouse, Capability::Supported);
     let calls = calls.0.lock().unwrap();
     assert!(
         calls
