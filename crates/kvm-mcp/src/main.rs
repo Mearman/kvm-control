@@ -1,7 +1,7 @@
 use std::{env, error::Error, fs, sync::Arc, time::Duration};
 
 use kvm_core::{Device, DeviceProfile};
-use kvm_kvmd::{Config, Kvmd};
+use kvm_kvmd::{Config, Kvmd, LoginState};
 use kvm_mcp::Server;
 use rmcp::ServiceExt;
 use url::Url;
@@ -74,7 +74,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
         timeout: Duration::from_secs(30),
     })?);
     let password = read_password(&env::var("KVM_PASSWORD_FD")?)?;
-    device.login(&env::var("KVM_USERNAME")?, &password).await?;
+    let login = device.login(&env::var("KVM_USERNAME")?, &password).await?;
+    if let LoginState::ApprovalPending { .. } = login {
+        return Err("device approval is pending; MCP session was not started".into());
+    }
     drop(password);
     let allow_control = env::var("KVM_ALLOW_CONTROL").as_deref() == Ok("1");
     let service = Server::new(device.clone(), allow_control)
