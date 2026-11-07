@@ -98,6 +98,17 @@ async fn device(body: impl Into<Vec<u8>>) -> (Kvmd, Arc<Notify>, tokio::task::Jo
     (device, closed, task)
 }
 
+async fn read_request(stream: &mut tokio::net::TcpStream) -> String {
+    let mut bytes = Vec::new();
+    let mut chunk = [0; 1024];
+    while !bytes.windows(4).any(|window| window == b"\r\n\r\n") {
+        let count = stream.read(&mut chunk).await.unwrap();
+        assert_ne!(count, 0, "request ended before headers");
+        bytes.extend_from_slice(&chunk[..count]);
+    }
+    String::from_utf8(bytes).unwrap()
+}
+
 fn input_device(address: std::net::SocketAddr) -> Kvmd {
     let endpoint = Url::parse(&format!("http://{address}/")).unwrap();
     let client = reqwest::Client::builder()
@@ -139,9 +150,7 @@ async fn cancelled_press_finishes_before_concurrent_release() {
     let (checked_tx, checked_rx) = tokio::sync::oneshot::channel();
     let server = tokio::spawn(async move {
         let (mut press, _) = listener.accept().await.unwrap();
-        let mut request = [0; 4096];
-        let n = press.read(&mut request).await.unwrap();
-        let first = String::from_utf8_lossy(&request[..n]).into_owned();
+        let first = read_request(&mut press).await;
         accepted_tx.send(()).unwrap();
         assert!(
             tokio::time::timeout(Duration::from_millis(100), listener.accept())
@@ -158,8 +167,7 @@ async fn cancelled_press_finishes_before_concurrent_release() {
             .await
             .unwrap();
         let (mut release, _) = listener.accept().await.unwrap();
-        let n = release.read(&mut request).await.unwrap();
-        let second = String::from_utf8_lossy(&request[..n]).into_owned();
+        let second = read_request(&mut release).await;
         release
             .write_all(
                 b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}",
@@ -226,10 +234,8 @@ async fn concurrent_key_and_button_presses_are_serialised() {
     let (accepted_tx, accepted_rx) = tokio::sync::oneshot::channel();
     let (proceed_tx, proceed_rx) = tokio::sync::oneshot::channel();
     let server = tokio::spawn(async move {
-        let mut buffer = [0; 4096];
         let (mut first, _) = listener.accept().await.unwrap();
-        let n = first.read(&mut buffer).await.unwrap();
-        assert!(String::from_utf8_lossy(&buffer[..n]).contains("send_key"));
+        assert!(read_request(&mut first).await.contains("send_key"));
         accepted_tx.send(()).unwrap();
         assert!(
             tokio::time::timeout(Duration::from_millis(100), listener.accept())
@@ -244,8 +250,11 @@ async fn concurrent_key_and_button_presses_are_serialised() {
             .await
             .unwrap();
         let (mut second, _) = listener.accept().await.unwrap();
-        let n = second.read(&mut buffer).await.unwrap();
-        assert!(String::from_utf8_lossy(&buffer[..n]).contains("send_mouse_button"));
+        assert!(
+            read_request(&mut second)
+                .await
+                .contains("send_mouse_button")
+        );
         second
             .write_all(
                 b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}",
@@ -358,6 +367,104 @@ async fn read_input_request(stream: &mut tokio::net::TcpStream) -> String {
     assert!(request_line.starts_with("POST /api/hid/events/send_key?"));
     assert!(request_line.ends_with(" HTTP/1.1"));
     request
+}
+
+#[tokio::test]
+async fn relogin_cannot_discard_authentication_with_held_input() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let device = input_device(listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        let (mut press, _) = listener.accept().await.unwrap();
+        assert!(read_request(&mut press).await.contains("state=true"));
+        press
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}",
+            )
+            .await
+            .unwrap();
+        let (mut release, _) = listener.accept().await.unwrap();
+        assert!(read_request(&mut release).await.contains("state=false"));
+        release
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}",
+            )
+            .await
+            .unwrap();
+    });
+    device.key("KeyA", true).await.unwrap();
+    assert!(matches!(
+        device.login("test", "test").await,
+        Err(kvm_core::Error::AmbiguousInput(_))
+    ));
+    device.release_inputs().await.unwrap();
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn cancelled_move_finishes_before_button_press() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let device = Arc::new(input_device(listener.local_addr().unwrap()));
+    let (accepted_tx, accepted_rx) = tokio::sync::oneshot::channel();
+    let (finish_tx, finish_rx) = tokio::sync::oneshot::channel();
+    let (checked_tx, checked_rx) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        let (mut state, _) = listener.accept().await.unwrap();
+        assert!(read_request(&mut state).await.contains("/api/hid "));
+        let body = b"{\"ok\":true,\"result\":{\"enabled\":true,\"mouse\":{\"online\":true,\"absolute\":true}}}";
+        state
+            .write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        state.write_all(body).await.unwrap();
+        let (mut movement, _) = listener.accept().await.unwrap();
+        assert!(
+            read_request(&mut movement)
+                .await
+                .contains("send_mouse_move")
+        );
+        accepted_tx.send(()).unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), listener.accept())
+                .await
+                .is_err()
+        );
+        checked_tx.send(()).unwrap();
+        finish_rx.await.unwrap();
+        movement
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}",
+            )
+            .await
+            .unwrap();
+        let (mut button, _) = listener.accept().await.unwrap();
+        assert!(
+            read_request(&mut button)
+                .await
+                .contains("send_mouse_button")
+        );
+        button
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}",
+            )
+            .await
+            .unwrap();
+    });
+    let moving = device.clone();
+    let movement = tokio::spawn(async move { moving.mouse_move(1, 2).await });
+    accepted_rx.await.unwrap();
+    movement.abort();
+    let clicking = device.clone();
+    let button = tokio::spawn(async move { clicking.mouse_button("left", true).await });
+    checked_rx.await.unwrap();
+    finish_tx.send(()).unwrap();
+    button.await.unwrap().unwrap();
+    server.await.unwrap();
 }
 
 #[tokio::test]

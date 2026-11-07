@@ -314,6 +314,10 @@ impl Kvmd {
                 "cookie login cannot replace configured header credentials".into(),
             ));
         }
+        let inputs = self.inputs.lock().await;
+        if !inputs.keys.is_empty() || !inputs.buttons.is_empty() || inputs.indeterminate {
+            return Err(Error::AmbiguousInput("release inputs before changing authentication; an indeterminate session cannot be reauthenticated safely".into()));
+        }
         let mut pending = self.approval_token.lock().await;
         *pending = None;
         let mut active = self.client.write().await;
@@ -364,6 +368,10 @@ impl Kvmd {
 
     /// Checks a pending GLKVM approval without exposing its temporary token.
     pub async fn complete_approval(&self) -> Result<LoginState> {
+        let inputs = self.inputs.lock().await;
+        if !inputs.keys.is_empty() || !inputs.buttons.is_empty() || inputs.indeterminate {
+            return Err(Error::AmbiguousInput("release inputs before changing authentication; an indeterminate session cannot be reauthenticated safely".into()));
+        }
         let mut pending = self.approval_token.lock().await;
         let token = pending
             .as_ref()
@@ -723,22 +731,34 @@ impl Device for Kvmd {
     }
 
     async fn mouse_move(&self, x: i16, y: i16) -> Result<()> {
-        let _inputs = self.inputs.lock().await;
-        let active = self.client.read().await;
-        let state = self.json_with(&active.client, "hid").await?;
-        if hid_capability(&state, "mouse") != Capability::Supported
-            || mouse_mode(&state) != MouseMode::Absolute
-        {
-            return Err(Error::Unsupported(
-                "absolute mouse movement requires an online absolute-mode mouse".into(),
-            ));
-        }
-        self.input_with(
-            &active.client,
-            "hid/events/send_mouse_move",
-            &[("to_x", x.to_string()), ("to_y", y.to_string())],
-        )
+        let inputs = self.inputs.clone().lock_owned().await;
+        self.capture_input_runtime();
+        let worker = self.input_worker();
+        tokio::spawn(async move {
+            let mut inputs = inputs;
+            let active = worker.client.read().await;
+            let state = worker.json_with(&active.client, "hid").await?;
+            if hid_capability(&state, "mouse") != Capability::Supported
+                || mouse_mode(&state) != MouseMode::Absolute
+            {
+                return Err(Error::Unsupported(
+                    "absolute mouse movement requires an online absolute-mode mouse".into(),
+                ));
+            }
+            let result = worker
+                .input_with(
+                    &active.client,
+                    "hid/events/send_mouse_move",
+                    &[("to_x", x.to_string()), ("to_y", y.to_string())],
+                )
+                .await;
+            if result.is_err() {
+                inputs.indeterminate = true;
+            }
+            result
+        })
         .await
+        .map_err(|_| Error::AmbiguousInput("input task failed".into()))?
     }
 
     async fn control(
