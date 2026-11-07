@@ -1074,21 +1074,42 @@ async fn maximum_frame_with_maximum_headers_and_boundary() {
     server.await.unwrap();
 }
 
-// Synthetic protocol fixtures based on source revisions, not firmware releases: PiKVM kvmd fcb903eb3be70d8eee4aee99e5fcc1c743e3ccef and GLKVM glkvm 3e8dd23c4bd638a4650433664cc3b0f3b4d29395.
+// This shared synthetic fixture uses the routes documented for PiKVM kvmd fcb903eb3be70d8eee4aee99e5fcc1c743e3ccef and GLKVM glkvm 3e8dd23c4bd638a4650433664cc3b0f3b4d29395. These are source revisions, not firmware releases, and neither profile is independently verified by this fixture.
 #[tokio::test]
-async fn source_revision_stream_reconnect_opens_a_fresh_lease() {
-    for profile in [DeviceProfile::PiKvm, DeviceProfile::GlKvm] {
+async fn explicit_video_reopen_after_complete_or_interrupted_stream() {
+    for (profile, interrupted) in [
+        (DeviceProfile::PiKvm, false),
+        (DeviceProfile::PiKvm, true),
+        (DeviceProfile::GlKvm, false),
+        (DeviceProfile::GlKvm, true),
+    ] {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
-            for _ in 0..2 {
+            for attempt in 0..2 {
                 let (socket, _) = listener.accept().await.unwrap();
-                let mut ws = tokio_tungstenite::accept_async(socket).await.unwrap();
+                let mut ws = tokio_tungstenite::accept_hdr_async(
+                    socket,
+                    |request: &tokio_tungstenite::tungstenite::handshake::server::Request,
+                     response| {
+                        assert_eq!(
+                            request.uri().path_and_query().unwrap().as_str(),
+                            "/api/ws?stream=true"
+                        );
+                        Ok(response)
+                    },
+                )
+                .await
+                .unwrap();
                 let (mut http, _) = listener.accept().await.unwrap();
                 let request = read_request(&mut http).await;
                 assert!(request.starts_with("GET /streamer/stream "));
                 http.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: multipart/x-mixed-replace; boundary=frame\r\nConnection: close\r\n\r\n").await.unwrap();
-                http.write_all(&part(&jpeg(), true, true)).await.unwrap();
+                if interrupted && attempt == 0 {
+                    http.write_all(b"--frame\r\nContent-Type: image/jpeg\r\nContent-Length: 100\r\n\r\npartial").await.unwrap();
+                } else {
+                    http.write_all(&part(&jpeg(), true, true)).await.unwrap();
+                }
                 drop(http);
                 tokio::time::timeout(Duration::from_secs(3), async {
                     while let Some(message) = ws.next().await {
@@ -1104,10 +1125,18 @@ async fn source_revision_stream_reconnect_opens_a_fresh_lease() {
         let mut device = input_device(address);
         device.profile = profile;
         device.config.profile = profile;
-        for _ in 0..2 {
+        for attempt in 0..2 {
             let mut video = device.video().await.unwrap();
-            assert_eq!(video.next_frame().await.unwrap().unwrap().jpeg, jpeg());
-            assert!(video.next_frame().await.unwrap().is_none());
+            if interrupted && attempt == 0 {
+                assert!(matches!(
+                    video.next_frame().await,
+                    Err(kvm_core::Error::InvalidResponse(_))
+                ));
+                drop(video);
+            } else {
+                assert_eq!(video.next_frame().await.unwrap().unwrap().jpeg, jpeg());
+                assert!(video.next_frame().await.unwrap().is_none());
+            }
         }
         server.await.unwrap();
     }
