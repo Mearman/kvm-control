@@ -1,6 +1,6 @@
 //! Typed device status.
 //!
-//! Each subsystem and each observed state value is wrapped in [`Reported`], so a caller can tell a value the device reported from a subsystem or field it does not have and from one whose state was not observed. Identifiers that locate an entry (a switch port number, a GPIO channel, an image or partition name), the parts of a composite value (output lists, ranges, resolutions) and the mouse mode, which has its own `Unknown`, are not wrapped. A whole subsystem is `Unsupported` when the device reports it absent or disabled, and `Unknown` when it could not be read: the session may not read it, the route failed (an HTTP error, a rejected or malformed response, an oversized body) or its response has an unexpected shape. A failed route does not discard the others; only a transport failure fails the whole status. Within a reported subsystem, a field is `Unsupported` when the device omits it and the selected profile's inspected source never reports it, and `Unknown` when it is missing or malformed otherwise, or when the device's value is a placeholder rather than an observation.
+//! Each subsystem and each observed state value is wrapped in [`Reported`], so a caller can tell a value the device reported from a subsystem or field it does not have and from one whose state was not observed. Identifiers that locate an entry (a switch port number, a GPIO channel, an image or partition name), the parts of a composite value (output lists, ranges, resolutions) and the mouse mode, which has its own `Unknown`, are not wrapped. A whole subsystem is `Unsupported` when the device reports it absent or disabled, and `Unknown` when it could not be read: the session may not read it, the route failed (an HTTP error, a rejected or malformed response, an oversized body) or its response has an unexpected shape. A failed route does not discard the others. A status read fails as a whole only when its evidence does not describe a device: the connection was lost, the endpoint is not a KVMD API (its info, HID or streamer route does not exist), or no route could be read at all. The adapter documents the exact rules.
 //!
 //! Status carries no credentials. Values the device reports that can embed them, such as a remote media image URL, are not part of this model.
 
@@ -183,6 +183,7 @@ pub struct Limits {
 pub struct VideoSource {
     /// Whether the capture source has a signal.
     pub online: Reported<bool>,
+    /// Captured frame size, `Unknown` while the source has no signal. A streamer started with a configured fake size (uStreamer's `--fake-width` and `--fake-height`) reports that size instead, which the device's response does not distinguish from a captured one.
     pub resolution: Reported<Resolution>,
     pub captured_fps: Reported<u32>,
 }
