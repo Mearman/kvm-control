@@ -27,7 +27,7 @@ if [ -n "$abandoned" ]; then
 fi
 tags=$(git tag --merged HEAD --list 'v[0-9]*' --sort=v:refname)
 if [ -z "$tags" ]; then
-  next=$(convco version --bump --initial-bump-version 0.1.0)
+  next=$(bash "$(dirname "$0")/convco-release.sh" version --bump --initial-bump-version 0.1.0)
   plan=$(jq -cn --arg tag "v$next" --arg commit "$(git rev-parse HEAD)" '[{tag:$tag,commit:$commit}]')
 else
 plan='[]'
@@ -46,7 +46,7 @@ while IFS= read -r tag; do
   fi
 done <<< "$tags"
 latest=$(printf '%s\n' "$tags" | sed -n '$p')
-next=$(convco version --bump)
+next=$(bash "$(dirname "$0")/convco-release.sh" version --bump)
 if [ "$next" = "${latest#v}" ] && git rev-parse -q --verify "refs/tags/abandoned-release-$latest" >/dev/null; then
   if [[ ! "$next" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
     printf 'Cannot advance abandoned version: %s\n' "$next" >&2

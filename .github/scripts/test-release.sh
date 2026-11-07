@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 root=$(cd "$(dirname "$0")/../.." && pwd)
+real_convco=$(command -v convco)
 tmp=$(mktemp -d "${TMPDIR:-/tmp}/release-test.XXXXXXXX")
 trap 'rm -rf "$tmp"' EXIT
 mkdir -p "$tmp/bin" "$tmp/repo"
@@ -166,7 +167,7 @@ export MOCK_NEXT=0.1.0
 : > "$GITHUB_OUTPUT"
 (cd "$tmp/untagged" && bash "$root/.github/scripts/version.sh")
 test "$(grep '^plan=' "$GITHUB_OUTPUT" | cut -d = -f 2- | jq -r 'map(.tag) | join(",")')" = v0.1.1
-printf '%s\n' '#!/usr/bin/env bash' 'if [[ "$1" == changelog ]]; then git log -1 --format=%s > release-notes.md; else printf "%s\n" "$MOCK_NEXT"; fi' > "$tmp/bin/convco"
+printf '%s\n' '#!/usr/bin/env bash' 'if [[ "$1" == changelog ]]; then git log -1 --format=%s > "${@: -1}"; else printf "%s\n" "$MOCK_NEXT"; fi' > "$tmp/bin/convco"
 chmod +x "$tmp/bin/convco"
 cp "$MOCK_ASSETS" "$tmp/invalid-assets"
 for asset in "$MOCK_REMOTE"/*; do
@@ -183,4 +184,22 @@ printf '%s\n' '[[{"tag_name":"v1.0.0","draft":false},{"tag_name":"v1.1.0","draft
 : > "$GITHUB_OUTPUT"
 bash "$root/.github/scripts/version.sh"
 test "$(grep '^plan=' "$GITHUB_OUTPUT" | cut -d = -f 2- | jq -r 'map(.tag) | join(",")')" = 'v1.1.0,v1.2.0,v1.3.0'
+mkdir "$tmp/real-convco"
+git -C "$tmp/real-convco" init -q
+git -C "$tmp/real-convco" -c user.name=test -c user.email=test@example.com commit --allow-empty -qm 'fix: baseline'
+git -C "$tmp/real-convco" -c tag.gpgsign=false tag v1.0.0
+git -C "$tmp/real-convco" -c user.name=test -c user.email=test@example.com commit --allow-empty -qm 'feat: retained change'
+git -C "$tmp/real-convco" -c tag.gpgsign=false tag v1.1.0
+git -C "$tmp/real-convco" -c tag.gpgsign=false tag abandoned-release-v1.1.0
+git -C "$tmp/real-convco" -c user.name=test -c user.email=test@example.com commit --allow-empty -qm 'fix: later change'
+rm "$tmp/bin/convco"
+ln -s "$real_convco" "$tmp/bin/convco"
+(cd "$tmp/real-convco" && convco changelog --unreleased 1.2.0 --max-versions 1 --output "$tmp/raw-notes" && bash "$root/.github/scripts/convco-release.sh" changelog --unreleased 1.2.0 --max-versions 1 --output "$tmp/filtered-notes")
+if grep -q 'retained change' "$tmp/raw-notes"; then printf '%s\n' 'Unfiltered changelog did not reproduce the abandoned baseline.' >&2; exit 1; fi
+grep -q 'retained change' "$tmp/filtered-notes"
+raw_version=$(cd "$tmp/real-convco" && convco version --bump)
+filtered_version=$(cd "$tmp/real-convco" && bash "$root/.github/scripts/convco-release.sh" version --bump)
+test "$raw_version" = 1.1.1
+test "$filtered_version" = 1.1.0
+test "$(git -C "$tmp/real-convco" rev-list -n 1 v1.1.0)" = "$(git -C "$tmp/real-convco" rev-list -n 1 abandoned-release-v1.1.0)"
 printf '%s\n' 'Release recovery tests passed.'

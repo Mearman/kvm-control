@@ -24,14 +24,9 @@ if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
     exit 1
   fi
   tag_object=$(git rev-parse "refs/tags/$TAG")
-  git update-ref -d "refs/tags/$TAG" "$tag_object"
-  trap 'git update-ref "refs/tags/$TAG" "$tag_object"' EXIT
 fi
-convco changelog --unreleased "${TAG#v}" --max-versions 1 --output release-notes.md
-if [ -n "${tag_object-}" ]; then
-  git update-ref "refs/tags/$TAG" "$tag_object"
-  trap - EXIT
-else
+CONVCO_EXCLUDE_TAG="${tag_object:+$TAG}" bash "$(dirname "$0")/convco-release.sh" changelog --unreleased "${TAG#v}" --max-versions 1 --output "$PWD/release-notes.md"
+if [ -z "${tag_object-}" ]; then
   git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' -c tag.gpgsign=false tag -a "$TAG" -m "$TAG"
   git push origin "refs/tags/$TAG"
 fi
