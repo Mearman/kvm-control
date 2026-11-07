@@ -22,7 +22,6 @@ if [ -n "$abandoned" ]; then
     [ "$(git rev-list -n 1 "$marker")" = "$commit" ] || { printf 'Abandonment marker points to a different commit: %s\n' "$marker" >&2; exit 1; }
   else
     git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' -c tag.gpgsign=false tag -a "$marker" "$commit" -m "Abandon invalid release intent $abandoned"
-    git push origin "refs/tags/$marker"
   fi
 fi
 tags=$(git tag --merged HEAD --list 'v[0-9]*' --sort=v:refname)
@@ -58,5 +57,6 @@ if [ "$next" != "${latest#v}" ]; then
   plan=$(printf '%s' "$plan" | jq -c --arg tag "v$next" --arg commit "$(git rev-parse HEAD)" '. + [{tag:$tag,commit:$commit}]')
 fi
 fi
-matrix=$(printf '%s' "$plan" | jq -c '[.[] as $release | [{os:"ubuntu-24.04",target:"x86_64-unknown-linux-gnu"},{os:"ubuntu-24.04-arm",target:"aarch64-unknown-linux-gnu"},{os:"macos-15-intel",target:"x86_64-apple-darwin"},{os:"macos-15",target:"aarch64-apple-darwin"}][] | . + $release]')
-printf 'plan=%s\nmatrix=%s\n' "$plan" "$matrix" >> "$GITHUB_OUTPUT"
+# The abandonment marker is created only in this clone, so that the plan above skips the tag; record-release-intent.sh pushes it once the checks have passed.
+printf 'plan=%s\nabandon=%s\n' "$plan" "$abandoned" >> "$GITHUB_OUTPUT"
+PLAN="$plan" bash "$(dirname "$0")/release-matrix.sh"

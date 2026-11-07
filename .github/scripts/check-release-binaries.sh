@@ -2,6 +2,8 @@
 set -euo pipefail
 
 commits=$(printf '%s' "$PLAN" | jq -er '[.[].commit] | unique | .[]' || { [ "$PLAN" = '[]' ] && exit 0; exit 1; })
+targets=$(jq -r '.targets[].target' "$(dirname "$0")/release.json")
+binaries=$(jq -r '.binaries[]' "$(dirname "$0")/release.json")
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 while IFS= read -r commit; do
@@ -12,7 +14,7 @@ while IFS= read -r commit; do
     printf 'Release commit %s lacks a Cargo workspace.\n' "$commit" >&2
     exit 1
   fi
-  for target in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu x86_64-apple-darwin aarch64-apple-darwin; do
+  for target in $targets; do
   if ! metadata=$(cd "$tmp/tree" && cargo metadata --locked --filter-platform "$target" --format-version 1); then
     printf 'Cannot inspect release commit %s.\n' "$commit" >&2
     exit 2
@@ -21,7 +23,7 @@ while IFS= read -r commit; do
     printf 'Cannot resolve release features for %s.\n' "$target" >&2
     exit 2
   fi
-  for binary in kvm-cli kvm-tui kvm-mcp; do
+  for binary in $binaries; do
     if ! printf '%s' "$metadata" | jq -e --arg binary "$binary" --arg features "$features" '. as $root | any(.packages[]; .id as $id | ($root.workspace_members | index($id)) != null and ((.name + " v" + .version + " (" + (.manifest_path | sub("/Cargo.toml$"; "")) + ")|") as $prefix | ([$features | split("\n")[] | select(startswith($prefix)) | ltrimstr($prefix) | split(",")[]] | unique) as $enabled | any(.targets[]; .name == $binary and (.kind | index("bin")) != null and all((.["required-features"] // [])[]; . as $feature | ($enabled | index($feature)) != null))))' >/dev/null; then
       printf 'Release commit %s lacks binary target %s.\n' "$commit" "$binary" >&2
       exit 1
