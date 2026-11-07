@@ -367,7 +367,7 @@ async fn handle(
 async fn serve(shared: Arc<Shared>) -> (Url, Vec<u8>) {
     let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
     let pem = certified.cert.pem().into_bytes();
-    let key = certified.key_pair.serialize_pem().into_bytes();
+    let key = certified.signing_key.serialize_pem().into_bytes();
     let tls = RustlsConfig::from_pem(pem.clone(), key).await.unwrap();
     let app = Router::new().fallback(handle).with_state(shared);
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();

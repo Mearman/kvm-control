@@ -338,7 +338,7 @@ async fn locked_control(State(calls): State<Calls>, headers: HeaderMap) -> impl 
 async fn fixture() -> (Url, Vec<u8>, Calls, tokio::task::JoinHandle<()>) {
     let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
     let pem = certified.cert.pem().into_bytes();
-    let key = certified.key_pair.serialize_pem().into_bytes();
+    let key = certified.signing_key.serialize_pem().into_bytes();
     let tls = RustlsConfig::from_pem(pem.clone(), key).await.unwrap();
     let calls = Calls::default();
     let app = Router::new()
@@ -2564,7 +2564,7 @@ async fn stalling_device(served: usize) -> (Url, Vec<u8>, Arc<std::sync::atomic:
         .with_no_client_auth()
         .with_single_cert(
             vec![certified.cert.der().clone()],
-            PrivatePkcs8KeyDer::from(certified.key_pair.serialize_der()).into(),
+            PrivatePkcs8KeyDer::from(certified.signing_key.serialize_der()).into(),
         )
         .unwrap();
     let acceptor = TlsAcceptor::from(Arc::new(tls));

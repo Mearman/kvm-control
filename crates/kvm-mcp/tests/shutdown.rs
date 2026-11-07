@@ -78,7 +78,7 @@ async fn exercise(delayed: bool) {
     let pem = cert.cert.pem();
     let tls = axum_server::tls_rustls::RustlsConfig::from_pem(
         pem.as_bytes().to_vec(),
-        cert.key_pair.serialize_pem().into_bytes(),
+        cert.signing_key.serialize_pem().into_bytes(),
     )
     .await
     .unwrap();
@@ -206,7 +206,7 @@ async fn approval_precedes_mcp_initialisation() {
     let pem = cert.cert.pem();
     let tls = axum_server::tls_rustls::RustlsConfig::from_pem(
         pem.as_bytes().to_vec(),
-        cert.key_pair.serialize_pem().into_bytes(),
+        cert.signing_key.serialize_pem().into_bytes(),
     )
     .await
     .unwrap();

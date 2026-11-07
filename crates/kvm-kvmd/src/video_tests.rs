@@ -1608,13 +1608,13 @@ async fn streams_beyond_decoder_slots_share_storage() {
 async fn trusted_tls_login_cookie_reaches_lease_and_stream() {
     use tokio_rustls::TlsAcceptor;
     use tokio_rustls::rustls::{ServerConfig, pki_types::PrivatePkcs8KeyDer};
-    let rcgen::CertifiedKey { cert, key_pair } =
+    let rcgen::CertifiedKey { cert, signing_key } =
         rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
     let tls = ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(
             vec![cert.der().clone()],
-            PrivatePkcs8KeyDer::from(key_pair.serialize_der()).into(),
+            PrivatePkcs8KeyDer::from(signing_key.serialize_der()).into(),
         )
         .unwrap();
     let acceptor = TlsAcceptor::from(Arc::new(tls));
@@ -1716,13 +1716,13 @@ async fn video_auth_headers(basic: bool) {
         TlsAcceptor,
         rustls::{ServerConfig, pki_types::PrivatePkcs8KeyDer},
     };
-    let rcgen::CertifiedKey { cert, key_pair } =
+    let rcgen::CertifiedKey { cert, signing_key } =
         rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
     let tls = ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(
             vec![cert.der().clone()],
-            PrivatePkcs8KeyDer::from(key_pair.serialize_der()).into(),
+            PrivatePkcs8KeyDer::from(signing_key.serialize_der()).into(),
         )
         .unwrap();
     let acceptor = TlsAcceptor::from(Arc::new(tls));
