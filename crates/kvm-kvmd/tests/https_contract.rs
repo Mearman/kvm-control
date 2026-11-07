@@ -368,7 +368,7 @@ fn client(endpoint: Url, ca: Option<Vec<u8>>) -> Kvmd {
     profile_client(endpoint, ca, DeviceProfile::PiKvm)
 }
 
-/// The fixture client's request timeout. A request that has not reached the fake device, or an outcome not delivered, within it would already have failed in the client, so a test waiting longer cannot pass for a different reason.
+/// The fixture client's request timeout, also used as the bound on each wait for the fake device. A single request finishes within it, by reply or by the client's own timeout, so a wait for one request or its outcome that exceeds it means the awaited event did not happen. A wait that starts before anything is sent, or is blocked on the input lock, has no client timeout behind it and relies on the bound alone; and a call that sends several requests can legitimately run past it, which is why `drive` bounds each step rather than the whole call.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Waits for `future`, failing the test instead of hanging if it does not finish within the client's request timeout.

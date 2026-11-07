@@ -117,7 +117,7 @@ async fn read_request(stream: &mut tokio::net::TcpStream) -> String {
     String::from_utf8(bytes).unwrap()
 }
 
-/// The input test client's request timeout. An input task that has not finished within it would already have failed its request, so waiting longer cannot change a test's result.
+/// The input test client's request timeout, also used as the bound on each wait in the input tests. A single request finishes within it, by reply or by the client's own timeout, so a wait for one request or its outcome that exceeds it means the awaited event did not happen. A wait that starts before anything is sent, or is blocked on the input lock, has no client timeout behind it and relies on the bound alone; and an input task that sends several requests (settlement, then its own) can legitimately run past it, so such waits cover one request each.
 const INPUT_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Polls an input operation once and returns it spawned. Afterwards the operation is waiting for the input lock that `device` shows as held, so it cannot send a request until the holder finishes.
