@@ -25,6 +25,7 @@ struct Mjpeg {
     boundary: Vec<u8>,
     buffer: Vec<u8>,
     pending: bytes::Bytes,
+    permit: Option<std::sync::Arc<tokio::sync::OwnedSemaphorePermit>>,
     scan_offset: usize,
     #[cfg(test)]
     scanned: usize,
@@ -148,6 +149,7 @@ pub(crate) async fn open(device: &Kvmd) -> Result<Box<dyn VideoStream>> {
         boundary,
         buffer: Vec::new(),
         pending: bytes::Bytes::new(),
+        permit: None,
         scan_offset: 0,
         #[cfg(test)]
         scanned: 0,
@@ -276,6 +278,9 @@ impl VideoStream for Mjpeg {
         if !*self.lease_state.borrow() {
             return Err(Error::Transport("stream lease ended".into()));
         }
+        if self.permit.is_none() {
+            self.permit = Some(crate::jpeg_permit().await?);
+        }
         if self.first {
             let marker = [self.boundary.as_slice(), b"\r\n"].concat();
             let pos = self.until(&marker, MAX_HEADER).await?;
@@ -368,7 +373,11 @@ impl VideoStream for Mjpeg {
             return Err(Error::InvalidResponse("frame exceeds limit".into()));
         }
         let frame = self.buffer[body_start..body_start + size].to_vec();
-        let frame = crate::validate_jpeg_async(frame).await?;
+        let frame = crate::validate_jpeg_async(
+            frame,
+            self.permit.as_ref().expect("permit acquired").clone(),
+        )
+        .await?;
         let suffix_start = body_start + size + delimiter.len();
         let suffix = &self.buffer[suffix_start..suffix_start + 2];
         if suffix == b"--" {
@@ -380,6 +389,10 @@ impl VideoStream for Mjpeg {
         self.buffer.drain(..suffix_start + 2);
         self.scan_offset = 0;
         self.proven.store(true, Ordering::Release);
+        if self.buffer.is_empty() && self.pending.is_empty() {
+            self.buffer = Vec::new();
+            self.permit = None;
+        }
         Ok(Some(Snapshot { jpeg: frame }))
     }
 }
@@ -430,6 +443,7 @@ mod tests {
             boundary: b"--frame".to_vec(),
             buffer: Vec::new(),
             pending: bytes::Bytes::new(),
+            permit: None,
             scan_offset: 0,
             scanned: 0,
             scan_progress: Some(progress_tx),

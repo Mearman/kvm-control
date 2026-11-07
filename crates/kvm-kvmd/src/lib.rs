@@ -143,15 +143,27 @@ fn jpeg_frame_safe(bytes: &[u8], stripped: &mut Vec<u8>) -> bool {
     false
 }
 
-async fn validate_jpeg_async(bytes: Vec<u8>) -> Result<Vec<u8>> {
+async fn jpeg_permit() -> Result<Arc<tokio::sync::OwnedSemaphorePermit>> {
     static SLOTS: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> = std::sync::OnceLock::new();
     let slots = SLOTS.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(MAX_JPEG_VALIDATIONS)));
-    run_jpeg_validation(slots.clone(), move || {
-        validate_jpeg(&bytes)?;
-        Ok(bytes)
+    Ok(Arc::new(slots.clone().acquire_owned().await.map_err(
+        |_| Error::Transport("JPEG validation unavailable".into()),
+    )?))
+}
+
+async fn validate_jpeg_async(
+    bytes: Vec<u8>,
+    permit: Arc<tokio::sync::OwnedSemaphorePermit>,
+) -> Result<Vec<u8>> {
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        validate_jpeg(&bytes)
     })
     .await
+    .map_err(|_| Error::Transport("JPEG validation task failed".into()))?
 }
+
+#[cfg(test)]
 
 async fn run_jpeg_validation<T: Send + 'static>(
     slots: Arc<tokio::sync::Semaphore>,
@@ -169,7 +181,7 @@ async fn run_jpeg_validation<T: Send + 'static>(
     .map_err(|_| Error::Transport("JPEG validation task failed".into()))?
 }
 
-fn validate_jpeg(bytes: &[u8]) -> Result<()> {
+fn validate_jpeg(bytes: &[u8]) -> Result<Vec<u8>> {
     use image::ImageDecoder;
     let invalid = || Error::InvalidResponse("invalid or oversized JPEG image".into());
     let mut stripped = Vec::with_capacity(bytes.len());
@@ -188,7 +200,8 @@ fn validate_jpeg(bytes: &[u8]) -> Result<()> {
         return Err(invalid());
     }
     let mut pixels = vec![0; size];
-    decoder.read_image(&mut pixels).map_err(|_| invalid())
+    decoder.read_image(&mut pixels).map_err(|_| invalid())?;
+    Ok(stripped)
 }
 
 fn request_error(context: &'static str, error: &reqwest::Error) -> Error {
@@ -786,6 +799,7 @@ impl Device for Kvmd {
     async fn snapshot(&self) -> Result<Snapshot> {
         // Limit compressed image data before collecting it, including chunked responses.
         const MAX_SNAPSHOT_BYTES: usize = 16 * 1024 * 1024;
+        let permit = jpeg_permit().await?;
         let mut response = self.get("streamer/snapshot").await?;
         if response
             .content_length()
@@ -808,7 +822,7 @@ impl Device for Kvmd {
             }
             bytes.extend_from_slice(&chunk);
         }
-        let jpeg = validate_jpeg_async(bytes).await?;
+        let jpeg = validate_jpeg_async(bytes, permit).await?;
         self.snapshot_proven.store(true, Ordering::Release);
         Ok(Snapshot { jpeg })
     }
@@ -1158,6 +1172,24 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn queued_image_reads_wait_for_a_permit() {
+        let first = jpeg_permit().await.unwrap();
+        let second = jpeg_permit().await.unwrap();
+        let mut waiter = Box::pin(jpeg_permit());
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(10), &mut waiter)
+                .await
+                .is_err()
+        );
+        drop(first);
+        let third = tokio::time::timeout(std::time::Duration::from_secs(3), waiter)
+            .await
+            .unwrap()
+            .unwrap();
+        drop((second, third));
+    }
+
+    #[tokio::test]
     async fn cancelled_validation_holds_slot_until_blocking_work_finishes() {
         let slots = Arc::new(tokio::sync::Semaphore::new(1));
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
@@ -1264,7 +1296,7 @@ mod tests {
         let mut stripped = Vec::new();
         assert!(jpeg_frame_safe(&frame, &mut stripped));
         assert_eq!(stripped, original);
-        assert!(validate_jpeg(&frame).is_ok());
+        assert_eq!(validate_jpeg(&frame).unwrap(), original);
     }
 
     #[test]
