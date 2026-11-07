@@ -350,7 +350,7 @@ struct Inputs {
     uncertain_keys: BTreeSet<String>,
     uncertain_buttons: BTreeSet<String>,
     indeterminate: bool,
-    // Inputs whose owed release cleanup confirmed since the last key or button request, so that request does not resend one.
+    // Inputs whose owed release cleanup confirmed since the last key or button request, login or approval, so the next key or button request does not resend one; a login or approval clears it because a release in the new session is a different request.
     cleaned: Vec<(Held, String)>,
     // Sequence number of the last key or button request sent for each tracked input, so an owed release is skipped once a later request pressed or released that input. An entry is removed when its input is released, so the map never outgrows the tracked inputs.
     last: BTreeMap<(Held, String), u64>,
@@ -1035,7 +1035,7 @@ impl Kvmd {
         }
     }
 
-    /// Submits a press or release on a task that holds the input lock until the outcome is recorded and delivered, not until it is collected. A release of an input whose owed release cleanup confirmed since the previous key or button request is not sent again.
+    /// Submits a press or release on a task that holds the input lock until the outcome is recorded and delivered, not until it is collected. A release of an input whose owed release cleanup confirmed since the previous key or button request, login or approval is not sent again.
     async fn held_input(&self, kind: Held, name: &str, pressed: bool) -> Result<()> {
         let mut inputs = TaskLock {
             inputs: self.inputs.clone().lock_owned().await,
