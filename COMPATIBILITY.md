@@ -32,7 +32,7 @@ The adapter requires HTTPS and rejects endpoint URLs containing credentials, que
 
 ## Terminal and platform
 
-The terminal client needs an interactive terminal and a stream of decodable JPEG frames. Its image protocol can be selected explicitly; native image protocols need support from the terminal and, under tmux, externally enabled passthrough. Without terminal key-release events, input falls back to key taps. A capability reported as unknown or unsupported can prevent input forwarding. The MCP executable's inherited password pipe is implemented for Unix only; this is a prerequisite independent of whether another part of the workspace compiles on a platform.
+The terminal client needs an interactive terminal and a stream of decodable JPEG frames. Its image protocol and keyboard enhancement are detected by querying the terminal, with environment heuristics for a terminal that does not answer, and the image protocol can be selected explicitly; native image protocols need support from the terminal and, under tmux, externally enabled passthrough. Without terminal key-release events, input falls back to key taps. A capability reported as unknown or unsupported can prevent input forwarding. The MCP executable's inherited password pipe is implemented for Unix only; this is a prerequisite independent of whether another part of the workspace compiles on a platform.
 
 ## Evidence in the repository
 
