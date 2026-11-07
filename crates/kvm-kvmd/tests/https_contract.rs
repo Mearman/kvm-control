@@ -1518,6 +1518,39 @@ async fn approval_cancelled_during_settlement_still_sends_the_owed_release() {
     server.abort();
 }
 
+#[test]
+fn owner_dropped_while_its_runtime_shuts_down_releases_inputs_on_the_last_runtime() {
+    let server_runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let (mut endpoint, ca, calls, server) = server_runtime.block_on(fixture());
+    endpoint.set_path("/gated/");
+    let device = client(endpoint, Some(ca));
+    server_runtime
+        .block_on(drive(&calls, device.key("KeyA", true)))
+        .unwrap();
+    // A task on a short-lived runtime owns the device, so shutdown drops the owner inside that runtime's context while it discards new tasks.
+    let owner_runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    owner_runtime.spawn(async move {
+        let _device = device;
+        std::future::pending::<()>().await;
+    });
+    drop(owner_runtime);
+    server_runtime.block_on(async {
+        arrival(&calls).await;
+        calls.4.notify_one();
+    });
+    assert_eq!(
+        input_events(&calls),
+        ["key=KeyA&state=true", "key=KeyA&state=false"]
+    );
+    server.abort();
+}
+
 #[tokio::test]
 async fn expired_session_requires_explicit_reauthentication() {
     let (endpoint, ca, calls, server) = fixture().await;

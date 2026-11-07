@@ -313,7 +313,7 @@ impl reqwest::cookie::CookieStore for SessionCookies {
 
 /// A KVMD connection with an explicitly authenticated session.
 ///
-/// Input requests already submitted continue after caller cancellation. A key or button press dropped before its outcome is collected, including outside a runtime, owes the release of its own input and nothing else, and owes nothing when the input was already held before it was sent, since an earlier press holds it: if the outcome was not yet delivered the request sends that release before giving up the input lock, and otherwise the release is queued for the next holder of the input lock and scheduled on the runtime the request ran on. Every later input, movement, explicit release, login or approval sends owed releases before its own work, including one already waiting for the lock, on a task that finishes them even if that caller is cancelled, so cleanup never interleaves with later inputs. An owed release is skipped once a later request has pressed or released the same input, so an input whose request reported success is never undone by cleanup. A completed request does not hold the input lock while its outcome waits to be collected, and a release of an input that cleanup has just confirmed released is not sent again unless an earlier press of it was ambiguous or a login or approval came between. Ambiguous outcomes permanently render cleanup indeterminate because a server may apply a timed-out request later. A request interrupted by runtime shutdown counts as ambiguous: an interrupted press owes its release as above, and an interrupted explicit release is finished by the next lock holder. An ambiguous release is not replayed automatically. Dropping the last owner attempts to release tracked inputs on the current runtime, or else on the runtime that last took the input lock; process termination, or a runtime shutdown with no later holder of the input lock, provides no cleanup guarantee.
+/// Input requests already submitted continue after caller cancellation. A key or button press dropped before its outcome is collected, including outside a runtime, owes the release of its own input and nothing else, and owes nothing when the input was already held before it was sent, since an earlier press holds it: if the outcome was not yet delivered the request sends that release before giving up the input lock, and otherwise the release is queued for the next holder of the input lock and scheduled on the runtime the request ran on. Every later input, movement, explicit release, login or approval sends owed releases before its own work, including one already waiting for the lock, on a task that finishes them even if that caller is cancelled, so cleanup never interleaves with later inputs. An owed release is skipped once a later request has pressed or released the same input, so an input whose request reported success is never undone by cleanup. A completed request does not hold the input lock while its outcome waits to be collected, and a release of an input that cleanup has just confirmed released is not sent again unless an earlier press of it was ambiguous or a login or approval came between. Ambiguous outcomes permanently render cleanup indeterminate because a server may apply a timed-out request later. A request interrupted by runtime shutdown counts as ambiguous: an interrupted press owes its release as above, and an interrupted explicit release is finished by the next lock holder. An ambiguous release is not replayed automatically. Dropping the last owner attempts to release tracked inputs on the current runtime and on the runtime that last took the input lock; process termination, or a runtime shutdown with no later holder of the input lock, provides no cleanup guarantee.
 ///
 /// Cookies are accepted only from login or approval responses. Later `Set-Cookie` headers, including rotation and expiry updates, are ignored. The inspected [PiKVM](https://github.com/pikvm/kvmd/blob/fcb903eb3be70d8eee4aee99e5fcc1c743e3ccef/kvmd/apps/kvmd/api/auth.py) and [GLKVM](https://github.com/gl-inet/glkvm/blob/3e8dd23c4bd638a4650433664cc3b0f3b4d29395/kvmd/apps/kvmd/api/auth.py) revisions issue authentication cookies on login, and GLKVM also issues them on approval. Other firmware requiring cookie rotation is not supported. Server-side expiry or revocation can return an authentication error; call `login` again with fresh credentials and complete any approval. Consequential and input requests are never automatically replayed, and ambiguous outcomes require observation before a caller decides what to do.
 pub struct Kvmd {
@@ -1433,7 +1433,7 @@ impl Device for Kvmd {
 
 impl Drop for Kvmd {
     fn drop(&mut self) {
-        // Only a connection that has taken the input lock has inputs to release. The runtime the owner is dropped on is running, so it is preferred; outside one, the runtime that last took the input lock is the best remaining choice.
+        // Only a connection that has taken the input lock has inputs to release. The release is scheduled on the runtime the owner is dropped on and, when that differs, also on the runtime that last took the input lock: a runtime that is shutting down still reports itself current but discards new tasks, and a second release finds nothing held.
         let last = self
             .input_runtime
             .lock()
@@ -1442,13 +1442,17 @@ impl Drop for Kvmd {
         if self.cleanup_on_drop
             && let Some(last) = last
         {
-            let runtime = tokio::runtime::Handle::try_current().unwrap_or(last);
-            let worker = self.input_worker();
-            runtime.spawn(async move {
-                if let Err(error) = worker.release_inputs().await {
-                    eprintln!("Input cleanup uncertain: {error}");
-                }
-            });
+            let current = tokio::runtime::Handle::try_current()
+                .ok()
+                .filter(|current| current.id() != last.id());
+            for runtime in current.into_iter().chain([last]) {
+                let worker = self.input_worker();
+                runtime.spawn(async move {
+                    if let Err(error) = worker.release_inputs().await {
+                        eprintln!("Input cleanup uncertain: {error}");
+                    }
+                });
+            }
         }
     }
 }
