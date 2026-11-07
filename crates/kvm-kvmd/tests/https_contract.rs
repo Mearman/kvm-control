@@ -253,7 +253,7 @@ async fn fixture() -> (Url, Vec<u8>, Calls, tokio::task::JoinHandle<()>) {
             get(|State(calls): State<Calls>| async move {
                 calls.0.lock().unwrap().push("snapshot".into());
                 if calls.2.load(Ordering::SeqCst) {
-                    vec![0xff, 0xd8, 0xff, 0xd9]
+                    include_bytes!("../../../examples/in-process/tests/synthetic.jpg").to_vec()
                 } else {
                     vec![0u8; 16 * 1024 * 1024 + 1]
                 }
