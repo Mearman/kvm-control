@@ -13,7 +13,7 @@ for binary in tui mcp; do
   printf '%s\n' '[package]' "name = \"synthetic-$binary\"" 'version.workspace = true' 'edition = "2021"' '[dependencies]' 'synthetic-lib.workspace = true' > "$work/$binary/Cargo.toml"
   printf '%s\n' 'fn main() { println!("{}", synthetic_lib::version()); }' > "$work/$binary/src/main.rs"
 done
-printf '%s\n' '[package]' 'name = "synthetic-lib"' 'version = "0.1.0"' 'edition = "2021"' > "$work/lib/Cargo.toml"
+printf '%s\n' '[package]' 'name = "synthetic-lib"' "version = '0.1.0'" 'edition = "2021"' > "$work/lib/Cargo.toml"
 printf '%s\n' 'fn main() { println!("{} {}", env!("CARGO_PKG_VERSION"), synthetic_lib::version()); }' > "$work/app/src/main.rs"
 printf '%s\n' 'pub fn version() -> &'"'"'static str { env!("CARGO_PKG_VERSION") }' > "$work/lib/src/lib.rs"
 cd "$work"

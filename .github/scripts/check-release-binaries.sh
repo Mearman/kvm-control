@@ -17,8 +17,12 @@ while IFS= read -r commit; do
     printf 'Cannot inspect release commit %s.\n' "$commit" >&2
     exit 2
   fi
+  if ! features=$(cd "$tmp/tree" && cargo tree --locked --workspace --target "$target" --edges normal,build --prefix none --format '{p}|{f}'); then
+    printf 'Cannot resolve release features for %s.\n' "$target" >&2
+    exit 2
+  fi
   for binary in kvm-cli kvm-tui kvm-mcp; do
-    if ! printf '%s' "$metadata" | jq -e --arg binary "$binary" '. as $root | any(.packages[]; .id as $id | ($root.workspace_members | index($id)) != null and (.features as $features | (["default" | recurse(. as $feature | ($features[$feature] // [])[] | select(contains("/") | not) | select(startswith("dep:") | not))] | unique) as $enabled | any(.targets[]; .name == $binary and (.kind | index("bin")) != null and all((.["required-features"] // [])[]; . as $feature | ($enabled | index($feature)) != null))))' >/dev/null; then
+    if ! printf '%s' "$metadata" | jq -e --arg binary "$binary" --arg features "$features" '. as $root | any(.packages[]; .id as $id | ($root.workspace_members | index($id)) != null and (.name + " v" + .version + " (" + (.manifest_path | sub("/Cargo.toml$"; "")) + ")|") as $prefix | ([$features | split("\n")[] | select(startswith($prefix)) | ltrimstr($prefix) | split(",")[]] | unique) as $enabled | any(.targets[]; .name == $binary and (.kind | index("bin")) != null and all((.["required-features"] // [])[]; . as $feature | ($enabled | index($feature)) != null)))' >/dev/null; then
       printf 'Release commit %s lacks binary target %s.\n' "$commit" "$binary" >&2
       exit 1
     fi

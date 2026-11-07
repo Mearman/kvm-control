@@ -31,7 +31,7 @@ for package in data["packages"]:
         section = re.search(r"(?ms)^\[package\]\s*$.*?(?=^\[|\Z)", text)
         if section is None:
             raise SystemExit("Missing package section in " + str(manifest))
-        updated, count = re.subn(r"(?m)^(\s*version\s*=\s*)\"[^\"]+\"", lambda match: match.group(1) + "\"" + version + "\"", section.group())
+        updated, count = re.subn(r"(?m)^(\s*version\s*=\s*)(?:\"[^\"]+\"|\x27[^\x27]+\x27)", lambda match: match.group(1) + "\"" + version + "\"", section.group())
         if count != 1:
             raise SystemExit("Cannot update package version in " + str(manifest))
         text = text[:section.start()] + updated + text[section.end():]

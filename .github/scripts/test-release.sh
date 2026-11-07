@@ -135,6 +135,10 @@ if (cd "$tmp/untagged" && PLAN="$platform_plan" bash "$root/.github/scripts/chec
   printf '%s\n' 'A feature enabled only on a different platform was accepted.' >&2
   exit 1
 fi
+python3 -c 'import pathlib, sys; p = pathlib.Path(sys.argv[1]); p.write_text(p.read_text().replace("[target.\x27cfg(target_os = \"macos\")\x27.dependencies]", "[dependencies]"))' "$tmp/untagged/crates/kvm-tui/Cargo.toml"
+(cd "$tmp/untagged" && git add crates/kvm-tui/Cargo.toml && git -c user.name=test -c user.email=test@example.com commit -qm 'test: enable binary feature through workspace dependency')
+dependency_plan=$(jq -cn --arg commit "$(git -C "$tmp/untagged" rev-parse HEAD)" '[{tag:"v0.2.0",commit:$commit}]')
+(cd "$tmp/untagged" && PLAN="$dependency_plan" bash "$root/.github/scripts/check-release-binaries.sh")
 for invalid in '{' '[{}]' '[{"tag":"v0.1.0"}]'; do
   if (cd "$tmp/untagged" && PLAN="$invalid" bash "$root/.github/scripts/record-release-intent.sh"); then
     printf '%s\n' 'Invalid release plan was accepted.' >&2
