@@ -877,8 +877,10 @@ mod tests {
             responses["info"]["extras"] = json!({"synthetic": {"token": secret}});
             responses["streamer"]["streamer"] = json!({"stream": {"clients": 1, "clients_stat": {"1": {"key": secret}}}});
             let status = parse(profile, reads(&responses)).unwrap();
-            prop_assert!(!format!("{status:?}").contains(&secret));
-            prop_assert!(!serde_json::to_string(&status).unwrap().contains(&secret));
+            let debug = format!("{status:?}");
+            let encoded = serde_json::to_string(&status).unwrap();
+            prop_assert!(!debug.contains(&secret));
+            prop_assert!(!encoded.contains(&secret));
         }
     }
 
