@@ -162,8 +162,20 @@ async fn status(State(calls): State<Calls>, uri: Uri, headers: HeaderMap) -> imp
     (StatusCode::OK, Json(json!({"ok": true, "result": result})))
 }
 
-/// Serves a profile's synthetic status fixture (`glstatus` for GLKVM, `pikvmstatus` for PiKVM, `corestatus` with only the info, HID and streamer routes, and `failstatus` whose media route fails with HTTP 500 and whose ATX route answers `ok: false`) and records every request's method and path, so a test can check that reading status sends nothing else.
-async fn typed_status(State(calls): State<Calls>, method: Method, uri: Uri) -> impl IntoResponse {
+/// Serves a profile's synthetic status fixture and records every request's method and path, so a test can check that reading status sends nothing else. The path prefix selects the device:
+///
+/// - `pikvmstatus` and `glstatus` serve the PiKVM and GLKVM fixtures;
+/// - `corestatus` serves only the info, HID and streamer routes;
+/// - `failstatus` fails its media route with HTTP 500 and answers `ok: false` on ATX;
+/// - `badstatus` answers HID with invalid JSON, the streamer without a result and media with an oversized chunked body;
+/// - `slowstatus` answers ATX after the short-timeout client has given up, which loses the connection partway through a status read;
+/// - `downstatus` answers every route with HTTP 502, as a proxy does when its daemon is stopped;
+/// - `htmlstatus` answers every route with an HTML page, as a single-page application's catch-all does.
+async fn typed_status(
+    State(calls): State<Calls>,
+    method: Method,
+    uri: Uri,
+) -> axum::response::Response {
     calls
         .0
         .lock()
@@ -181,25 +193,44 @@ async fn typed_status(State(calls): State<Calls>, method: Method, uri: Uri) -> i
     })
     .unwrap();
     let routed = prefix != "corestatus" || matches!(route, "info" | "hid" | "streamer");
-    if prefix == "failstatus" && route == "msd" {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"ok": false, "result": {}})),
-        );
-    }
-    if prefix == "failstatus" && route == "atx" {
-        return (StatusCode::OK, Json(json!({"ok": false, "result": {}})));
+    match (prefix, route) {
+        ("downstatus", _) => return StatusCode::BAD_GATEWAY.into_response(),
+        ("htmlstatus", _) => {
+            return (
+                [(header::CONTENT_TYPE, "text/html")],
+                "<!doctype html><title>app</title>",
+            )
+                .into_response();
+        }
+        ("failstatus", "msd") => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"ok": false, "result": {}})),
+            )
+                .into_response();
+        }
+        ("failstatus", "atx") => return Json(json!({"ok": false, "result": {}})).into_response(),
+        ("badstatus", "hid") => return "{\"ok\": true, \"result\": {".into_response(),
+        ("badstatus", "streamer") => return Json(json!({"ok": true})).into_response(),
+        ("badstatus", "msd") => return oversized_chunked().await.into_response(),
+        ("slowstatus", "atx") => tokio::time::sleep(SLOW_RESPONSE).await,
+        _ => {}
     }
     match fixture.get(route) {
         Some(state) if method == Method::GET && routed => {
-            (StatusCode::OK, Json(json!({"ok": true, "result": state})))
+            Json(json!({"ok": true, "result": state})).into_response()
         }
         _ => (
             StatusCode::NOT_FOUND,
             Json(json!({"ok": false, "result": {}})),
-        ),
+        )
+            .into_response(),
     }
 }
+
+/// The timeout of the client that reads `slowstatus`, and the delay of that device's ATX route, which outlasts it by a wide margin so the client always gives up first.
+const SHORT_TIMEOUT: Duration = Duration::from_secs(1);
+const SLOW_RESPONSE: Duration = Duration::from_secs(4);
 
 async fn oversized_length() -> impl IntoResponse {
     vec![b' '; 4 * 1024 * 1024 + 1]
@@ -321,7 +352,7 @@ async fn fixture() -> (Url, Vec<u8>, Calls, tokio::task::JoinHandle<()>) {
             "/bigapproval/api/auth/two_step_complete",
             post(oversized_chunked),
         )
-        .route("/bigstatus/api/info", get(oversized_length))
+        .route("/bigstatus/{*route}", get(oversized_length))
         .route("/nocookie/api/auth/login", post(gl_login))
         .route(
             "/nocookie/api/auth/two_step_complete",
@@ -359,6 +390,10 @@ async fn fixture() -> (Url, Vec<u8>, Calls, tokio::task::JoinHandle<()>) {
         .route("/glstatus/{*route}", any(typed_status))
         .route("/corestatus/{*route}", any(typed_status))
         .route("/failstatus/{*route}", any(typed_status))
+        .route("/badstatus/{*route}", any(typed_status))
+        .route("/slowstatus/{*route}", any(typed_status))
+        .route("/downstatus/{*route}", any(typed_status))
+        .route("/htmlstatus/{*route}", any(typed_status))
         .route("/api/auth/check", get(status))
         .route("/api/info", get(status))
         .route("/api/hid", get(status))
@@ -1892,10 +1927,10 @@ async fn oversized_json_is_rejected_for_length_and_chunked_responses() {
     let mut url = endpoint;
     url.set_path("/bigstatus/");
     let device = client(url, Some(ca));
-    // An oversized route is unreadable, not a reason to discard the routes that were read.
-    let status = device.status().await.unwrap();
-    assert_eq!(status.info, Reported::Unknown);
-    assert_eq!(status.atx, Reported::Unsupported);
+    // Every route is oversized, so nothing was observed and the first route's error is the status's.
+    assert!(
+        matches!(device.status().await, Err(Error::InvalidResponse(message)) if message.contains("size limit"))
+    );
     server.abort();
 }
 
@@ -2429,5 +2464,67 @@ async fn a_failing_route_leaves_the_other_subsystems_readable() {
         assert_eq!(capability, Capability::Supported);
     }
     assert_eq!(calls.0.lock().unwrap().len(), STATUS_ROUTES.len());
+    server.abort();
+}
+
+#[tokio::test]
+async fn unreadable_routes_are_unknown_and_an_unreadable_device_fails() {
+    let (endpoint, ca, _, server) = fixture().await;
+    let status = status_client(&endpoint, &ca, "badstatus", DeviceProfile::PiKvm)
+        .status()
+        .await
+        .unwrap();
+    // Invalid JSON, a missing result and an oversized chunked body each leave only their own subsystem unknown.
+    assert_eq!(status.hid, Reported::Unknown);
+    assert_eq!(status.streamer, Reported::Unknown);
+    assert_eq!(status.media, Reported::Unknown);
+    for capability in [
+        status.info.capability(),
+        status.atx.capability(),
+        status.switch.capability(),
+        status.gpio.capability(),
+    ] {
+        assert_eq!(capability, Capability::Supported);
+    }
+    // A proxy whose daemon is stopped, and a page that is not the API, are failures, not an all-unknown status.
+    assert!(matches!(
+        status_client(&endpoint, &ca, "downstatus", DeviceProfile::PiKvm)
+            .status()
+            .await,
+        Err(Error::Http(502))
+    ));
+    assert!(matches!(
+        status_client(&endpoint, &ca, "htmlstatus", DeviceProfile::GlKvm)
+            .status()
+            .await,
+        Err(Error::InvalidResponse(_))
+    ));
+    server.abort();
+}
+
+#[tokio::test]
+async fn a_connection_lost_partway_through_fails_the_whole_status() {
+    let (mut endpoint, ca, calls, server) = fixture().await;
+    endpoint.set_path("/slowstatus/");
+    let device = Kvmd::with_header_auth(
+        Config {
+            endpoint,
+            profile: DeviceProfile::PiKvm,
+            trusted_ca_pem: Some(ca),
+            insecure_tls: false,
+            timeout: SHORT_TIMEOUT,
+        },
+        "test-user",
+        "test-password",
+    )
+    .unwrap();
+    assert!(matches!(device.status().await, Err(Error::Transport(_))));
+    // The reads before the lost one succeeded, and no route was read after it.
+    let paths: Vec<String> = calls.0.lock().unwrap().clone();
+    let expected: Vec<String> = STATUS_ROUTES[..4]
+        .iter()
+        .map(|route| format!("GET /slowstatus/api/{route}"))
+        .collect();
+    assert_eq!(paths, expected);
     server.abort();
 }

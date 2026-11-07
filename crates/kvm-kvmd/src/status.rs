@@ -7,7 +7,7 @@
 use kvm_core::{
     AtxStatus, DeviceProfile, DeviceStatus, Error, GpioInput, GpioOutput, GpioStatus, HidOutputs,
     HidStatus, JigglerStatus, KernelInfo, KeyboardLeds, KeyboardStatus, Limits, MediaDrive,
-    MediaImage, MediaStatus, MouseStatus, PlatformInfo, Reported, Resolution, Result,
+    MediaImage, MediaStatus, MouseMode, MouseStatus, PlatformInfo, Reported, Resolution, Result,
     StoragePartition, StreamerFeatures, StreamerStatus, SwitchPort, SwitchStatus, SystemInfo,
     VideoSource,
 };
@@ -28,11 +28,11 @@ pub(crate) enum Read {
     #[default]
     Denied,
     /// The route answered but its state could not be read: an HTTP error status, `ok: false`, a missing result, malformed JSON or an oversized body.
-    Failed,
+    Failed(Error),
 }
 
 impl Kvmd {
-    /// Reads every state route with GET requests only, so reading status sends no input or control request. A route that fails is reported unknown without discarding the others; only a transport failure, which leaves the connection itself in doubt, fails the whole status.
+    /// Reads every state route with GET requests only, so reading status sends no input or control request. A transport failure, which leaves the connection itself in doubt, fails the whole status at once; how the other outcomes combine is described at [`parse`].
     pub(crate) async fn read_status(&self) -> Result<DeviceStatus> {
         let active = self.client.read().await;
         let mut reads: [Read; 7] = Default::default();
@@ -42,7 +42,7 @@ impl Kvmd {
                 Err(Error::Http(404)) => Read::Absent,
                 Err(Error::Authentication) => Read::Denied,
                 Err(error @ Error::Transport(_)) => return Err(error),
-                Err(_) => Read::Failed,
+                Err(error) => Read::Failed(error),
             };
         }
         parse(self.profile, reads)
@@ -51,42 +51,54 @@ impl Kvmd {
 
 /// Builds a typed status from the route reads, in `ROUTES` order.
 ///
-/// Both inspected sources always serve the info route, so a 404 there means the endpoint is not a KVMD API and fails with that HTTP error rather than reporting every subsystem unsupported. Fails with an authentication error when no route could be read and at least one was denied, since such a session has observed nothing.
+/// Both inspected sources always register the info, HID and streamer routes, so a 404 on any of them means the endpoint is not a KVMD API and fails with that HTTP error. A status in which no route produced state has observed nothing, so it fails: with an authentication error when a route was denied, otherwise with the first route's error (for example the HTTP 502 of a proxy whose daemon is stopped, or the invalid JSON of a page that is not the API). Otherwise each failed or denied route is unknown, and an absent route is unsupported only when the info route was read, which establishes that the endpoint is a KVMD API; without that it is unknown.
 pub(crate) fn parse(profile: DeviceProfile, reads: [Read; 7]) -> Result<DeviceStatus> {
-    if matches!(reads[0], Read::Absent) {
+    if reads[..3].iter().any(|read| matches!(read, Read::Absent)) {
         return Err(Error::Http(404));
     }
-    if !reads.iter().any(|read| matches!(read, Read::State(_)))
-        && reads.iter().any(|read| matches!(read, Read::Denied))
-    {
-        return Err(Error::Authentication);
+    if !reads.iter().any(|read| matches!(read, Read::State(_))) {
+        if reads.iter().any(|read| matches!(read, Read::Denied)) {
+            return Err(Error::Authentication);
+        }
+        return Err(reads
+            .into_iter()
+            .find_map(|read| match read {
+                Read::Failed(error) => Some(error),
+                _ => None,
+            })
+            .unwrap_or(Error::Http(404)));
     }
+    let api_confirmed = matches!(reads[0], Read::State(_));
     let [info, hid, streamer, atx, switch, gpio, msd] = reads;
     Ok(DeviceStatus {
-        info: section(info, |state| {
+        info: section(info, api_confirmed, |state| {
             Reported::Supported(system_info(profile, state))
         }),
-        hid: section(hid, |state| enabled(state, hid_status)),
-        streamer: section(streamer, |state| {
+        hid: section(hid, api_confirmed, |state| enabled(state, hid_status)),
+        streamer: section(streamer, api_confirmed, |state| {
             Reported::Supported(streamer_status(profile, state))
         }),
-        atx: section(atx, |state| {
+        atx: section(atx, api_confirmed, |state| {
             enabled(state, |state| atx_status(profile, state))
         }),
-        switch: section(switch, |state| switch_status(profile, state)),
-        gpio: section(gpio, |state| Reported::Supported(gpio_status(state))),
-        media: section(msd, |state| {
+        switch: section(switch, api_confirmed, |state| switch_status(profile, state)),
+        gpio: section(gpio, api_confirmed, gpio_status),
+        media: section(msd, api_confirmed, |state| {
             enabled(state, |state| media_status(profile, state))
         }),
     })
 }
 
-/// A subsystem's status: unsupported when its route is absent, unknown when it was denied, failed or is not an object.
-fn section<T>(read: Read, parse: impl FnOnce(&Value) -> Reported<T>) -> Reported<T> {
+/// A subsystem's status: unknown when its route was denied, failed or is not an object, and when absent unsupported if `api_confirmed` (the info route was read), otherwise unknown.
+fn section<T>(
+    read: Read,
+    api_confirmed: bool,
+    parse: impl FnOnce(&Value) -> Reported<T>,
+) -> Reported<T> {
     match read {
         Read::State(state) if state.is_object() => parse(&state),
-        Read::State(_) | Read::Denied | Read::Failed => Reported::Unknown,
-        Read::Absent => Reported::Unsupported,
+        Read::Absent if api_confirmed => Reported::Unsupported,
+        Read::State(_) | Read::Denied | Read::Failed(_) | Read::Absent => Reported::Unknown,
     }
 }
 
@@ -254,10 +266,18 @@ fn hid_status(state: &Value) -> HidStatus {
                 outputs: hid_outputs(keyboard),
             }
         }),
-        mouse: nested(state, "/mouse", |mouse| MouseStatus {
-            online: boolean(mouse, "/online"),
-            mode: mouse_mode(state),
-            outputs: hid_outputs(mouse),
+        mouse: nested(state, "/mouse", |mouse| {
+            let online = boolean(mouse, "/online");
+            MouseStatus {
+                // PiKVM's MCU HID reports `absolute: true` whenever it is offline, so the mode is only an observation while the mouse is online. Capability discovery reads the mode on its own, so this does not change the absolute-move check.
+                mode: if online == Reported::Supported(true) {
+                    mouse_mode(state)
+                } else {
+                    MouseMode::Unknown
+                },
+                online,
+                outputs: hid_outputs(mouse),
+            }
         }),
         jiggler: nested(state, "/jiggler", |jiggler| JigglerStatus {
             enabled: boolean(jiggler, "/enabled"),
@@ -365,14 +385,13 @@ fn atx_status(profile: DeviceProfile, state: &Value) -> AtxStatus {
     }
 }
 
-/// A switch whose port list is empty is unsupported, as in capability discovery: PiKVM reports an empty list, with its initial `active_port: -1` and `synced: true`, when no switch is attached or its units are not ready.
+/// A switch whose port list is empty is unsupported and one without a port list is unknown, as in capability discovery: PiKVM reports an empty list, with its initial `active_port: -1` and `synced: true`, when no switch is attached or its units are not ready.
 fn switch_status(profile: DeviceProfile, state: &Value) -> Reported<SwitchStatus> {
-    if state
-        .pointer("/model/ports")
-        .and_then(Value::as_array)
-        .is_some_and(Vec::is_empty)
-    {
-        return Reported::Unsupported;
+    // As in capability discovery, a response without a port list says nothing about whether a switch exists.
+    match state.pointer("/model/ports").and_then(Value::as_array) {
+        None => return Reported::Unknown,
+        Some(ports) if ports.is_empty() => return Reported::Unsupported,
+        Some(_) => {}
     }
     Reported::Supported(SwitchStatus {
         ports: extract(state.pointer("/model/ports"), |ports| {
@@ -406,7 +425,25 @@ fn switch_status(profile: DeviceProfile, state: &Value) -> Reported<SwitchStatus
     })
 }
 
-fn gpio_status(state: &Value) -> GpioStatus {
+/// GPIO is supported when the device lists a channel, unsupported when it lists no output and no input, and unknown when it does not report its channels. Capability discovery judges the GPIO control, which only outputs accept, so a device with inputs and no outputs has an unsupported GPIO capability but a supported GPIO status that lists its inputs.
+fn gpio_status(state: &Value) -> Reported<GpioStatus> {
+    let channels = |pointer: &str| {
+        state
+            .pointer(pointer)
+            .and_then(Value::as_object)
+            .map(serde_json::Map::len)
+    };
+    match (channels("/state/inputs"), channels("/state/outputs")) {
+        (Some(inputs), Some(outputs)) if inputs > 0 || outputs > 0 => {}
+        (Some(inputs), None) if inputs > 0 => {}
+        (None, Some(outputs)) if outputs > 0 => {}
+        (None | Some(0), Some(0)) => return Reported::Unsupported,
+        _ => return Reported::Unknown,
+    }
+    Reported::Supported(gpio_channels(state))
+}
+
+fn gpio_channels(state: &Value) -> GpioStatus {
     // The device reports `state: false` for an offline or busy channel without reading it.
     let read_state = |channel: &Value, readable: bool| {
         if readable {
@@ -645,7 +682,8 @@ mod tests {
         assert_eq!(hid.connected, Reported::Supported(true));
         let mouse = supported(&hid.mouse);
         assert_eq!(mouse.online, Reported::Supported(false));
-        assert_eq!(mouse.mode, MouseMode::Relative);
+        // An offline mouse's mode is a placeholder (PiKVM's MCU HID reports absolute while offline), so it is not reported.
+        assert_eq!(mouse.mode, MouseMode::Unknown);
         assert_eq!(supported(&hid.jiggler).active, Reported::Supported(true));
 
         let streamer = supported(&status.streamer);
@@ -675,9 +713,8 @@ mod tests {
         assert_eq!(switch.active_port, Reported::Supported(None));
         assert_eq!(switch.synced, Reported::Unknown);
 
-        let gpio = supported(&status.gpio);
-        assert_eq!(gpio.inputs, Reported::Supported(Vec::new()));
-        assert_eq!(gpio.outputs, Reported::Supported(Vec::new()));
+        // No channel is configured, which capability discovery also reports as unsupported.
+        assert_eq!(status.gpio, Reported::Unsupported);
 
         let media = supported(&status.media);
         assert_eq!(supported(&media.drive).image, Reported::Supported(None));
@@ -718,15 +755,14 @@ mod tests {
         // A disabled ATX plugin reports its LEDs off; that is a placeholder, not an observation.
         assert_eq!(status.atx, Reported::Unsupported);
         assert_eq!(status.switch, Reported::Unsupported);
-        let gpio = supported(&status.gpio);
-        assert_eq!(gpio.inputs, Reported::Unknown);
-        assert_eq!(gpio.outputs, Reported::Unknown);
+        // A GPIO response that lists no channels says nothing either way, as in capability discovery.
+        assert_eq!(status.gpio, Reported::Unknown);
         assert_eq!(status.media, Reported::Unsupported);
 
         let status = parse(
             DeviceProfile::GlKvm,
             ROUTES.map(|route| match route {
-                "info" => Read::State(json!({})),
+                "info" | "hid" | "streamer" => Read::State(json!({})),
                 "atx" => Read::State(json!({"leds": {"power": true}})),
                 "msd" => Read::State(json!({"online": true})),
                 _ => Read::Absent,
@@ -736,8 +772,63 @@ mod tests {
         // A subsystem that does not say whether it is enabled is unknown, as in capability discovery.
         assert_eq!(status.atx, Reported::Unknown);
         assert_eq!(status.media, Reported::Unknown);
-        assert_eq!(status.hid, Reported::Unsupported);
+        assert_eq!(status.hid, Reported::Unknown);
+        // The info route was read, so absent routes are subsystems the device does not have.
         assert_eq!(status.switch, Reported::Unsupported);
+        assert_eq!(status.gpio, Reported::Unsupported);
+
+        // Without the info route an absent route is not evidence of a missing subsystem.
+        let status = parse(
+            DeviceProfile::PiKvm,
+            ROUTES.map(|route| match route {
+                "info" => Read::Failed(Error::Http(500)),
+                "hid" | "streamer" => Read::State(json!({})),
+                _ => Read::Absent,
+            }),
+        )
+        .unwrap();
+        assert_eq!(status.info, Reported::Unknown);
+        assert_eq!(status.atx, Reported::Unknown);
+        assert_eq!(status.switch, Reported::Unknown);
+        assert_eq!(status.media, Reported::Unknown);
+    }
+
+    #[test]
+    fn a_status_that_observed_nothing_fails() {
+        // A proxy whose daemon is stopped answers every route with HTTP 502.
+        assert!(matches!(
+            parse(
+                DeviceProfile::PiKvm,
+                ROUTES.map(|_| Read::Failed(Error::Http(502)))
+            ),
+            Err(Error::Http(502))
+        ));
+        // A page that is not the API answers with something that is not JSON; the first route's error is reported.
+        let mut observed: [Read; 7] =
+            std::array::from_fn(|_| Read::Failed(Error::InvalidResponse("not JSON".into())));
+        observed[0] = Read::Failed(Error::Http(500));
+        assert!(matches!(
+            parse(DeviceProfile::GlKvm, observed),
+            Err(Error::Http(500))
+        ));
+        // Info failing with every other route absent is not a KVMD API either.
+        let observed = ROUTES.map(|route| match route {
+            "info" => Read::Failed(Error::Http(500)),
+            _ => Read::Absent,
+        });
+        assert!(matches!(
+            parse(DeviceProfile::PiKvm, observed),
+            Err(Error::Http(404))
+        ));
+        // Both sources register the HID and streamer routes, so a 404 on either is not a KVMD API.
+        for index in [1, 2] {
+            let mut observed = reads(&fixture(DeviceProfile::PiKvm));
+            observed[index] = Read::Absent;
+            assert!(matches!(
+                parse(DeviceProfile::PiKvm, observed),
+                Err(Error::Http(404))
+            ));
+        }
     }
 
     #[test]
@@ -745,7 +836,7 @@ mod tests {
         for (index, route) in ROUTES.iter().enumerate() {
             let responses = fixture(DeviceProfile::PiKvm);
             let mut reads = reads(&responses);
-            reads[index] = Read::Failed;
+            reads[index] = Read::Failed(Error::Http(500));
             let status = parse(DeviceProfile::PiKvm, reads).unwrap();
             let capabilities = [
                 status.info.capability(),
@@ -769,18 +860,95 @@ mod tests {
                 );
             }
         }
-        // Only failures, with nothing denied, are an all-unknown status rather than an authentication failure.
-        let mut failed: [Read; 7] = std::array::from_fn(|_| Read::Failed);
-        assert_eq!(
-            parse(DeviceProfile::GlKvm, failed).unwrap().media,
-            Reported::Unknown
-        );
-        failed = std::array::from_fn(|_| Read::Failed);
+        // With nothing read, a denial takes precedence over failures: the session has observed nothing.
+        let mut failed: [Read; 7] = std::array::from_fn(|_| Read::Failed(Error::Http(502)));
         failed[2] = Read::Denied;
         assert!(matches!(
             parse(DeviceProfile::GlKvm, failed),
             Err(Error::Authentication)
         ));
+    }
+
+    // Breaks if the parser starts reading a key that the generated responses never contain, which would leave that branch reachable only through its unknown case.
+    #[test]
+    fn fuzz_keys_cover_every_key_the_parser_reads() {
+        let source = include_str!("status.rs");
+        let parser = &source[..source.find("#[cfg(test)]").unwrap()];
+        let keys: Vec<&str> = KEYS.split(' ').collect();
+        let mut missing = Vec::new();
+        for line in parser
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+        {
+            // String literals are the odd-numbered pieces between quotes; the parser's literals contain no escaped quotes.
+            for literal in line.split('"').skip(1).step_by(2) {
+                for key in literal.split('/') {
+                    let is_key = !key.is_empty()
+                        && key
+                            .chars()
+                            .all(|c| c.is_ascii_lowercase() || c == '_' || c.is_ascii_digit());
+                    if is_key && !ROUTES.contains(&key) && !keys.contains(&key) {
+                        missing.push(key.to_owned());
+                    }
+                }
+            }
+        }
+        // `mouse_mode`, shared with capability discovery, reads `/mouse/absolute`.
+        assert!(keys.contains(&"absolute"));
+        assert!(
+            missing.is_empty(),
+            "keys the parser reads but KEYS omits: {missing:?}"
+        );
+    }
+
+    #[test]
+    fn subsystem_support_agrees_with_capability_discovery() {
+        for profile in [DeviceProfile::PiKvm, DeviceProfile::GlKvm] {
+            // Discovery reads a switch as supported only when it lists ports.
+            assert_eq!(switch_status(profile, &json!({})), Reported::Unknown);
+            assert_eq!(
+                switch_status(profile, &json!({"model": {"ports": {}}})),
+                Reported::Unknown
+            );
+            assert!(matches!(
+                switch_status(profile, &json!({"model": {"ports": [{}]}})),
+                Reported::Supported(_)
+            ));
+        }
+        assert_eq!(gpio_status(&json!({})), Reported::Unknown);
+        assert_eq!(
+            gpio_status(&json!({"state": {"inputs": {}, "outputs": {}}})),
+            Reported::Unsupported
+        );
+        assert_eq!(
+            gpio_status(&json!({"state": {"outputs": {}}})),
+            Reported::Unsupported
+        );
+        assert_eq!(
+            gpio_status(&json!({"state": {"inputs": {}}})),
+            Reported::Unknown
+        );
+        let outputs = gpio_status(&json!({"state": {"outputs": {"relay": {}}}}));
+        assert_eq!(supported(&outputs).inputs, Reported::Unknown);
+        assert_eq!(supported(&outputs).outputs.value().unwrap().len(), 1);
+        // Inputs alone are readable state, although the GPIO control (outputs only) is unsupported.
+        let inputs = gpio_status(&json!({"state": {"inputs": {"led": {}}, "outputs": {}}}));
+        assert_eq!(supported(&inputs).inputs.value().unwrap().len(), 1);
+        assert_eq!(supported(&inputs).outputs, Reported::Supported(Vec::new()));
+    }
+
+    #[test]
+    fn mouse_mode_is_reported_only_while_the_mouse_is_online() {
+        for (online, absolute, expected) in [
+            (json!(true), json!(true), MouseMode::Absolute),
+            (json!(true), json!(false), MouseMode::Relative),
+            // PiKVM's MCU HID reports absolute whenever it is offline.
+            (json!(false), json!(true), MouseMode::Unknown),
+            (Value::Null, json!(false), MouseMode::Unknown),
+        ] {
+            let hid = hid_status(&json!({"mouse": {"online": online, "absolute": absolute}}));
+            assert_eq!(supported(&hid.mouse).mode, expected);
+        }
     }
 
     #[test]
@@ -821,6 +989,7 @@ mod tests {
         ));
         let mut mixed: [Read; 7] = Default::default();
         mixed[3] = Read::Absent;
+        mixed[4] = Read::Failed(Error::Http(500));
         assert!(matches!(
             parse(DeviceProfile::GlKvm, mixed),
             Err(Error::Authentication)
@@ -852,7 +1021,7 @@ mod tests {
         }
     }
 
-    /// Every object key the parser reads, at any depth, so generated responses can reach its supported leaves rather than only its unknown cases.
+    /// Every object key the parser reads, at any depth, so generated responses can reach its supported leaves rather than only its unknown cases. `fuzz_keys_cover_every_key_the_parser_reads` checks the list against the parser's source.
     const KEYS: &str = "enabled online busy connected state leds power hdd caps scroll num acts reset model ports unit channel id name summary active_port synced inputs outputs scheme switch drive drive_partition image cdrom rw size complete removable free writable storage images parts system kvmd version streamer app kernel release machine platform type base serial video board hw meta server host keyboard mouse absolute available active jiggler interval features quality resolution h264 h265 zero_delay venc_mode params desired_fps h264_bitrate h264_gop limits available_resolutions min max encoder source width height captured_fps stream clients";
 
     fn json_value() -> impl Strategy<Value = Value> {
@@ -921,7 +1090,7 @@ mod tests {
             profile in profile(),
         ) {
             let state = json!({"enabled": enabled, "busy": false, "leds": {"power": power, "hdd": hdd}});
-            let atx = section(Read::State(state), |state| enabled_atx(profile, state));
+            let atx = section(Read::State(state), true, |state| enabled_atx(profile, state));
             if enabled {
                 let atx = atx.value().unwrap();
                 prop_assert_eq!(&atx.power_led, &Reported::Supported(power));
@@ -952,7 +1121,7 @@ mod tests {
             if let Some(switchable) = switchable {
                 scheme["switch"] = switchable.into();
             }
-            let gpio = gpio_status(&json!({
+            let gpio = gpio_channels(&json!({
                 "model": {"scheme": {"outputs": {"a/b~c": scheme}}},
                 "state": {"outputs": {"a/b~c": output}},
             }));
