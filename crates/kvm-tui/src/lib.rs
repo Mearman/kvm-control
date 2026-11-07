@@ -48,7 +48,39 @@ pub struct App {
     refresh_note: String,
     /// Control outcomes received so far, so a refresh started before the latest one is shown as predating it.
     controls_completed: u64,
+    /// The message shown when input mode was entered, so leaving input mode can replace it while it is still shown, but not a message written since (a control's outcome, a failed key).
+    input_entry_message: Option<String>,
+    /// Why a refresh ended input mode, and how its release of inputs went; shown first on the device-state line until input mode is entered again.
+    input_ended: Option<InputEnded>,
 }
+
+/// A refresh that ended input mode: the cause and the state of the release it requires.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct InputEnded {
+    cause: &'static str,
+    release: Release,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Release {
+    Pending,
+    Done,
+    Failed(String),
+}
+
+impl InputEnded {
+    fn line(&self) -> String {
+        let release = match &self.release {
+            Release::Pending => "releasing inputs".to_owned(),
+            Release::Done => "inputs released".to_owned(),
+            Release::Failed(error) => format!("input cleanup uncertain: {error}"),
+        };
+        format!("Input mode ended ({}); {release}", self.cause)
+    }
+}
+
+/// The message that replaces input mode's entry message when input mode ends.
+const INPUT_MODE_ENDED: &str = "Input mode ended; keys are client commands again";
 
 /// The outcome of reading capabilities and status, applied to an [`App`] by [`App::finish_refresh`].
 pub struct Refresh {
@@ -92,6 +124,8 @@ impl Default for App {
             refreshing: false,
             refresh_note: "Device state not read yet".into(),
             controls_completed: 0,
+            input_entry_message: None,
+            input_ended: None,
         }
     }
 }
@@ -113,30 +147,39 @@ impl App {
         self.finish_refresh(device, refresh).await;
     }
 
-    /// Applies a completed read. The message is never written: the read's outcome, and any end of input mode it causes, go on the device-state line, so a command being typed, a confirmation prompt or a control's outcome stays visible.
-    ///
-    /// Input mode's key and mouse handling (releases included) is gated on the keyboard and mouse capabilities and the mouse mode it was entered under, so those must not change under it: when the read reports different values for them, or fails to read capabilities, input mode ends and every tracked input is released first, as `F12` does. Other capabilities, such as live video becoming proven once frames arrive, are applied without interrupting input mode. Capabilities are written nowhere else, so while input mode lasts its gates stay those it was entered under.
+    /// Applies a completed read and, when it ends input mode, releases every tracked input, waiting for the release. The event loop uses [`App::apply_refresh`] instead and releases in the background.
     pub async fn finish_refresh(&mut self, device: &dyn Device, refresh: Refresh) {
+        if self.apply_refresh(refresh) {
+            let release = device.release_inputs().await;
+            self.input_release_finished(release);
+        }
+    }
+
+    /// Applies a completed read, returning whether it ended input mode, in which case the caller must release every tracked input and report it with [`App::input_release_finished`].
+    ///
+    /// The read's outcome goes on the device-state line, so a command being typed, a confirmation prompt or a control's outcome stays the message; the message is replaced only while it is still input mode's own entry text, which would otherwise go on claiming input mode is on.
+    ///
+    /// Input mode's key and mouse handling (releases included) is gated on the keyboard and mouse capabilities and the mouse mode it was entered under, so those must not change under it: when the read reports different values for them, or fails to read capabilities, input mode ends and every tracked input is to be released, as `F12` does. Other capabilities, such as live video becoming proven once frames arrive, are applied without interrupting input mode. Capabilities are written nowhere else, so while input mode lasts its gates stay those it was entered under.
+    pub fn apply_refresh(&mut self, refresh: Refresh) -> bool {
         self.refreshing = false;
         let mut errors = Vec::new();
         let capabilities = refresh
             .capabilities
             .map_err(|error| errors.push(error.to_string()))
             .ok();
-        let mut ended = None;
+        let mut ended = false;
         if self.control
             && input_gates(capabilities.as_ref()) != input_gates(self.capabilities.as_ref())
         {
-            self.control = false;
-            self.clear_input_state();
-            ended = Some(match device.release_inputs().await {
-                Ok(()) => {
-                    "input mode ended and inputs released, since keyboard or mouse support changed"
-                        .to_owned()
-                }
-                Err(error) => format!(
-                    "input mode ended, since keyboard or mouse support changed; input cleanup uncertain: {error}"
-                ),
+            ended = true;
+            self.leave_input_mode();
+            self.input_ended = Some(InputEnded {
+                cause: if capabilities.is_none() {
+                    "capabilities could not be read"
+                } else {
+                    "keyboard or mouse support changed"
+                },
+                release: Release::Pending,
             });
         }
         self.capabilities = capabilities;
@@ -149,23 +192,50 @@ impl App {
         } else {
             ""
         };
-        let mut note = if errors.is_empty() {
+        self.refresh_note = if errors.is_empty() {
             format!("Device state read{predates}")
         } else {
             format!("Device state read failed: {}{predates}", errors.join("; "))
         };
-        if let Some(ended) = ended {
-            note = format!("{note}; {ended}");
-        }
-        self.refresh_note = note;
+        ended
     }
 
-    /// The device-state line: a read in flight, or the outcome of the last one.
+    /// Records how the release after a refresh ended input mode went.
+    pub fn input_release_finished(&mut self, release: kvm_core::Result<()>) {
+        if let Some(ended) = &mut self.input_ended {
+            ended.release = match release {
+                Ok(()) => Release::Done,
+                Err(error) => Release::Failed(error.to_string()),
+            };
+        }
+    }
+
+    /// Whether a release requested when a refresh ended input mode is still running; input mode is not entered meanwhile, since the release would also release anything pressed after it.
+    fn input_release_pending(&self) -> bool {
+        self.input_ended
+            .as_ref()
+            .is_some_and(|ended| ended.release == Release::Pending)
+    }
+
+    /// Leaves input mode, replacing the message if it is still the entry text, so the screen never says input mode is on after it has ended.
+    fn leave_input_mode(&mut self) {
+        self.control = false;
+        self.clear_input_state();
+        if self.input_entry_message.take().as_ref() == Some(&self.message) {
+            self.message = INPUT_MODE_ENDED.into();
+        }
+    }
+
+    /// The device-state line: an end of input mode first, since the line is cut off at the width and that is what the user must see, then a read in flight or the outcome of the last one.
     fn device_state_line(&self) -> String {
-        if self.refreshing {
-            "Refreshing device state".into()
+        let state = if self.refreshing {
+            "Refreshing device state".to_owned()
         } else {
             self.refresh_note.clone()
+        };
+        match &self.input_ended {
+            Some(ended) => format!("{}; {state}", ended.line()),
+            None => state,
         }
     }
 
@@ -497,14 +567,16 @@ impl App {
                 self.message = "Control: power on|off|off-hard|reset-hard; switch PORT; gpio CHANNEL on|off; media connect|disconnect|select IMAGE".into();
             }
             KeyCode::F(12) if self.control => {
-                self.control = false;
-                self.clear_input_state();
+                self.leave_input_mode();
                 if let Err(error) = device.release_inputs().await {
                     self.message = error.to_string();
                 }
             }
             KeyCode::Char('q') if !self.control => return false,
             KeyCode::Char('r') if !self.control => self.refresh_requested = true,
+            KeyCode::Char('i') if !self.control && self.input_release_pending() => {
+                self.message = "Inputs are still being released; try again shortly".into();
+            }
             KeyCode::Char('i') if !self.control => {
                 if self.capabilities.as_ref().is_some_and(|c| {
                     c.keyboard == Capability::Supported || c.mouse == Capability::Supported
@@ -523,6 +595,8 @@ impl App {
                         self.message
                             .push_str("; terminal lacks key releases, keys are tapped");
                     }
+                    self.input_entry_message = Some(self.message.clone());
+                    self.input_ended = None;
                 } else if self.capabilities.is_none() && self.refreshing {
                     self.message = "Capabilities are still being read".into();
                 } else {
@@ -1508,7 +1582,7 @@ where
             self.0.abort();
         }
     }
-    // A device read can take up to its routes' deadlines, so it runs as its own task: it keeps making progress while the loop awaits video, input or cleanup calls (which would otherwise stall it and could turn a reply that arrived into a timeout), keys and `q` are handled meanwhile, and at most one read is in flight. Its outcome goes on the device-state line, never the message, and keyboard or mouse capabilities that change (or cannot be read) under input mode end it with inputs released (`App::finish_refresh`).
+    // A device read can take up to its routes' deadlines, so it runs as its own task: it keeps making progress while the loop awaits video, input or cleanup calls (which would otherwise stall it and could turn a reply that arrived into a timeout), keys and `q` are handled meanwhile, and at most one read is in flight. Its outcome goes on the device-state line, and keyboard or mouse capabilities that change (or cannot be read) under input mode end it (`App::apply_refresh`), with the release of tracked inputs run as its own task too, since it can take as long as a request to an unreachable device.
     let start_refresh = |app: &mut App| {
         app.refreshing = true;
         let device = shared.clone();
@@ -1518,6 +1592,14 @@ where
         }))
     };
     let mut refresh_task = Some(start_refresh(&mut app));
+    /// The release that a refresh ending input mode requires, aborted when dropped like the refresh read.
+    struct ReleaseTask(tokio::task::JoinHandle<kvm_core::Result<()>>);
+    impl Drop for ReleaseTask {
+        fn drop(&mut self) {
+            self.0.abort();
+        }
+    }
+    let mut release_task: Option<ReleaseTask> = None;
     let mut video_rx: Option<
         tokio::sync::watch::Receiver<Option<Result<kvm_core::Snapshot, String>>>,
     > = None;
@@ -1542,12 +1624,32 @@ where
             && let Some(mut task) = refresh_task.take()
         {
             match (&mut task.0).await {
-                Ok(refresh) => app.finish_refresh(device, refresh).await,
+                Ok(refresh) => {
+                    // Releasing can take as long as a request to an unreachable device, so it runs as its own task too; the release that ends the run still releases if quitting aborts this one.
+                    if app.apply_refresh(refresh) {
+                        let device = shared.clone();
+                        release_task = Some(ReleaseTask(tokio::spawn(async move {
+                            device.release_inputs().await
+                        })));
+                    }
+                }
                 Err(error) => {
                     app.refreshing = false;
                     app.refresh_note = format!("Device state read failed: {error}");
                 }
             }
+        }
+        if release_task
+            .as_ref()
+            .is_some_and(|task| task.0.is_finished())
+            && let Some(mut task) = release_task.take()
+        {
+            app.input_release_finished(match (&mut task.0).await {
+                Ok(release) => release,
+                Err(error) => Err(kvm_core::Error::Transport(format!(
+                    "release task failed: {error}"
+                ))),
+            });
         }
         if std::mem::take(&mut app.refresh_requested) {
             if refresh_task.is_some() {
@@ -1750,7 +1852,7 @@ mod tests {
             .collect()
     }
 
-    /// Gives `next` no events until the start-up refresh, which runs as its own task, has shown the capabilities it read, so a test's first key sees them. It watches the capability header, which every terminal size used here shows in full, rather than the device-state line, which a narrow footer wraps out of view; the fake devices it is used with always report capabilities.
+    /// Gives `next` no events until the start-up refresh, which runs as its own task, has shown the capabilities it read, so a test's first key sees them. It watches the capability header, which every terminal size used here shows in full, because the device-state row is cut off at narrow widths and reads the same before a read has started as while it runs; the fake devices it is used with always report capabilities.
     fn after_start_up_refresh(
         mut next: impl FnMut(&Terminal<TestBackend>) -> io::Result<Option<Event>>,
     ) -> impl FnMut(&Terminal<TestBackend>) -> io::Result<Option<Event>> {
@@ -1769,7 +1871,7 @@ mod tests {
         }
     }
 
-    /// The bound on waiting for the start-up refresh in tests, matching the timeout the other loop tests put on a whole run.
+    /// The bound on waiting for the start-up refresh in tests. The fake devices answer at once, so the wait is a few scheduler turns; the bound is far above any scheduling delay on a loaded CI runner and only turns a regression into a failure instead of a hang. A test that puts a shorter timeout on its whole run fails at that timeout first, which also fails the test.
     const START_UP_READ_BOUND: Duration = Duration::from_secs(10);
 
     #[derive(Default)]
@@ -3587,7 +3689,10 @@ mod tests {
             device.calls.lock().unwrap().last().map(String::as_str),
             Some("release")
         );
-        assert!(app.device_state_line().contains("inputs released"));
+        assert!(
+            app.device_state_line()
+                .starts_with("Input mode ended (capabilities could not be read); inputs released")
+        );
     }
 
     // Breaks if a capability that input mode is not gated on ends it: live video becomes proven once frames arrive, and ending input mode then would turn the user's next keystrokes into client commands.
@@ -3621,14 +3726,132 @@ mod tests {
         app.finish_refresh(&device, refresh).await;
         assert!(!app.control);
         assert_eq!(app.message, outcome);
-        assert!(app.device_state_line().contains("input mode ended"));
+        assert!(
+            app.device_state_line().starts_with(
+                "Input mode ended (keyboard or mouse support changed); inputs released"
+            )
+        );
+    }
+
+    fn with_mode(mode: kvm_core::MouseMode, mouse: Capability) -> Capabilities {
+        Capabilities {
+            mouse_mode: mode,
+            mouse,
+            ..fake_capabilities(Capability::Supported)
+        }
+    }
+
+    // Breaks if input mode is gated on the keyboard alone: a change of only the mouse mode, or only the mouse capability, must also end input mode and release a held button.
+    #[tokio::test]
+    async fn a_mouse_or_mouse_mode_change_alone_ends_input_mode() {
+        for changed in [
+            with_mode(kvm_core::MouseMode::Relative, Capability::Supported),
+            with_mode(kvm_core::MouseMode::Absolute, Capability::Unknown),
+        ] {
+            let device = FakeDevice::default();
+            let mut app = App::default();
+            app.refresh(&device).await;
+            app.key(&device, KeyCode::Char('i')).await;
+            app.video = Some(image::RgbImage::new(2, 4));
+            app.mouse(
+                &device,
+                MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column: 1,
+                    row: 1,
+                    modifiers: crossterm::event::KeyModifiers::NONE,
+                },
+                ratatui::layout::Rect::new(0, 0, 4, 4),
+            )
+            .await;
+            let refresh = read_with(&device, Ok(changed.clone()), 0).await;
+            app.finish_refresh(&device, refresh).await;
+            assert!(!app.control, "{changed:?}");
+            assert_eq!(
+                device.calls.lock().unwrap().last().map(String::as_str),
+                Some("release")
+            );
+        }
+    }
+
+    // Breaks if, once a failed read ends input mode, the rendered screen does not lead the device-state row with the notice or still says input mode is on.
+    #[tokio::test]
+    async fn an_ended_input_mode_is_visible_on_screen() {
+        let device = FakeDevice::default();
+        let mut app = App::default();
+        app.refresh(&device).await;
+        app.key(&device, KeyCode::Char('i')).await;
+        let entry = app.message.clone();
+        assert!(entry.contains("Input mode"));
+        let failed = Refresh {
+            capabilities: Err(kvm_core::Error::Transport("device request: timeout".into())),
+            status: Err(kvm_core::Error::Transport("device request: timeout".into())),
+            controls_before: 0,
+        };
+        app.finish_refresh(&device, failed).await;
+        let mut terminal = Terminal::new(TestBackend::new(80, 16)).unwrap();
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let row = |y: u16| -> String {
+            (1..buffer.area.width - 1)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect()
+        };
+        let state_row = row(buffer.area.height - 2);
+        assert!(
+            state_row
+                .starts_with("Input mode ended (capabilities could not be read); inputs released"),
+            "{state_row:?}"
+        );
+        let footer: String = (buffer.area.height - FOOTER_HEIGHT..buffer.area.height)
+            .map(row)
+            .collect();
+        assert!(!footer.contains(&entry), "{footer:?}");
+        assert!(footer.contains(INPUT_MODE_ENDED), "{footer:?}");
+        // F12 leaves input mode the same way, replacing only the entry message.
+        app.refresh(&device).await;
+        app.key(&device, KeyCode::Char('i')).await;
+        assert_eq!(app.device_state_line(), "Device state read");
+        app.key(&device, KeyCode::F(12)).await;
+        assert_eq!(app.message, INPUT_MODE_ENDED);
+        app.key(&device, KeyCode::Char('i')).await;
+        app.control_finished(Ok(kvm_core::ControlOutcome::Unverified));
+        let outcome = app.message.clone();
+        app.key(&device, KeyCode::F(12)).await;
+        assert_eq!(app.message, outcome);
+    }
+
+    // Breaks if input mode can be entered while the release a refresh requested is still running, which would release what is pressed next.
+    #[test]
+    fn input_mode_waits_for_a_pending_release() {
+        let mut app = App {
+            capabilities: Some(fake_capabilities(Capability::Supported)),
+            input_ended: Some(InputEnded {
+                cause: "capabilities could not be read",
+                release: Release::Pending,
+            }),
+            ..App::default()
+        };
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(app.key(&FakeDevice::default(), KeyCode::Char('i')));
+        assert!(!app.control);
+        assert!(app.message.contains("still being released"));
+        app.input_release_finished(Ok(()));
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(app.key(&FakeDevice::default(), KeyCode::Char('i')));
+        assert!(app.control);
+        assert!(app.input_ended.is_none());
     }
 
     // Breaks if a long help, message or command wraps the device-state line out of view.
     #[test]
     fn the_device_state_line_stays_visible_under_long_text() {
         let long_message = "Input mode: F12 exits; Escape is remote; terminal lacks key releases, keys are tapped; and a long transport error from the device that goes on";
-        for width in [30, 52, 80, 120] {
+        for width in [20, 30, 52, 80, 120] {
             for control in [false, true] {
                 let mut terminal = Terminal::new(TestBackend::new(width, 16)).unwrap();
                 let app = App {
@@ -3645,6 +3868,7 @@ mod tests {
                     .map(|x| buffer[(x, row)].symbol())
                     .collect();
                 let expected = "Refreshing device state";
+                // At 20 columns the inner width is narrower than the text, which is cut off at it.
                 let shown = &expected[..expected.len().min(usize::from(width) - 2)];
                 assert!(line.starts_with(shown), "width {width}: {line:?}");
             }
