@@ -352,7 +352,7 @@ struct Inputs {
     indeterminate: bool,
     // Inputs whose owed release cleanup confirmed since the last key or button request, so that request does not resend one.
     cleaned: Vec<(Held, String)>,
-    // Sequence number of the last key or button request for each input, so an owed release is skipped once a later request changed that input.
+    // Sequence number of the last key or button request sent for each tracked input, so an owed release is skipped once a later request pressed or released that input. An entry is removed when its input is released, so the map never outgrows the tracked inputs.
     last: BTreeMap<(Held, String), u64>,
     sequence: u64,
     // Set while an explicit release runs, so one interrupted by runtime shutdown is finished by the next lock holder.
@@ -415,6 +415,7 @@ impl Inputs {
             held.insert(name.to_owned());
         } else {
             held.remove(name);
+            self.last.remove(&(kind, name.to_owned()));
         }
         if !confirmed {
             uncertain.insert(name.to_owned());
@@ -1059,7 +1060,6 @@ impl Kvmd {
             let cleaned = std::mem::take(&mut inputs.cleaned);
             inputs.sequence += 1;
             let sequence = inputs.sequence;
-            inputs.last.insert((kind, name.clone()), sequence);
             // A press of an input already held owes nothing, since releasing it would undo the earlier press that holds it.
             let owes = (pressed && !inputs.held(kind).contains(&name)).then(|| Owed {
                 kind,
@@ -1069,6 +1069,7 @@ impl Kvmd {
             let result = if !pressed && cleaned.contains(&(kind, name.clone())) {
                 Ok(())
             } else {
+                inputs.last.insert((kind, name.clone()), sequence);
                 inputs.owes = owes.clone();
                 worker.send_held(&mut inputs, kind, &name, pressed).await
             };
