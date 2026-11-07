@@ -5138,10 +5138,18 @@ else:
 proc = subprocess.Popen([binary, '--exact', name, '--nocapture'], stdin=slave, stdout=slave, stderr=slave, env=env)
 data = b''
 deadline = time.monotonic() + 10
+def drain():
+    global data
+    while select.select([master], [], [], 0)[0]:
+        data += os.read(master, 65536)
 def read_until(needle, why):
     global data
     while needle not in data:
         if time.monotonic() >= deadline or proc.poll() is not None:
+            # A child that wrote the needle and exited at once can be seen to exit before its output is read, so read what it left before failing.
+            drain()
+            if needle in data:
+                break
             raise AssertionError(why + ': ' + repr(data))
         if select.select([master], [], [], 0.1)[0]:
             data += os.read(master, 65536)
