@@ -625,6 +625,63 @@ mod tests {
         server.await.unwrap();
     }
 
+    #[tokio::test]
+    async fn actor_delivers_final_frame_after_cancelled_request() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut jpeg = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new(&mut jpeg)
+            .encode(&[64, 128, 192], 1, 1, image::ExtendedColorType::Rgb8)
+            .unwrap();
+        let expected = jpeg.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (release, wait) = tokio::sync::oneshot::channel::<()>();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0; 1024];
+            socket.read(&mut request).await.unwrap();
+            socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: multipart/x-mixed-replace; boundary=frame\r\n\r\n").await.unwrap();
+            wait.await.unwrap();
+            socket
+                .write_all(b"--frame\r\nContent-Type: image/jpeg\r\n\r\n")
+                .await
+                .unwrap();
+            socket.write_all(&jpeg).await.unwrap();
+            socket.write_all(b"\r\n--frame--\r\n").await.unwrap();
+        });
+        let response = reqwest::get(format!("http://{address}/")).await.unwrap();
+        let slots = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+        let storage = slots.clone().try_acquire_owned().unwrap();
+        let (_tx, lease_state) = watch::channel(true);
+        let parser = Parser {
+            response,
+            boundary: b"--frame".to_vec(),
+            buffer: Vec::new(),
+            pending: bytes::Bytes::new(),
+            storage: Some(std::sync::Arc::new(storage)),
+            validation: None,
+            scan_offset: 0,
+            scanned: 0,
+            scan_progress: None,
+            lease: tokio::spawn(std::future::pending()),
+            lease_state,
+            timeout: Duration::from_secs(3),
+            first: true,
+            ended: false,
+        };
+        let mut stream = Mjpeg::start(parser, Duration::from_secs(3));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), stream.next_frame())
+                .await
+                .is_err()
+        );
+        release.send(()).unwrap();
+        assert_eq!(stream.next_frame().await.unwrap().unwrap().jpeg, expected);
+        assert!(stream.next_frame().await.unwrap().is_none());
+        assert_eq!(slots.available_permits(), 1);
+        server.await.unwrap();
+    }
+
     struct BlockedSink;
     impl futures_util::Sink<Message> for BlockedSink {
         type Error = ();
