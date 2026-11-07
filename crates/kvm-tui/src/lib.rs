@@ -764,24 +764,6 @@ fn video_mouse_coordinates(column: u16, row: u16, viewport: &VideoViewport) -> O
     ))
 }
 
-fn mouse_coordinates(column: u16, row: u16, area: ratatui::layout::Rect) -> Option<(i16, i16)> {
-    let width = area.width;
-    let height = area.height;
-    if width < 2 || height < 2 {
-        return None;
-    }
-    let x = column.checked_sub(area.x)?;
-    let y = row.checked_sub(area.y)?;
-    if x >= width || y >= height {
-        return None;
-    }
-    let scale = |position: u16, size: u16| -> i16 {
-        (i32::from(i16::MIN) + i32::from(position) * (i32::from(u16::MAX)) / i32::from(size - 1))
-            as i16
-    };
-    Some((scale(x, width), scale(y, height)))
-}
-
 fn key_name(code: KeyCode) -> Option<String> {
     match code {
         KeyCode::Char(c) if c.is_ascii_alphabetic() => {
@@ -1326,15 +1308,14 @@ where
                     .split(frame.area());
                     if let Some(area) =
                         video_viewport(areas[1], image.width(), image.height(), app.cell_size)
+                        && let Some(protocol) = &mut image_protocol
                     {
-                        if let Some(protocol) = &mut image_protocol {
-                            frame.render_stateful_widget(
-                                ratatui_image::StatefulImage::default()
-                                    .resize(ratatui_image::Resize::Scale(None)),
-                                area.cells,
-                                protocol,
-                            );
-                        }
+                        frame.render_stateful_widget(
+                            ratatui_image::StatefulImage::default()
+                                .resize(ratatui_image::Resize::Scale(None)),
+                            area.cells,
+                            protocol,
+                        );
                     }
                 }
             })
@@ -3333,15 +3314,6 @@ finally:
             };
             assert_eq!(*calls.borrow(), expected);
         }
-    }
-
-    #[test]
-    fn maps_mouse_to_signed_device_coordinates() {
-        let area = ratatui::layout::Rect::new(11, 6, 10, 5);
-        assert_eq!(mouse_coordinates(11, 6, area), Some((i16::MIN, i16::MIN)));
-        assert_eq!(mouse_coordinates(20, 10, area), Some((i16::MAX, i16::MAX)));
-        assert_eq!(mouse_coordinates(10, 5, area), None);
-        assert_eq!(mouse_coordinates(21, 10, area), None);
     }
 
     #[test]
