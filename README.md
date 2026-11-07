@@ -65,7 +65,7 @@ Library callers should explicitly await `release_inputs()` when ending input and
 
 ### Errors
 
-Every fallible call returns `kvm_core::Error`, and the enum's documentation (`cargo doc -p kvm-core --open`) says when each variant occurs and what a caller should do. The variants divide by whether the device may have acted: `Authentication`, `Unsupported`, `Transport`, `Http` and `InvalidResponse` returned by an input or control method mean that call submitted no input or control request, while `AmbiguousInput` and `AmbiguousControl` mean one was, or may have been, submitted with an unknown effect. Never replay an ambiguous operation automatically; observe the device and the controlled host first. An acknowledged control request whose effect could not be observed is not an error but `Ok(ControlOutcome::Unverified)`.
+Every fallible call returns `kvm_core::Error`. The enum's documentation (`cargo doc -p kvm-core --open` in a checkout of `main`) says when each variant occurs and what a caller should do; it was added after `v0.1.0` and ships with the next release. The variants divide by whether the device may have acted: `Authentication`, `Unsupported`, `Transport`, `Http` and `InvalidResponse` returned by an input or control method mean the requested input or control was not submitted (releases owed to earlier interrupted presses may have been sent first), while `AmbiguousInput` and `AmbiguousControl` mean it was, or may have been, submitted with an unknown effect. `AmbiguousInput` from `login` or `complete_approval` is different: it refuses to change authentication while inputs are held and sends nothing. Never replay an ambiguous operation automatically; observe the device and the controlled host first. An acknowledged control request whose effect could not be observed is not an error but `Ok(ControlOutcome::Unverified)`.
 
 ### Using the crates from another project
 
@@ -77,9 +77,10 @@ kvm-core = { git = "https://github.com/Mearman/kvm-control", tag = "v0.1.0" }
 kvm-kvmd = { git = "https://github.com/Mearman/kvm-control", tag = "v0.1.0" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 url = "2"
+zeroize = "1"
 ```
 
-To pin by commit, replace `tag = "v0.1.0"` with `rev = "a175eea5286fd495d429eb78c6ac0116788b1b42"`, the commit `v0.1.0` points to, in both lines. `Cargo.lock` records the resolved commit either way; change the reference in `Cargo.toml` to move to another release. The crates use the 2024 edition and declare no minimum supported Rust version, so build them with a current stable toolchain. A project that only consumes or implements the `Device` contract, as [`examples/in-process`](examples/in-process) does, needs `kvm-core` alone, plus `async-trait` to implement the traits.
+To pin by commit, replace `tag = "v0.1.0"` with `rev = "a175eea5286fd495d429eb78c6ac0116788b1b42"`, the commit `v0.1.0` points to, in both lines. `Cargo.lock` records the resolved commit either way; change the reference in `Cargo.toml` to move to another release. The crates use the 2024 edition and declare no minimum supported Rust version, so build them with a current stable toolchain. A project that only consumes or implements the `Device` contract, as [`examples/in-process`](examples/in-process) does, needs `kvm-core` and not `kvm-kvmd`; its [manifest](examples/in-process/Cargo.toml) lists the other crates that implementing the traits needs.
 
 A minimal consumer of a real device runs the adapter in its own process, like `examples/in-process`, but with `Kvmd` in place of the synthetic device. It reads the password from redirected standard input; the key press types the letter `a` on the controlled host.
 
@@ -89,11 +90,13 @@ use std::{io::BufRead, time::Duration};
 use kvm_core::{Capability, Device, DeviceProfile};
 use kvm_kvmd::{Config, Kvmd, LoginState};
 use url::Url;
+use zeroize::Zeroizing;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Read the password from redirected standard input, never from arguments or the environment.
-    let mut password = String::new();
+    // Zeroizing clears the caller's copy when it is dropped.
+    let mut password = Zeroizing::new(String::new());
     std::io::stdin().lock().read_line(&mut password)?;
     let adapter = Kvmd::new(Config {
         endpoint: Url::parse("https://kvm.example.com/")?,
@@ -123,11 +126,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-**Runtime and shared state.** Call the adapter from inside a Tokio runtime: input requests and JPEG validation run as tasks on the runtime that made the call, and dropping the adapter schedules its input cleanup on the runtime that last took the input lock, so keep that runtime driven until they finish. `Kvmd` is `Send` and `Sync` but not `Clone`; share one instance between tasks behind an `Arc` (an `Arc<Kvmd>` coerces to `Arc<dyn Device>`). The instance owns the authenticated session, the record of held keys and buttons and whether an ambiguous outcome has made input indeterminate, so a second instance for the same device shares none of that and cannot release what the first pressed. Input calls on one instance run one at a time, in the order they request the input lock. Snapshot and live-video capabilities stay `Unknown` until that instance has received a valid JPEG. The adapter limits how many snapshots and video streams it holds at once, and a call beyond the limit returns `Error::Transport`.
+**Runtime and shared state.** Call the adapter from inside a Tokio runtime: input requests and JPEG validation run as tasks on the runtime that made the call, and dropping the adapter schedules its input cleanup on the runtime that last took the input lock, so keep that runtime driven until they finish. `Kvmd` is `Send` and `Sync` but not `Clone`; share one instance between tasks behind an `Arc` (an `Arc<Kvmd>` coerces to `Arc<dyn Device>`). The instance owns the authenticated session, the record of held keys and buttons and whether an ambiguous outcome has made input indeterminate, so a second instance for the same device shares none of that and cannot release what the first pressed. Input calls on one instance run one at a time, in the order they request the input lock. The snapshot capability stays `Unknown` until that instance's `snapshot()` has returned a valid JPEG, and live video until one of its video streams has delivered a frame. `login` discards the instance's current session before sending its request, so a failed login leaves it unauthenticated. The adapter bounds how many snapshots and how much video stream storage it holds at once, process-wide: every `Kvmd` instance in the process shares those bounds, and a call beyond them returns `Error::Transport`.
 
 **TLS.** `Config::endpoint` must be an HTTPS URL without credentials, a query or a fragment; `Kvmd::new` rejects anything else with `Error::InvalidResponse`. Certificates are verified against the Mozilla root set the crates bundle through `webpki-roots`, not the operating system's trust store, plus the PEM certificate in `trusted_ca_pem`, which is the way to trust a device's own CA. `insecure_tls: true` disables verification entirely, including the host name check, and exposes the session and credentials to anyone who can intercept the connection. The adapter speaks HTTP/1.1, follows no redirects and retries nothing.
 
-**Secrets.** `Config` holds no credentials. Pass them to `login`, `login_with_totp`, `Kvmd::with_header_auth` or `Kvmd::with_basic_auth`, read from a prompt, a pipe or a secret store, never from command-line arguments, environment variables, the endpoint URL or a configuration file. The adapter keeps its copy of the cookie-login password and code in a buffer that is zeroed when dropped, though copies made while encoding the request are not, and marks header credentials sensitive so they are not formatted in debug output; the caller's own copies are the caller's to clear. A TOTP code is valid for one login, so obtain a fresh one each time. See [security](SECURITY.md).
+**Secrets.** `Config` holds no credentials. Pass them to `login`, `login_with_totp`, `Kvmd::with_header_auth` or `Kvmd::with_basic_auth`, read from a prompt, a pipe or a secret store, never from command-line arguments, environment variables, the endpoint URL or a configuration file. The adapter keeps its copy of the cookie-login password and code in a buffer that is zeroed when dropped, though copies made while encoding the request are not, and marks header credentials sensitive so they are not formatted in debug output; the caller's own copies are the caller's to clear, as the example does with `zeroize::Zeroizing`. A TOTP code is valid for one login, so obtain a fresh one each time. See [security](SECURITY.md).
 
 **API stability.** There is no API stability guarantee, and any release may change the public API. Release versions come from commit messages: below 1.0.0 a commit marked as breaking bumps the minor version and every other releasing commit the patch version (see [compatibility](COMPATIBILITY.md)), but nothing compares the public API between releases, so a breaking change is only recognised when its commit says so. Pin an exact tag or commit, and read the release notes and the crate documentation before moving to another.
 
