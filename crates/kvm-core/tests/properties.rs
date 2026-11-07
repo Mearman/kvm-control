@@ -1,10 +1,11 @@
 //! Property tests for the contract types that cross process boundaries: their serialised forms and the error messages that callers and logs receive.
 
 use kvm_core::{
-    AtxStatus, Capabilities, Capability, Control, DeviceProfile, DeviceStatus, Error, GpioInput,
-    GpioOutput, GpioStatus, HidOutputs, HidStatus, JigglerStatus, KernelInfo, KeyboardLeds,
-    KeyboardStatus, Limits, MediaDrive, MediaImage, MediaStatus, MouseMode, MouseStatus,
-    PlatformInfo, PowerAction, Reported, Resolution, StoragePartition, StreamerFeatures,
+    AtxStatus, AuthScheme, CallerIdentity, Capabilities, Capability, Control, Credentials,
+    DeviceId, DeviceIdentity, DeviceProfile, DeviceStatus, Endpoint, Error, GpioInput, GpioOutput,
+    GpioStatus, HidOutputs, HidStatus, JigglerStatus, KernelInfo, KeyboardLeds, KeyboardStatus,
+    Limits, LoginState, MediaDrive, MediaImage, MediaStatus, MouseMode, MouseStatus, PlatformInfo,
+    PowerAction, Reported, Resolution, Secret, ServerTrust, StoragePartition, StreamerFeatures,
     StreamerStatus, SwitchPort, SwitchStatus, SystemInfo, VideoSource, escape_json_for_terminal,
     is_terminal_unsafe,
 };
@@ -362,6 +363,55 @@ fn control() -> impl Strategy<Value = Control> {
     ]
 }
 
+fn profile() -> impl Strategy<Value = DeviceProfile> {
+    proptest::sample::select(vec![DeviceProfile::PiKvm, DeviceProfile::GlKvm])
+}
+
+fn endpoint() -> BoxedStrategy<Endpoint> {
+    (
+        option::of(any::<String>()),
+        "[a-z]{1,12}",
+        option::of(1_u16..),
+        "(/[a-z0-9]{1,8}){0,3}/?",
+        profile(),
+        proptest::sample::select(vec![
+            AuthScheme::Session,
+            AuthScheme::Header,
+            AuthScheme::Basic,
+        ]),
+        prop_oneof![
+            option::of(any::<String>())
+                .prop_map(|additional_ca_pem| ServerTrust::Verified { additional_ca_pem }),
+            Just(ServerTrust::Disabled),
+        ],
+        any::<(u64, u32)>(),
+    )
+        .prop_map(
+            |(label, host, port, path, profile, auth, trust, (secs, nanos))| Endpoint {
+                label,
+                address: url::Url::parse(&match port {
+                    Some(port) => format!("https://{host}.invalid:{port}{path}"),
+                    None => format!("https://{host}.invalid{path}"),
+                })
+                .unwrap(),
+                profile,
+                auth,
+                trust,
+                timeout: std::time::Duration::new(secs, nanos % 1_000_000_000),
+            },
+        )
+        .boxed()
+}
+
+fn login_state() -> BoxedStrategy<LoginState> {
+    prop_oneof![
+        Just(LoginState::Authenticated),
+        option::of(any::<u64>()).prop_map(|expires_in| LoginState::ApprovalPending { expires_in }),
+        Just(LoginState::Unverified),
+    ]
+    .boxed()
+}
+
 proptest! {
     // Breaks if a field is renamed or skipped on one side of the round trip, or if two capability states share a spelling.
     #[test]
@@ -496,5 +546,97 @@ proptest! {
         let encoded = serde_json::to_string(&left).unwrap();
         prop_assert_eq!(serde_json::from_str::<DeviceProfile>(&encoded).unwrap(), left);
         prop_assert_eq!(encoded == serde_json::to_string(&right).unwrap(), left == right);
+    }
+
+    // Breaks if an endpoint field is renamed or skipped on one side of the round trip, so stored configuration would reconnect somewhere else or with another profile, scheme or trust policy.
+    #[test]
+    fn endpoints_survive_a_round_trip_through_json(endpoint in endpoint()) {
+        let encoded = serde_json::to_value(&endpoint).unwrap();
+        let decoded: Endpoint = serde_json::from_value(encoded.clone()).unwrap();
+        prop_assert_eq!(serde_json::to_value(&decoded).unwrap(), encoded);
+        prop_assert_eq!(decoded, endpoint);
+    }
+
+    // Breaks if a login state decodes as another state or loses whether its approval expiry was reported.
+    #[test]
+    fn login_states_survive_a_round_trip_through_json(state in login_state()) {
+        let encoded = serde_json::to_value(state).unwrap();
+        prop_assert_eq!(serde_json::from_value::<LoginState>(encoded).unwrap(), state);
+    }
+
+    // Breaks if identity keeps a value the device did not report, takes the profile or label from anywhere but the endpoint, or does not survive serialisation.
+    #[test]
+    fn identity_separates_configuration_from_device_claims(
+        endpoint in endpoint(),
+        verified in any::<bool>(),
+        status in device_status(),
+    ) {
+        let identity = DeviceIdentity::observe(&endpoint, verified, &status);
+        prop_assert_eq!(&identity.label, &endpoint.label);
+        prop_assert_eq!(&identity.address, &endpoint.address);
+        prop_assert_eq!(identity.profile, endpoint.profile);
+        prop_assert_eq!(identity.address_verified, verified);
+        let (serial, host) = match &status.info {
+            Reported::Supported(info) => (
+                match &info.platform {
+                    Reported::Supported(platform) => platform.serial.clone(),
+                    Reported::Unsupported => Reported::Unsupported,
+                    Reported::Unknown => Reported::Unknown,
+                },
+                info.host.clone(),
+            ),
+            Reported::Unsupported => (Reported::Unsupported, Reported::Unsupported),
+            Reported::Unknown => (Reported::Unknown, Reported::Unknown),
+        };
+        prop_assert_eq!(&identity.serial, &serial);
+        prop_assert_eq!(&identity.host, &host);
+        let encoded = serde_json::to_value(&identity).unwrap();
+        prop_assert_eq!(serde_json::from_value::<DeviceIdentity>(encoded).unwrap(), identity.clone());
+        let id = identity.id();
+        let encoded = serde_json::to_value(&id).unwrap();
+        prop_assert_eq!(serde_json::from_value::<DeviceId>(encoded).unwrap(), id);
+    }
+
+    // Breaks if the identifier changes with anything but the endpoint name, the profile or the reported serial, or if two devices that differ in one of those share it.
+    #[test]
+    fn device_ids_follow_endpoint_name_profile_and_serial(
+        endpoint in endpoint(),
+        other in endpoint(),
+        status in device_status(),
+        other_status in device_status(),
+    ) {
+        let first = DeviceIdentity::observe(&endpoint, true, &status);
+        let second = DeviceIdentity::observe(&other, false, &other_status);
+        let name = |identity: &DeviceIdentity| identity.label.clone().unwrap_or_else(|| identity.address.to_string());
+        prop_assert_eq!(first.id().endpoint, name(&first));
+        let same = name(&first) == name(&second) && first.profile == second.profile && first.serial == second.serial;
+        prop_assert_eq!(first.id() == second.id(), same);
+        // The host name and the address verification are not part of the identifier.
+        let renamed = DeviceIdentity { host: Reported::Unknown, address_verified: !first.address_verified, ..first.clone() };
+        prop_assert_eq!(renamed.id(), first.id());
+    }
+
+    // Breaks if a secret reaches debug output, which is what logs and panic messages print.
+    #[test]
+    fn secrets_are_redacted_from_debug_output(
+        username in "[a-z]{1,8}",
+        password in "pw-[A-Za-z0-9]{8,32}",
+        code in proptest::option::of("[0-9]{6}"),
+    ) {
+        let secret = Secret::from(password.as_str());
+        prop_assert_eq!(secret.expose(), password.as_str());
+        prop_assert_eq!(format!("{secret:?}"), "Secret(<redacted>)");
+        let mut credentials = Credentials::new(username.clone(), password.clone());
+        if let Some(code) = &code {
+            credentials = credentials.with_totp(code.as_str());
+        }
+        let printed = format!("{credentials:?}");
+        prop_assert!(!printed.contains(&password), "{}", printed);
+        if let Some(code) = &code {
+            prop_assert!(!printed.contains(code.as_str()), "{}", printed);
+        }
+        prop_assert!(printed.contains(&username), "{}", printed);
+        prop_assert_eq!(&credentials.caller, &CallerIdentity { username });
+        prop_assert_eq!(credentials.totp.is_some(), code.is_some());
     }
 }

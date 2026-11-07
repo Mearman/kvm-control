@@ -13,7 +13,7 @@ use crate::{Capability, MouseMode};
 /// A status value as observed from the device.
 ///
 /// Serialised with a `support` tag (`Supported`, `Unsupported` or `Unknown`) and, for `Supported`, the value under `value`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(tag = "support", content = "value")]
 pub enum Reported<T> {
     /// The device reported this value.
