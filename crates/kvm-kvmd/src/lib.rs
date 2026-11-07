@@ -313,7 +313,7 @@ impl reqwest::cookie::CookieStore for SessionCookies {
 
 /// A KVMD connection with an explicitly authenticated session.
 ///
-/// Input requests already submitted continue after caller cancellation. A key or button request dropped before its outcome is collected, including outside a runtime, owes the release of its own press and nothing else: if the outcome was not yet delivered the request sends that release before giving up the input lock, and otherwise the release is queued for the next holder of the input lock and scheduled on the captured runtime. Every later input, movement or explicit release sends owed releases before its own request, including one already waiting for the lock, so cleanup never interleaves with later inputs. An owed release is skipped once a later request has pressed or released the same input, so an input whose request reported success is never undone by cleanup. A completed request does not hold the input lock while its outcome waits to be collected, and a release of an input that cleanup has just confirmed released is not sent again unless an earlier press of it was ambiguous. Ambiguous outcomes permanently render cleanup indeterminate because a server may apply a timed-out request later. A request interrupted by runtime shutdown counts as ambiguous: an interrupted press owes its release, and an interrupted explicit release is finished by the next lock holder. An ambiguous release is not replayed automatically. Dropping the last owner attempts to release tracked inputs on the captured runtime; process termination, or a runtime shutdown with no later holder of the input lock, provides no cleanup guarantee.
+/// Input requests already submitted continue after caller cancellation. A key or button press dropped before its outcome is collected, including outside a runtime, owes the release of its own input and nothing else, and owes nothing when the input was already held before it was sent, since an earlier press holds it: if the outcome was not yet delivered the request sends that release before giving up the input lock, and otherwise the release is queued for the next holder of the input lock and scheduled on the runtime the request ran on. Every later input, movement, explicit release, login or approval sends owed releases before its own work, including one already waiting for the lock, so cleanup never interleaves with later inputs. An owed release is skipped once a later request has pressed or released the same input, so an input whose request reported success is never undone by cleanup. A completed request does not hold the input lock while its outcome waits to be collected, and a release of an input that cleanup has just confirmed released is not sent again unless an earlier press of it was ambiguous or a login or approval came between. Ambiguous outcomes permanently render cleanup indeterminate because a server may apply a timed-out request later. A request interrupted by runtime shutdown counts as ambiguous: an interrupted press owes its release as above, and an interrupted explicit release is finished by the next lock holder. An ambiguous release is not replayed automatically. Dropping the last owner attempts to release tracked inputs on the current runtime, or else on the runtime that last took the input lock; process termination, or a runtime shutdown with no later holder of the input lock, provides no cleanup guarantee.
 ///
 /// Cookies are accepted only from login or approval responses. Later `Set-Cookie` headers, including rotation and expiry updates, are ignored. The inspected [PiKVM](https://github.com/pikvm/kvmd/blob/fcb903eb3be70d8eee4aee99e5fcc1c743e3ccef/kvmd/apps/kvmd/api/auth.py) and [GLKVM](https://github.com/gl-inet/glkvm/blob/3e8dd23c4bd638a4650433664cc3b0f3b4d29395/kvmd/apps/kvmd/api/auth.py) revisions issue authentication cookies on login, and GLKVM also issues them on approval. Other firmware requiring cookie rotation is not supported. Server-side expiry or revocation can return an authentication error; call `login` again with fresh credentials and complete any approval. Consequential and input requests are never automatically replayed, and ambiguous outcomes require observation before a caller decides what to do.
 pub struct Kvmd {
@@ -714,6 +714,7 @@ impl Kvmd {
             ));
         }
         let mut inputs = self.inputs.lock().await;
+        self.settle_owed(&mut inputs).await;
         if !inputs.keys.is_empty() || !inputs.buttons.is_empty() {
             return Err(Error::AmbiguousInput(
                 "release tracked inputs before changing authentication".into(),
@@ -782,6 +783,7 @@ impl Kvmd {
             ));
         }
         let mut inputs = self.inputs.lock().await;
+        self.settle_owed(&mut inputs).await;
         if !inputs.keys.is_empty() || !inputs.buttons.is_empty() {
             return Err(Error::AmbiguousInput(
                 "release tracked inputs before changing authentication".into(),
@@ -1410,9 +1412,12 @@ impl Device for Kvmd {
         let mut inputs = self.inputs.clone().lock_owned().await;
         self.capture_input_runtime();
         let worker = self.input_worker();
-        tokio::spawn(async move { worker.release_all(&mut inputs).await })
-            .await
-            .map_err(|_| Error::AmbiguousInput("release task failed".into()))?
+        tokio::spawn(async move {
+            worker.settle_owed(&mut inputs).await;
+            worker.release_all(&mut inputs).await
+        })
+        .await
+        .map_err(|_| Error::AmbiguousInput("release task failed".into()))?
     }
 }
 

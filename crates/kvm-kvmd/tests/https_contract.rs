@@ -262,6 +262,10 @@ async fn fixture() -> (Url, Vec<u8>, Calls, tokio::task::JoinHandle<()>) {
         .route("/gltotp/api/auth/check", get(status))
         .route("/gl/api/auth/two_step_complete", post(gl_complete))
         .route("/gl/api/auth/check", get(status))
+        .route("/glgated/api/auth/login", post(gl_login))
+        .route("/glgated/api/auth/two_step_complete", post(gl_complete))
+        .route("/glgated/api/auth/check", get(status))
+        .route("/glgated/api/hid/events/send_key", post(gated_input))
         .route("/bigapproval/api/auth/login", post(gl_login))
         .route(
             "/bigapproval/api/auth/two_step_complete",
@@ -1392,6 +1396,64 @@ fn owner_dropped_in_a_runtime_releases_inputs_there() {
     assert_eq!(
         input_events(&calls),
         ["key=KeyA&state=true", "key=KeyA&state=false"]
+    );
+    server.abort();
+}
+
+// Pinned to the current-thread runtime: the scheduled cleanup task cannot run before the login takes the input lock, so only the login's own settlement can release the press.
+#[tokio::test(flavor = "current_thread")]
+async fn login_sends_owed_releases_before_checking_tracked_inputs() {
+    let (mut endpoint, ca, calls, server) = fixture().await;
+    endpoint.set_path("/gated/");
+    let device = client(endpoint, Some(ca));
+    let woken = Arc::new(Woken(tokio::sync::Notify::new()));
+    let mut press = Box::pin(device.key("KeyA", true));
+    poll_once(press.as_mut(), &woken);
+    arrival(&calls).await;
+    calls.4.notify_one();
+    within("the outcome to be delivered", woken.0.notified()).await;
+    drop(press);
+    drive(&calls, device.login("test-user", "test-password"))
+        .await
+        .unwrap();
+    assert_eq!(
+        input_events(&calls),
+        ["key=KeyA&state=true", "key=KeyA&state=false"]
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn release_after_cleanup_is_sent_again_after_approval() {
+    let (mut endpoint, ca, calls, server) = fixture().await;
+    endpoint.set_path("/glgated/");
+    let device = Arc::new(profile_client(endpoint, Some(ca), DeviceProfile::GlKvm));
+    assert!(matches!(
+        device.login("test-user", "test-password").await.unwrap(),
+        LoginState::ApprovalPending { .. }
+    ));
+    let sender = device.clone();
+    let press = tokio::spawn(async move { sender.key("KeyA", true).await });
+    arrival(&calls).await;
+    press.abort();
+    assert!(press.await.unwrap_err().is_cancelled());
+    calls.4.notify_one();
+    // The abandoned press releases its own input, then approval starts a new session in which a release is sent again.
+    drive(&calls, async {
+        assert_eq!(
+            device.complete_approval().await.unwrap(),
+            LoginState::Authenticated
+        );
+        device.key("KeyA", false).await.unwrap();
+    })
+    .await;
+    assert_eq!(
+        input_events(&calls),
+        [
+            "key=KeyA&state=true",
+            "key=KeyA&state=false",
+            "key=KeyA&state=false"
+        ]
     );
     server.abort();
 }
