@@ -26,6 +26,7 @@ pub struct App {
     pub status: Option<DeviceStatus>,
     pub capabilities: Option<Capabilities>,
     pub message: String,
+    video_message: String,
     pub control: bool,
     enhanced_keyboard: bool,
     cell_size: (u16, u16),
@@ -45,6 +46,7 @@ impl Default for App {
             status: None,
             capabilities: None,
             message: String::new(),
+            video_message: String::new(),
             control: false,
             enhanced_keyboard: false,
             cell_size: (1, 2),
@@ -60,6 +62,10 @@ impl Default for App {
 }
 
 impl App {
+    fn video_arrived(&mut self) {
+        self.video_message = "Live video".into();
+    }
+
     fn clear_input_state(&mut self) {
         self.held_modifiers.clear();
         self.synthetic_modifiers.clear();
@@ -870,7 +876,13 @@ pub fn draw(frame: &mut Frame<'_>, app: &App) {
         areas[0],
     );
     frame.render_widget(
-        Block::default().title("Live video").borders(Borders::ALL),
+        Block::default()
+            .title(if app.video_message.is_empty() {
+                "Live video"
+            } else {
+                &app.video_message
+            })
+            .borders(Borders::ALL),
         areas[1],
     );
     if let Some(image) = &app.video {
@@ -1268,12 +1280,13 @@ where
             app.video = None;
             app.control = false;
             app.clear_input_state();
-            app.message = match item {
+            app.video_message = match item {
                 Some(Err(error)) => error,
                 _ => "Video stream closed".into(),
             };
             if let Err(error) = device.release_inputs().await {
-                app.message = format!("{}; input cleanup uncertain: {error}", app.message);
+                app.video_message =
+                    format!("{}; input cleanup uncertain: {error}", app.video_message);
             }
             drop(stream.take());
             video_rx = None;
@@ -1294,17 +1307,17 @@ where
                                 image::DynamicImage::ImageRgb8(image.clone()),
                             ));
                             app.video = Some(image);
-                            app.message = "Live video (character-cell fallback)".into();
+                            app.video_arrived();
                         }
                         Err(error) => {
                             app.video = None;
-                            app.message = format!("Invalid video frame: {error}");
+                            app.video_message = format!("Invalid video frame: {error}");
                             drop(stream.take());
                         }
                     },
                     Err(error) => {
                         app.video = None;
-                        app.message = error;
+                        app.video_message = error;
                         drop(stream.take());
                     }
                 }
@@ -1385,11 +1398,11 @@ where
                                         }
                                     }
                                 }))));
-                                app.message = "Waiting for video".into();
+                                app.video_message = "Waiting for video".into();
                             }
                             Err(error) => {
                                 app.video = None;
-                                app.message = error.to_string();
+                                app.video_message = error.to_string();
                             }
                         }
                     } else if !app.key_event(device, key).await {
@@ -2925,6 +2938,42 @@ mod tests {
         assert!(app.control);
         app.key(&device, KeyCode::Char('a')).await;
         assert!(device.calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn video_frames_preserve_confirmation_and_outcome() {
+        let device = FakeDevice::default();
+        let mut app = App::default();
+        app.refresh(&device).await;
+        app.key(&device, KeyCode::Char(':')).await;
+        for c in "power off".chars() {
+            app.key(&device, KeyCode::Char(c)).await;
+        }
+        app.key(&device, KeyCode::Enter).await;
+        app.video_arrived();
+        let mut terminal = Terminal::new(TestBackend::new(100, 20)).unwrap();
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        let text = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<String>();
+        assert!(text.contains("Confirm Power(Off)"));
+        assert!(app.pending.is_some());
+        app.key(&device, KeyCode::Char('y')).await;
+        app.message = "Request acknowledged; outcome not verified".into();
+        app.video_arrived();
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        let text = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<String>();
+        assert!(text.contains("Request acknowledged; outcome not verified"));
     }
 
     #[tokio::test]
