@@ -10,9 +10,13 @@ use tokio::{
 use url::Url;
 
 fn jpeg() -> Vec<u8> {
+    jpeg_colour([64, 128, 192])
+}
+
+fn jpeg_colour(colour: [u8; 3]) -> Vec<u8> {
     let mut bytes = Vec::new();
     image::codecs::jpeg::JpegEncoder::new(&mut bytes)
-        .encode(&[64, 128, 192], 1, 1, image::ExtendedColorType::Rgb8)
+        .encode(&colour, 1, 1, image::ExtendedColorType::Rgb8)
         .unwrap();
     bytes
 }
@@ -961,7 +965,7 @@ async fn coalesced_http_response_delivers_multiple_frames() {
             b"HTTP/1.1 200 OK\r\nContent-Type: multipart/x-mixed-replace; boundary=frame\r\n\r\n"
                 .to_vec();
         response.extend(part(&jpeg(), true, false));
-        response.extend(part(&jpeg(), true, true));
+        response.extend(part(&jpeg_colour([200, 20, 50]), true, true));
         http.write_all(&response).await.unwrap();
         watcher.await.unwrap();
     });
@@ -991,7 +995,10 @@ async fn coalesced_http_response_delivers_multiple_frames() {
     };
     let mut video = device.video().await.unwrap();
     assert_eq!(video.next_frame().await.unwrap().unwrap().jpeg, jpeg());
-    assert_eq!(video.next_frame().await.unwrap().unwrap().jpeg, jpeg());
+    assert_eq!(
+        video.next_frame().await.unwrap().unwrap().jpeg,
+        jpeg_colour([200, 20, 50])
+    );
     assert!(video.next_frame().await.unwrap().is_none());
     tokio::time::timeout(Duration::from_secs(3), server)
         .await
@@ -1151,12 +1158,15 @@ async fn explicit_video_reopen_after_complete_or_interrupted_stream() {
 #[tokio::test]
 async fn continuous_frames_and_drop_close_lease() {
     let mut body = part(&jpeg(), true, false);
-    body.extend(part(&jpeg(), false, false));
+    body.extend(part(&jpeg_colour([200, 20, 50]), false, false));
     body.extend_from_slice(b"--frame\r\n");
     let (device, closed, server) = device(body).await;
     let mut video = device.video().await.unwrap();
     assert_eq!(video.next_frame().await.unwrap().unwrap().jpeg, jpeg());
-    assert_eq!(video.next_frame().await.unwrap().unwrap().jpeg, jpeg());
+    assert_eq!(
+        video.next_frame().await.unwrap().unwrap().jpeg,
+        jpeg_colour([200, 20, 50])
+    );
     drop(video);
     tokio::time::timeout(Duration::from_secs(3), closed.notified())
         .await

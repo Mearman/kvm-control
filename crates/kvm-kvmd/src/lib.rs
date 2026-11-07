@@ -30,6 +30,36 @@ use url::Url;
 const MAX_IMAGE_DIMENSION: u32 = 8192;
 const MAX_IMAGE_PIXELS: u64 = 32 * 1024 * 1024;
 const MAX_DECODED_BYTES: u64 = MAX_IMAGE_PIXELS * 4;
+// zune-jpeg may allocate 64 i16 coefficients per 8x8 block, for four components with sampling factors up to 4x4, even for non-interleaved progressive scans.
+const MAX_PROGRESSIVE_COEFFICIENT_BYTES: u64 = MAX_DECODED_BYTES;
+const MAX_JPEG_COMPONENTS: u64 = 4;
+const MAX_SAMPLING_AREA: u64 = 4 * 4;
+const MAX_JPEG_VALIDATIONS: usize = 2;
+
+fn jpeg_dimensions_safe(width: u32, height: u32) -> bool {
+    let blocks = u64::from(width).div_ceil(8) * u64::from(height).div_ceil(8);
+    let coefficients =
+        blocks * 64 * size_of::<i16>() as u64 * MAX_JPEG_COMPONENTS * MAX_SAMPLING_AREA;
+    u64::from(width) * u64::from(height) <= MAX_IMAGE_PIXELS
+        && coefficients <= MAX_PROGRESSIVE_COEFFICIENT_BYTES
+}
+
+async fn validate_jpeg_async(bytes: Vec<u8>) -> Result<Vec<u8>> {
+    static SLOTS: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> = std::sync::OnceLock::new();
+    let permit = SLOTS
+        .get_or_init(|| Arc::new(tokio::sync::Semaphore::new(MAX_JPEG_VALIDATIONS)))
+        .clone()
+        .acquire_owned()
+        .await
+        .map_err(|_| Error::Transport("JPEG validation unavailable".into()))?;
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        validate_jpeg(&bytes)?;
+        Ok(bytes)
+    })
+    .await
+    .map_err(|_| Error::Transport("JPEG validation task failed".into()))?
+}
 
 fn validate_jpeg(bytes: &[u8]) -> Result<()> {
     use image::ImageDecoder;
@@ -40,7 +70,7 @@ fn validate_jpeg(bytes: &[u8]) -> Result<()> {
     let mut decoder = image::codecs::jpeg::JpegDecoder::new(std::io::Cursor::new(bytes))
         .map_err(|_| invalid())?;
     let (width, height) = decoder.dimensions();
-    if u64::from(width) * u64::from(height) > MAX_IMAGE_PIXELS {
+    if !jpeg_dimensions_safe(width, height) {
         return Err(invalid());
     }
     let mut limits = image::Limits::default();
@@ -673,9 +703,9 @@ impl Device for Kvmd {
             }
             bytes.extend_from_slice(&chunk);
         }
-        validate_jpeg(&bytes)?;
+        let jpeg = validate_jpeg_async(bytes).await?;
         self.snapshot_proven.store(true, Ordering::Release);
-        Ok(Snapshot { jpeg: bytes })
+        Ok(Snapshot { jpeg })
     }
 
     async fn key(&self, key: &str, pressed: bool) -> Result<()> {
@@ -1021,6 +1051,16 @@ impl Drop for Kvmd {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn jpeg_coefficient_budget_bounds_padded_blocks() {
+        let bytes_per_block =
+            64 * size_of::<i16>() as u64 * MAX_JPEG_COMPONENTS * MAX_SAMPLING_AREA;
+        let blocks = MAX_PROGRESSIVE_COEFFICIENT_BYTES / bytes_per_block;
+        let width = (blocks * 8) as u32;
+        assert!(jpeg_dimensions_safe(width, 8));
+        assert!(!jpeg_dimensions_safe(width + 1, 8));
+    }
 
     #[test]
     fn jpeg_validation_checks_decode_and_dimensions() {

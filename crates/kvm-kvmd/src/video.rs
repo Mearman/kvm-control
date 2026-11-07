@@ -368,7 +368,7 @@ impl VideoStream for Mjpeg {
             return Err(Error::InvalidResponse("frame exceeds limit".into()));
         }
         let frame = self.buffer[body_start..body_start + size].to_vec();
-        crate::validate_jpeg(&frame)?;
+        let frame = crate::validate_jpeg_async(frame).await?;
         let suffix_start = body_start + size + delimiter.len();
         let suffix = &self.buffer[suffix_start..suffix_start + 2];
         if suffix == b"--" {
