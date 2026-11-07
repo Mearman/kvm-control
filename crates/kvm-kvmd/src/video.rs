@@ -288,7 +288,7 @@ impl Mjpeg {
 impl VideoStream for Mjpeg {
     async fn next_frame(&mut self) -> Result<Option<Snapshot>> {
         let result = self.read_frame().await;
-        if result.is_err() {
+        if result.is_err() || self.ended {
             self.ended = true;
             self.lease.abort();
             self.storage = None;
