@@ -14,5 +14,4 @@ types:
   - {type: test, increment: None, section: Tests, hidden: false}
   - {type: style, increment: None, section: Styles, hidden: false}
   - {type: chore, increment: None, section: Other, hidden: true}
-releaseCommitMessageFormat: "chore(release): {{currentTag}} [skip ci]"
 lineLength: 100
