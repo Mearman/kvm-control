@@ -191,7 +191,7 @@ pub(crate) async fn open(device: &Kvmd) -> Result<Box<dyn VideoStream>> {
 struct Delivery {
     result: std::sync::Arc<std::sync::Mutex<Option<Result<Option<Snapshot>>>>>,
     acknowledged: tokio::sync::oneshot::Sender<()>,
-    _storage: Option<std::sync::Arc<tokio::sync::OwnedSemaphorePermit>>,
+    finished: bool,
 }
 
 struct Mjpeg {
@@ -213,7 +213,7 @@ impl Mjpeg {
         let (terminal_tx, terminal) = watch::channel(false);
         let actor = tokio::spawn(async move {
             let mut pending = None;
-            let storage = parser.storage.clone();
+            let _storage = parser.storage.clone();
             let deadline = tokio::time::sleep(idle);
             tokio::pin!(deadline);
             loop {
@@ -238,12 +238,16 @@ impl Mjpeg {
                     .send(Delivery {
                         result: result.clone(),
                         acknowledged,
-                        _storage: storage.clone(),
+                        finished,
                     })
                     .is_ok()
                 {
                     tokio::select! {
-                        _ = &mut deadline => { let _ = terminal_tx.send(true); break; }
+                        _ = &mut deadline => {
+                            result.lock().expect("delivery lock poisoned").take();
+                            let _ = terminal_tx.send(true);
+                            break;
+                        }
                         _ = ack => {}
                     }
                 }
@@ -281,10 +285,15 @@ impl VideoStream for Mjpeg {
                     .result
                     .lock()
                     .expect("delivery lock poisoned")
-                    .take()
-                    .expect("delivery already consumed");
+                    .take();
                 let _ = delivery.acknowledged.send(());
-                result
+                if delivery.finished {
+                    let _ = (&mut self.actor).await;
+                }
+                match result {
+                    Some(result) => result,
+                    None => Err(Error::Transport("video consumer idle timeout".into())),
+                }
             }
             Err(_) if *self.terminal.borrow() => {
                 Err(Error::Transport("video consumer idle timeout".into()))
@@ -728,6 +737,71 @@ mod tests {
         );
         assert_eq!(slots.available_permits(), 1);
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn unpolled_delivery_expires_and_releases_capacity() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut jpeg = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new(&mut jpeg)
+            .encode(&[64, 128, 192], 1, 1, image::ExtendedColorType::Rgb8)
+            .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0; 1024];
+            socket.read(&mut request).await.unwrap();
+            socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: multipart/x-mixed-replace; boundary=frame\r\n\r\n--frame\r\nContent-Type: image/jpeg\r\n\r\n").await.unwrap();
+            socket.write_all(&jpeg).await.unwrap();
+            socket.write_all(b"\r\n--frame--\r\n").await.unwrap();
+        });
+        let response = reqwest::get(format!("http://{address}/")).await.unwrap();
+        let slots = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+        let (_tx, lease_state) = watch::channel(true);
+        let parser = Parser {
+            response,
+            boundary: b"--frame".to_vec(),
+            buffer: Vec::new(),
+            pending: bytes::Bytes::new(),
+            storage: Some(std::sync::Arc::new(
+                slots.clone().try_acquire_owned().unwrap(),
+            )),
+            validation: None,
+            scan_offset: 0,
+            scanned: 0,
+            scan_progress: None,
+            lease: tokio::spawn(std::future::pending()),
+            lease_state,
+            timeout: Duration::from_secs(1),
+            first: true,
+            ended: false,
+        };
+        let stream = Mjpeg::start(parser, Duration::from_secs(2));
+        let (send, mut receive) = tokio::sync::oneshot::channel();
+        stream.requests.send(send).await.unwrap();
+        let delivery = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                match receive.try_recv() {
+                    Ok(delivery) => break delivery,
+                    Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {
+                        tokio::task::yield_now().await
+                    }
+                    Err(error) => panic!("delivery failed: {error}"),
+                }
+            }
+        })
+        .await
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while slots.available_permits() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(delivery.result.lock().unwrap().is_none());
+        server.await.unwrap();
     }
 
     #[tokio::test]
