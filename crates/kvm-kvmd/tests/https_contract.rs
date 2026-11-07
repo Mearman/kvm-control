@@ -168,7 +168,7 @@ async fn status(State(calls): State<Calls>, uri: Uri, headers: HeaderMap) -> imp
 /// - `corestatus` serves only the info, HID and streamer routes;
 /// - `failstatus` fails its media route with HTTP 500 and answers `ok: false` on ATX;
 /// - `badstatus` answers HID with invalid JSON, the streamer without a result and media with an oversized chunked body;
-/// - `slowstatus` never answers ATX, so the client's own request timeout ends that one request;
+/// - `slowstatus` never answers ATX, so the client's response-phase timeout ends that one request;
 /// - `downstatus` answers every route with HTTP 502, as a proxy does when its daemon is stopped;
 /// - `htmlstatus` answers every route with an HTML page, as a single-page application's catch-all does.
 async fn typed_status(
@@ -453,12 +453,15 @@ fn client(endpoint: Url, ca: Option<Vec<u8>>) -> Kvmd {
     profile_client(endpoint, ca, DeviceProfile::PiKvm)
 }
 
-/// The fixture client's request timeout, also used as the bound on each wait for the fake device. A single request finishes within it, by reply or by the client's own timeout, so a wait for one request or its outcome that exceeds it means the awaited event did not happen. A wait that starts before anything is sent, or is blocked on the input lock, has no client timeout behind it and relies on the bound alone; and a call that sends several requests can legitimately run past it, which is why `drive` bounds each step rather than the whole call.
+/// The fixture client's `Config::timeout`, which bounds a request's connect phase and its response phase separately.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Waits for `future`, failing the test instead of hanging if it does not finish within the client's request timeout.
+/// The bound on each wait for the fake device: one request's two phases. A single request finishes within it, by reply or by the client's own timeout, so a wait for one request or its outcome that exceeds it means the awaited event did not happen. A wait that starts before anything is sent, or is blocked on the input lock, has no client timeout behind it and relies on the bound alone; and a call that sends several requests can legitimately run past it, which is why `drive` bounds each step rather than the whole call.
+const REQUEST_BOUND: Duration = REQUEST_TIMEOUT.saturating_add(REQUEST_TIMEOUT);
+
+/// Waits for `future`, failing the test instead of hanging if it does not finish within one request's bound.
 async fn within<F: std::future::Future>(what: &str, future: F) -> F::Output {
-    tokio::time::timeout(REQUEST_TIMEOUT, future)
+    tokio::time::timeout(REQUEST_BOUND, future)
         .await
         .unwrap_or_else(|_| panic!("timed out waiting for {what}"))
 }
@@ -750,7 +753,7 @@ where
     tokio::spawn(future)
 }
 
-/// Completes `future`, letting every gated request reach the device in the order it arrives. Each step, a request arriving or the future finishing, is bounded by the client's request timeout.
+/// Completes `future`, letting every gated request reach the device in the order it arrives. Each step, a request arriving or the future finishing, is bounded by `REQUEST_BOUND`.
 async fn drive<F: std::future::Future>(calls: &Calls, future: F) -> F::Output {
     let mut future = std::pin::pin!(future);
     loop {
@@ -2501,7 +2504,7 @@ async fn unreadable_routes_are_unknown_and_an_unreadable_device_fails() {
 #[tokio::test]
 async fn a_timed_out_route_is_unknown_and_the_others_are_kept() {
     let (endpoint, ca, calls, server) = fixture().await;
-    // The ATX route never answers; only the client's request timeout, `REQUEST_TIMEOUT`, ends that request, and every other route answers at once.
+    // The ATX route never answers; only the client's response-phase timeout ends that request, and every other route answers at once.
     let status = status_client(&endpoint, &ca, "slowstatus", DeviceProfile::PiKvm)
         .status()
         .await
@@ -2526,28 +2529,105 @@ async fn a_timed_out_route_is_unknown_and_the_others_are_kept() {
     server.abort();
 }
 
-#[tokio::test]
-async fn a_connection_failure_fails_the_whole_status() {
-    let (mut endpoint, _, calls, server) = fixture().await;
-    endpoint.set_path("/pikvmstatus/");
-    // Without the fixture's CA no TLS session can be established, which is a failure of the connection, not of one route.
-    let device = Kvmd::with_header_auth(
+/// The connect-phase budget of the stalled-device client. A stalled TLS handshake is ended by it, well inside the test's own `REQUEST_BOUND`.
+const STALL_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// A device that completes `served` connections (TLS, one KVMD response each, then closes) and then accepts every later TCP connection without ever speaking TLS, as a device that stops answering mid-read does. Returns its URL, CA and the count of accepted connections.
+async fn stalling_device(served: usize) -> (Url, Vec<u8>, Arc<std::sync::atomic::AtomicUsize>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio_rustls::{
+        TlsAcceptor,
+        rustls::{ServerConfig, pki_types::PrivatePkcs8KeyDer},
+    };
+    let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+    let tls = ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(
+            vec![certified.cert.der().clone()],
+            PrivatePkcs8KeyDer::from(certified.key_pair.serialize_der()).into(),
+        )
+        .unwrap();
+    let acceptor = TlsAcceptor::from(Arc::new(tls));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let accepted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = accepted.clone();
+    tokio::spawn(async move {
+        let mut stalled = Vec::new();
+        loop {
+            let (socket, _) = listener.accept().await.unwrap();
+            if counter.fetch_add(1, Ordering::SeqCst) >= served {
+                // Held open and silent, so the client's TLS handshake never completes.
+                stalled.push(socket);
+                continue;
+            }
+            let mut stream = acceptor.accept(socket).await.unwrap();
+            let mut request = Vec::new();
+            let mut byte = [0; 1];
+            while !request.ends_with(b"\r\n\r\n") {
+                stream.read_exact(&mut byte).await.unwrap();
+                request.push(byte[0]);
+            }
+            let body = br#"{"ok":true,"result":{"enabled":true,"online":true}}"#;
+            stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            stream.write_all(body).await.unwrap();
+            stream.shutdown().await.unwrap();
+        }
+    });
+    (
+        Url::parse(&format!("https://localhost:{port}/")).unwrap(),
+        certified.cert.pem().into_bytes(),
+        accepted,
+    )
+}
+
+fn stall_client(endpoint: Url, ca: Vec<u8>) -> Kvmd {
+    Kvmd::with_header_auth(
         Config {
             endpoint,
             profile: DeviceProfile::PiKvm,
-            trusted_ca_pem: None,
+            trusted_ca_pem: Some(ca),
             insecure_tls: false,
-            timeout: REQUEST_TIMEOUT,
+            timeout: STALL_TIMEOUT,
         },
         "test-user",
         "test-password",
     )
-    .unwrap();
-    assert!(matches!(
-        device.status().await,
-        Err(Error::Transport(message)) if message.contains("connection failure")
-    ));
-    // The first failed connection ended the read: no route reached the device.
-    assert!(calls.0.lock().unwrap().is_empty());
-    server.abort();
+    .unwrap()
+}
+
+// Breaks if a stalled TLS handshake is reported as an ordinary timeout of one route: the read would then go on to open a connection for every later route.
+#[tokio::test]
+async fn a_stalled_connection_fails_the_whole_status_at_once() {
+    let (endpoint, ca, accepted) = stalling_device(0).await;
+    let result = within(
+        "a status read from a stalled device",
+        stall_client(endpoint, ca).status(),
+    )
+    .await;
+    assert!(matches!(result, Err(Error::Transport(_))));
+    assert_eq!(accepted.load(Ordering::SeqCst), 1);
+}
+
+// A device that stops answering partway through a read fails the whole status rather than returning the routes read before it: the status would otherwise describe a device that can no longer be reached as if it were readable.
+#[tokio::test]
+async fn a_connection_lost_after_earlier_routes_fails_the_whole_status() {
+    let (endpoint, ca, accepted) = stalling_device(2).await;
+    let result = within(
+        "a status read that loses the device",
+        stall_client(endpoint, ca).status(),
+    )
+    .await;
+    assert!(matches!(result, Err(Error::Transport(_))));
+    // Info and HID were served, the streamer's connection stalled, and nothing after it was attempted.
+    assert_eq!(accepted.load(Ordering::SeqCst), 3);
 }
