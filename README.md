@@ -4,7 +4,7 @@ Rust libraries and local clients for controlling KVMD-compatible devices over HT
 
 ## Build from source
 
-Install a Rust toolchain supporting the 2024 edition, then from this checkout run `cargo build --workspace` or `cargo test --workspace`. These commands compile the project; they do not establish hardware compatibility. The repository contains no release workflow or packaged binaries at this revision. The workspace version is not evidence that packages have been published or that an API stability guarantee exists.
+Install a Rust toolchain supporting the 2024 edition, then from this checkout run `cargo build --workspace` or `cargo test --workspace`. These commands compile the project; they do not establish hardware compatibility. Pull requests are checked, and release-mode binaries are packaged and smoke-tested as validation archives, by `.github/workflows/verification.yml`; see [compatibility](COMPATIBILITY.md). No release is published from the repository, so publication is unproven. The workspace version is not evidence that packages have been published or that an API stability guarantee exists.
 
 ## Direct connection
 
