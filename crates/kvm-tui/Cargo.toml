@@ -27,7 +27,12 @@ axum-server.workspace = true
 futures-util.workspace = true
 rcgen.workspace = true
 rustls.workspace = true
+# fcntl_setfl, for a non-blocking standard input in the probe tests.
+rustix = { workspace = true, features = ["fs"] }
 serde_json.workspace = true
+
+[target.'cfg(unix)'.dev-dependencies]
+libc.workspace = true
 
 [lints]
 workspace = true

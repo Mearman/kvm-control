@@ -585,4 +585,194 @@ mod tests {
         );
         assert_eq!(decide(&env, None, None).cell_size, DEFAULT_CELL_SIZE);
     }
+
+    /// The probe against controlled standard input. Each test re-runs itself alone in a child process (`--exact`), whose standard input the case may replace or close without disturbing the test harness, and the parent requires the child to report the one test passed.
+    #[cfg(unix)]
+    mod stdin {
+        use super::{super::*, FULL_REPLY, parse};
+        use std::{
+            io::Write,
+            process::{Command, Stdio},
+            sync::mpsc,
+            thread,
+            time::Instant,
+        };
+
+        /// Marks the child process that runs a case instead of spawning one.
+        const CHILD: &str = "KVM_TUI_STDIN_CASE_CHILD";
+
+        /// Bounds a case that never finishes, such as a read left blocked, so a regression fails instead of hanging; a working case ends as soon as its condition is met.
+        const CASE_BOUND: Duration = Duration::from_secs(10);
+
+        /// A probe deadline the cases that must end by end of input or by an answer can never reach, so ending inside [`CASE_BOUND`] proves the deadline played no part.
+        const UNREACHED_DEADLINE: Duration = Duration::from_secs(20);
+
+        /// A probe deadline a few readiness checks long, so a case waiting on the deadline loops through several checks yet ends promptly.
+        const SHORT_DEADLINE: Duration = PROBE_POLL_INTERVAL.saturating_mul(4);
+
+        /// Runs `case` in a child process, or, in that child, runs it on its own thread and fails if it does not finish within [`CASE_BOUND`].
+        fn in_child(name: &str, case: impl FnOnce() + Send + 'static) {
+            let exact = format!("capabilities::tests::stdin::{name}");
+            if std::env::var_os(CHILD).is_some() {
+                let (done, finished) = mpsc::channel();
+                thread::spawn(move || {
+                    case();
+                    done.send(()).unwrap();
+                });
+                match finished.recv_timeout(CASE_BOUND) {
+                    Ok(()) => return,
+                    Err(mpsc::RecvTimeoutError::Timeout) => panic!("{exact} did not finish"),
+                    Err(mpsc::RecvTimeoutError::Disconnected) => panic!("{exact} failed"),
+                }
+            }
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", &exact])
+                .env(CHILD, "1")
+                .stdin(Stdio::null())
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            // A child that ran no test also exits successfully, so the count proves the case ran.
+            assert!(
+                output.status.success() && stdout.contains("1 passed"),
+                "child status: {}\nstdout: {stdout}\nstderr: {}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        fn probe_with(deadline: Duration) -> ProbeReport {
+            probe_on(&runtime(), deadline)
+        }
+
+        /// A runtime with only the timer the probe needs; it opens no descriptor, so building it cannot take the number of a closed standard input.
+        fn runtime() -> tokio::runtime::Runtime {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .build()
+                .unwrap()
+        }
+
+        fn probe_on(runtime: &tokio::runtime::Runtime, deadline: Duration) -> ProbeReport {
+            runtime
+                .block_on(probe(&query(false, true), deadline))
+                .unwrap()
+        }
+
+        /// A standard input that is not a terminal and is at end of input ends the probe unanswered, which leaves the decision to the environment heuristics.
+        #[test]
+        fn end_of_input_ends_the_probe_unanswered() {
+            in_child("end_of_input_ends_the_probe_unanswered", || {
+                rustix::stdio::dup2_stdin(std::fs::File::open("/dev/null").unwrap()).unwrap();
+                assert_eq!(probe_with(UNREACHED_DEADLINE), ProbeReport::default());
+            });
+        }
+
+        /// A closed standard input counts as ready, its read fails with EBADF, and that ends the probe unanswered.
+        #[test]
+        #[allow(unsafe_code)] // Closing descriptor 0 has no safe wrapper: rustix offers only the unsafe `take_stdin`.
+        fn closed_stdin_ends_the_probe_unanswered() {
+            in_child("closed_stdin_ends_the_probe_unanswered", || {
+                // Built first, so that nothing opened after the close reuses descriptor 0.
+                let runtime = runtime();
+                // SAFETY: this child runs only this case, and nothing else in it uses standard input.
+                drop(unsafe { rustix::stdio::take_stdin() });
+                assert_eq!(
+                    probe_on(&runtime, UNREACHED_DEADLINE),
+                    ProbeReport::default()
+                );
+            });
+        }
+
+        /// A pipe that stays open and never becomes readable is never read, so the probe is still free to end at its deadline, unanswered.
+        #[test]
+        fn silent_pipe_ends_at_the_deadline() {
+            in_child("silent_pipe_ends_at_the_deadline", || {
+                let (reader, writer) = std::io::pipe().unwrap();
+                rustix::stdio::dup2_stdin(&reader).unwrap();
+                let started = Instant::now();
+                assert_eq!(probe_with(SHORT_DEADLINE), ProbeReport::default());
+                assert!(started.elapsed() >= SHORT_DEADLINE);
+                drop(writer);
+            });
+        }
+
+        /// A reply split across writes, with the first part consumed before the second is written, is parsed as a whole.
+        #[test]
+        fn reply_split_across_writes_is_parsed_whole() {
+            in_child("reply_split_across_writes_is_parsed_whole", || {
+                // Splits inside the device attributes reply, so the first part alone cannot answer the probe.
+                let (first, second) = FULL_REPLY.split_at(FULL_REPLY.len() - 3);
+                assert!(!parse(first).answered);
+                let (reader, mut writer) = std::io::pipe().unwrap();
+                rustix::stdio::dup2_stdin(&reader).unwrap();
+                let replies = thread::spawn(move || {
+                    writer.write_all(first).unwrap();
+                    while rustix::io::ioctl_fionread(rustix::stdio::stdin()).unwrap() > 0 {
+                        thread::yield_now();
+                    }
+                    writer.write_all(second).unwrap();
+                    writer
+                });
+                assert_eq!(probe_with(UNREACHED_DEADLINE), parse(FULL_REPLY));
+                drop(replies.join().unwrap());
+            });
+        }
+
+        /// A read interrupted by a signal reports a retry instead of an error or end of input.
+        #[test]
+        #[allow(unsafe_code)] // Installing a handler without SA_RESTART and signalling one thread have no safe wrapper in kvm-tui's dependencies.
+        fn interrupted_read_asks_for_a_retry() {
+            extern "C" fn ignore(_: libc::c_int) {}
+            in_child("interrupted_read_asks_for_a_retry", || {
+                use std::os::unix::thread::JoinHandleExt;
+                // SAFETY: an all-zero `sigaction` is valid (empty mask, no flags), and only the handler is set before it is installed; without SA_RESTART a blocked read returns EINTR.
+                unsafe {
+                    let mut action: libc::sigaction = std::mem::zeroed();
+                    action.sa_sigaction =
+                        ignore as extern "C" fn(libc::c_int) as *const () as libc::sighandler_t;
+                    assert_eq!(libc::sigemptyset(&mut action.sa_mask), 0);
+                    assert_eq!(
+                        libc::sigaction(libc::SIGUSR1, &action, std::ptr::null_mut()),
+                        0
+                    );
+                }
+                let (reader, writer) = std::io::pipe().unwrap();
+                rustix::stdio::dup2_stdin(&reader).unwrap();
+                let (done, result) = mpsc::channel();
+                let blocked = thread::spawn(move || {
+                    let mut buffer = [0_u8; 16];
+                    done.send(read_stdin(&mut buffer).map_err(|error| error.kind()))
+                        .unwrap();
+                });
+                // A signal that lands before the read starts runs the handler and changes nothing, so signalling until the read returns interrupts it once it blocks.
+                let outcome = loop {
+                    if let Ok(outcome) = result.try_recv() {
+                        break outcome;
+                    }
+                    // SAFETY: the handle has not been joined, so its thread identifier is still valid.
+                    unsafe { libc::pthread_kill(blocked.as_pthread_t(), libc::SIGUSR1) };
+                    thread::yield_now();
+                };
+                assert_eq!(outcome, Ok(None));
+                blocked.join().unwrap();
+                drop(writer);
+            });
+        }
+
+        /// A non-blocking standard input with nothing to read reports a retry.
+        #[test]
+        fn would_block_read_asks_for_a_retry() {
+            in_child("would_block_read_asks_for_a_retry", || {
+                let (reader, writer) = std::io::pipe().unwrap();
+                rustix::stdio::dup2_stdin(&reader).unwrap();
+                let stdin = rustix::stdio::stdin();
+                let flags = rustix::fs::fcntl_getfl(stdin).unwrap();
+                rustix::fs::fcntl_setfl(stdin, flags | rustix::fs::OFlags::NONBLOCK).unwrap();
+                let mut buffer = [0_u8; 16];
+                assert_eq!(read_stdin(&mut buffer).unwrap(), None);
+                drop(writer);
+            });
+        }
+    }
 }
