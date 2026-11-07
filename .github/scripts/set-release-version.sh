@@ -52,7 +52,7 @@ for package in data["packages"]:
         if inherited_declarations:
             inherited.add(key)
         name = re.escape(key)
-        pattern = r"(?m)^(\s*" + name + r"\s*=\s*\{[^\n}]*?\bversion\s*=\s*)\"[^\"]+\""
+        pattern = r"(?m)^(\s*" + name + r"\s*=\s*\{[^\n}]*?\bversion\s*=\s*)(?:\"[^\"]+\"|\x27[^\x27]+\x27)"
         workspace_section = re.search(r"(?ms)^\[workspace\.dependencies\]\s*$.*?(?=^\[|\Z)", text) if manifest == root else None
         if workspace_section:
             before, first = re.subn(pattern, lambda match: match.group(1) + "\"" + version + "\"", text[:workspace_section.start()])
@@ -68,7 +68,7 @@ for key in inherited:
     section = re.search(r"(?ms)^\[workspace\.dependencies\]\s*$.*?(?=^\[|\Z)", root_text)
     if section is None:
         raise SystemExit("Missing workspace dependencies")
-    pattern = r"(?m)^(\s*" + re.escape(key) + r"\s*=\s*\{[^\n}]*?\bversion\s*=\s*)\"[^\"]+\""
+    pattern = r"(?m)^(\s*" + re.escape(key) + r"\s*=\s*\{[^\n}]*?\bversion\s*=\s*)(?:\"[^\"]+\"|\x27[^\x27]+\x27)"
     updated, count = re.subn(pattern, lambda match: match.group(1) + "\"" + version + "\"", section.group())
     if count != 1:
         raise SystemExit("Cannot update inherited workspace dependency " + key)
