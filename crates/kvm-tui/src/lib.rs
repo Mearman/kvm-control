@@ -1034,16 +1034,51 @@ impl Drop for InputCleanup {
     }
 }
 
+fn terminal_capabilities() -> io::Result<(ratatui_image::picker::Picker, bool)> {
+    use ratatui_image::picker::{Picker, ProtocolType};
+    let term = std::env::var("TERM").unwrap_or_default();
+    let program = std::env::var("TERM_PROGRAM").unwrap_or_default();
+    let tmux = std::env::var_os("TMUX").is_some();
+    let protocol = match std::env::var("KVM_TUI_IMAGE_PROTOCOL").as_deref() {
+        Ok("halfblocks") => ProtocolType::Halfblocks,
+        Ok("kitty") => ProtocolType::Kitty,
+        Ok("sixel") => ProtocolType::Sixel,
+        Ok("iterm2") => ProtocolType::Iterm2,
+        Ok(_) => return Err(io::Error::other("invalid KVM_TUI_IMAGE_PROTOCOL")),
+        Err(std::env::VarError::NotPresent) => match (tmux, term.as_str(), program.as_str()) {
+            (false, "xterm-kitty" | "xterm-ghostty", _) => ProtocolType::Kitty,
+            (false, _, "iTerm.app" | "WezTerm") => ProtocolType::Iterm2,
+            _ => ProtocolType::Halfblocks,
+        },
+        Err(_) => return Err(io::Error::other("invalid KVM_TUI_IMAGE_PROTOCOL encoding")),
+    };
+    let enhanced = !tmux && matches!(term.as_str(), "xterm-kitty" | "xterm-ghostty" | "wezterm");
+    // Pixel dimensions are optional in the terminal ioctl; the library's halfblock picker supplies its default cell size when absent.
+    let mut picker = match crossterm::terminal::window_size() {
+        Ok(size)
+            if size.columns > 0
+                && size.rows > 0
+                && size.width >= size.columns
+                && size.height >= size.rows =>
+        {
+            #[allow(deprecated)]
+            Picker::from_fontsize((size.width / size.columns, size.height / size.rows))
+        }
+        _ => Picker::halfblocks(),
+    };
+    picker.set_protocol_type(protocol);
+    Ok((picker, enhanced))
+}
+
 /// Runs the TUI for an already authenticated device. Cancellation schedules best-effort input release while the runtime remains active.
 pub async fn run(device: std::sync::Arc<dyn Device>) -> io::Result<()> {
     let mut input_cleanup = InputCleanup(Some(device.clone()));
     #[cfg(unix)]
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let mut guard = TerminalGuard::enter(SystemTerminal)?;
-    let picker = ratatui_image::picker::Picker::from_query_stdio()
-        .unwrap_or_else(|_| ratatui_image::picker::Picker::halfblocks());
-    let enhanced = crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false);
+    let (picker, enhanced) = terminal_capabilities()?;
     if enhanced {
+        guard.keyboard = true;
         execute!(
             io::stdout(),
             crossterm::event::PushKeyboardEnhancementFlags(
@@ -1055,7 +1090,7 @@ pub async fn run(device: std::sync::Arc<dyn Device>) -> io::Result<()> {
     }
     guard.keyboard = enhanced;
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
-    let run = run_loop(&mut terminal, device.as_ref(), &picker, enhanced, || {
+    let run = run_loop(&mut terminal, device.as_ref(), &picker, enhanced, |_| {
         if event::poll(Duration::from_millis(25))? {
             Ok(Some(event::read()?))
         } else {
@@ -1105,7 +1140,7 @@ async fn run_loop<B: Backend>(
     device: &dyn Device,
     picker: &ratatui_image::picker::Picker,
     enhanced: bool,
-    mut next_event: impl FnMut() -> io::Result<Option<Event>>,
+    mut next_event: impl FnMut(&Terminal<B>) -> io::Result<Option<Event>>,
 ) -> io::Result<()>
 where
     B::Error: std::error::Error + Send + Sync + 'static,
@@ -1132,6 +1167,7 @@ where
         >,
     > = None;
     loop {
+        tokio::task::yield_now().await;
         if let Some(request) = &mut control_request {
             let outcome = tokio::select! { outcome = request.as_mut() => Some(outcome), _ = tokio::time::sleep(Duration::from_millis(1)) => None };
             if let Some(outcome) = outcome {
@@ -1148,31 +1184,6 @@ where
                 };
             }
         }
-        terminal
-            .draw(|frame| {
-                draw(frame, &app);
-                if let Some(image) = &app.video {
-                    let areas = Layout::vertical([
-                        Constraint::Length(3),
-                        Constraint::Min(3),
-                        Constraint::Length(4),
-                    ])
-                    .split(frame.area());
-                    if let Some(area) =
-                        video_viewport(areas[1], image.width(), image.height(), app.cell_size)
-                    {
-                        let mut protocol = picker
-                            .new_resize_protocol(image::DynamicImage::ImageRgb8(image.clone()));
-                        frame.render_stateful_widget(
-                            ratatui_image::StatefulImage::default()
-                                .resize(ratatui_image::Resize::Scale(None)),
-                            area.cells,
-                            &mut protocol,
-                        );
-                    }
-                }
-            })
-            .map_err(io::Error::other)?;
         if let Some(receiver) = &mut video_rx
             && receiver.has_changed().is_err()
         {
@@ -1218,7 +1229,32 @@ where
                 }
             }
         }
-        if let Some(event) = next_event()? {
+        terminal
+            .draw(|frame| {
+                draw(frame, &app);
+                if let Some(image) = &app.video {
+                    let areas = Layout::vertical([
+                        Constraint::Length(3),
+                        Constraint::Min(3),
+                        Constraint::Length(4),
+                    ])
+                    .split(frame.area());
+                    if let Some(area) =
+                        video_viewport(areas[1], image.width(), image.height(), app.cell_size)
+                    {
+                        let mut protocol = picker
+                            .new_resize_protocol(image::DynamicImage::ImageRgb8(image.clone()));
+                        frame.render_stateful_widget(
+                            ratatui_image::StatefulImage::default()
+                                .resize(ratatui_image::Resize::Scale(None)),
+                            area.cells,
+                            &mut protocol,
+                        );
+                    }
+                }
+            })
+            .map_err(io::Error::other)?;
+        if let Some(event) = next_event(terminal)? {
             match event {
                 Event::Key(key)
                     if key.kind == KeyEventKind::Press
@@ -1461,7 +1497,7 @@ mod tests {
             &device,
             &ratatui_image::picker::Picker::halfblocks(),
             false,
-            || {
+            |_| {
                 count += 1;
                 if count == 1 {
                     return Ok(Some(Event::Key(crossterm::event::KeyEvent::new(
@@ -1506,30 +1542,40 @@ mod tests {
         };
         let mut terminal = Terminal::new(TestBackend::new(40, 16)).unwrap();
         let mut rounds = 0;
-        let result = run_loop(
-            &mut terminal,
-            &device,
-            &ratatui_image::picker::Picker::halfblocks(),
-            false,
-            || {
-                rounds += 1;
-                if rounds == 1 {
-                    Ok(Some(Event::Key(crossterm::event::KeyEvent::new(
-                        KeyCode::Char('v'),
-                        crossterm::event::KeyModifiers::NONE,
-                    ))))
-                } else if rounds == 100 {
-                    Ok(Some(Event::Key(crossterm::event::KeyEvent::new(
-                        KeyCode::Char('q'),
-                        crossterm::event::KeyModifiers::NONE,
-                    ))))
-                } else {
-                    std::thread::yield_now();
-                    Ok(None)
-                }
-            },
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            run_loop(
+                &mut terminal,
+                &device,
+                &ratatui_image::picker::Picker::halfblocks(),
+                false,
+                |terminal| {
+                    rounds += 1;
+                    if rounds == 1 {
+                        Ok(Some(Event::Key(crossterm::event::KeyEvent::new(
+                            KeyCode::Char('v'),
+                            crossterm::event::KeyModifiers::NONE,
+                        ))))
+                    } else if terminal
+                        .backend()
+                        .buffer()
+                        .content()
+                        .iter()
+                        .any(|cell| cell.symbol() == "▀")
+                    {
+                        Ok(Some(Event::Key(crossterm::event::KeyEvent::new(
+                            KeyCode::Char('q'),
+                            crossterm::event::KeyModifiers::NONE,
+                        ))))
+                    } else {
+                        std::thread::yield_now();
+                        Ok(None)
+                    }
+                },
+            ),
         )
-        .await;
+        .await
+        .expect("video frame must render before exit");
         assert!(result.is_ok());
         assert!(
             terminal
@@ -1562,7 +1608,7 @@ mod tests {
             &device,
             &ratatui_image::picker::Picker::halfblocks(),
             false,
-            || {
+            |_| {
                 if let Some(c) = events.next() {
                     return Ok(Some(Event::Key(crossterm::event::KeyEvent::new(
                         if c == '\n' {
@@ -1620,7 +1666,7 @@ mod tests {
             &device,
             &ratatui_image::picker::Picker::halfblocks(),
             false,
-            || {
+            |_| {
                 Ok(Some(match events.next().expect("quit") {
                     None => Event::FocusLost,
                     Some(c) => Event::Key(crossterm::event::KeyEvent::new(
@@ -1652,7 +1698,7 @@ mod tests {
             &device,
             &ratatui_image::picker::Picker::halfblocks(),
             false,
-            || {
+            |_| {
                 let c = events.next().expect("quit event");
                 Ok(Some(Event::Key(crossterm::event::KeyEvent::new(
                     if c == '\n' {
@@ -1692,7 +1738,7 @@ mod tests {
             &device,
             &ratatui_image::picker::Picker::halfblocks(),
             false,
-            || {
+            |_| {
                 count += 1;
                 let code = if count == 1 || count == 100 {
                     Some('v')
@@ -1824,7 +1870,7 @@ mod tests {
             &device,
             &ratatui_image::picker::Picker::halfblocks(),
             false,
-            || {
+            |_| {
                 step += 1;
                 let event = match step {
                     1 => crossterm::event::KeyEvent::new(
@@ -2655,14 +2701,14 @@ mod tests {
     fn viewport_accounts_for_two_fits_and_cell_padding() {
         let area = ratatui::layout::Rect::new(0, 0, 82, 42);
         let viewport = video_viewport(area, 640, 480, (8, 16)).unwrap();
-        assert_eq!(viewport.cells, ratatui::layout::Rect::new(1, 5, 80, 30));
+        assert_eq!(viewport.cells, ratatui::layout::Rect::new(1, 6, 80, 30));
         assert_eq!(viewport.pixels, (640, 480));
         assert_eq!(
-            video_mouse_coordinates(1, 5, &viewport),
+            video_mouse_coordinates(1, 6, &viewport),
             Some((-32461, -31811))
         );
         assert_eq!(
-            video_mouse_coordinates(80, 34, &viewport),
+            video_mouse_coordinates(80, 35, &viewport),
             Some((32356, 31672))
         );
         let padded =
@@ -2671,7 +2717,7 @@ mod tests {
         assert_eq!(padded.pixels, (80, 25));
         assert_eq!(
             video_mouse_coordinates(10, 6, &padded),
-            Some((29448, i16::MAX))
+            Some((29448, 30036))
         );
         assert_eq!(video_mouse_coordinates(10, 7, &padded), None);
     }
@@ -2937,6 +2983,68 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn startup_process_restores_pty_on_sigterm() {
+        const CHILD: &str = "KVM_STARTUP_PTY_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let result = runtime.block_on(run(std::sync::Arc::new(FakeDevice::default())));
+            assert!(result.is_err());
+            return;
+        }
+        let script = r#"
+import os, pty, select, signal, subprocess, sys, termios, time
+master, slave = pty.openpty()
+before = termios.tcgetattr(slave)
+env = dict(os.environ, KVM_STARTUP_PTY_CHILD='1', TERM='xterm', KVM_TUI_IMAGE_PROTOCOL='halfblocks')
+proc = subprocess.Popen([sys.argv[1], '--exact', 'tests::startup_process_restores_pty_on_sigterm', '--nocapture'], stdin=slave, stdout=slave, stderr=slave, env=env)
+data = b''
+deadline = time.monotonic() + 10
+try:
+    while b'\x1b[?1049h' not in data:
+        if time.monotonic() >= deadline or proc.poll() is not None:
+            raise AssertionError('startup did not enter alternate screen: ' + repr(data))
+        if select.select([master], [], [], 0.1)[0]:
+            data += os.read(master, 65536)
+    os.kill(proc.pid, signal.SIGTERM)
+    while proc.poll() is None:
+        if time.monotonic() >= deadline:
+            raise AssertionError('SIGTERM did not terminate startup')
+        if select.select([master], [], [], 0.1)[0]:
+            data += os.read(master, 65536)
+    while select.select([master], [], [], 0)[0]:
+        data += os.read(master, 65536)
+    assert proc.returncode == 0, (proc.returncode, data)
+    assert b'\x1b[?1049l' in data, data
+    after = termios.tcgetattr(slave)
+    # Darwin may set PENDIN transiently when canonical mode is restored.
+    if hasattr(termios, 'PENDIN'):
+        before[3] &= ~termios.PENDIN
+        after[3] &= ~termios.PENDIN
+    assert after == before, ('terminal attributes not restored', before, after, data)
+finally:
+    if proc.poll() is None:
+        proc.kill()
+        proc.wait()
+    os.close(master)
+    os.close(slave)
+"#;
+        let output = std::process::Command::new("python3")
+            .args(["-I", "-c", script])
+            .arg(std::env::current_exe().unwrap())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn sigterm_process_releases_input_and_restores_terminal() {
         use std::io::{BufRead, BufReader, Write};
         use std::process::{Command, Stdio};
@@ -2958,6 +3066,7 @@ mod tests {
                 })
                 .unwrap();
                 let device = FakeDevice::default();
+                let _ = terminal_capabilities();
                 println!("SIGTERM_READY");
                 std::io::stdout().flush().unwrap();
                 let result = wait_for_termination(std::future::pending(), &mut signal).await;

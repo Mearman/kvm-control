@@ -9,7 +9,10 @@ use std::{
 use url::Url;
 
 #[derive(Parser)]
-#[command(about = "Interactive KVMD terminal client")]
+#[command(
+    about = "Interactive KVMD terminal client",
+    after_help = "Set KVM_TUI_IMAGE_PROTOCOL to halfblocks, kitty, sixel or iterm2 to select an image protocol explicitly."
+)]
 struct Args {
     /// Device base HTTPS URL, without credentials
     #[arg(long)]
