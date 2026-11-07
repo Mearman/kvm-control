@@ -1066,25 +1066,19 @@ async fn request_abandoned_during_owed_cleanup_leaves_nothing_held() {
     let (mut endpoint, ca, calls, server) = fixture().await;
     endpoint.set_path("/gated/");
     let device = Arc::new(client(endpoint, Some(ca)));
-    let sender = device.clone();
-    let first = tokio::spawn(async move { sender.key("KeyA", true).await });
+    let woken = Arc::new(Woken(tokio::sync::Notify::new()));
+    let mut first = Box::pin(device.key("KeyA", true));
+    poll_once(first.as_mut(), &woken);
     arrival(&calls).await;
+    calls.4.notify_one();
+    within("the outcome to be delivered", woken.0.notified()).await;
+    // The second request takes the input lock before the first is dropped, so its task holds the lock and sends the release the first then owes.
     let sender = device.clone();
     let second = queue(async move { sender.key("KeyB", true).await }).await;
-    first.abort();
-    assert!(first.await.unwrap_err().is_cancelled());
-    calls.4.notify_one();
-    // Cleanup owed for the first request is in flight when the second request is abandoned.
+    drop(first);
     arrival(&calls).await;
-    assert!(
-        calls
-            .0
-            .lock()
-            .unwrap()
-            .last()
-            .unwrap()
-            .contains("key=KeyA&state=false")
-    );
+    assert_eq!(input_events(&calls).last().unwrap(), "key=KeyA&state=false");
+    // Abandoning the second request while the owed release is in flight must leave its own press released too.
     second.abort();
     assert!(second.await.unwrap_err().is_cancelled());
     calls.4.notify_one();
@@ -1093,6 +1087,17 @@ async fn request_abandoned_during_owed_cleanup_leaves_nothing_held() {
         device.key("KeyC", false).await.unwrap();
     })
     .await;
+    assert_eq!(
+        input_events(&calls),
+        [
+            "key=KeyA&state=true",
+            "key=KeyA&state=false",
+            "key=KeyB&state=true",
+            "key=KeyB&state=false",
+            "key=KeyC&state=true",
+            "key=KeyC&state=false",
+        ]
+    );
     assert_eq!(held_on_device(&calls), Vec::<String>::new());
     server.abort();
 }
