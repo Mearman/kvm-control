@@ -26,7 +26,7 @@ if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
   fi
   tag_object=$(git rev-parse "refs/tags/$TAG")
 fi
-CONVCO_EXCLUDE_TAG="${tag_object:+$TAG}" bash "$(dirname "$0")/convco-release.sh" changelog --unreleased "${TAG#v}" --max-versions 1 --output "$PWD/release-notes.md"
+CONVCO_EXCLUDE_TAG="${tag_object:+$TAG}" bash "$(dirname "$0")/convco-release.sh" changelog --unreleased "${TAG#v}" --max-versions 1 --no-wrap --output "$PWD/release-notes.md"
 if [ -z "${tag_object-}" ]; then
   git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' -c tag.gpgsign=false tag -a "$TAG" -m "$TAG"
   git push origin "refs/tags/$TAG"
