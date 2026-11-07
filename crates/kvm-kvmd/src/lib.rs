@@ -647,8 +647,8 @@ impl Device for Kvmd {
     }
 
     async fn key(&self, key: &str, pressed: bool) -> Result<()> {
-        self.capture_input_runtime();
         let mut inputs = self.inputs.clone().lock_owned().await;
+        self.capture_input_runtime();
         let worker = self.input_worker();
         let key = key.to_owned();
         tokio::spawn(async move {
@@ -684,8 +684,8 @@ impl Device for Kvmd {
     }
 
     async fn mouse_button(&self, button: &str, pressed: bool) -> Result<()> {
-        self.capture_input_runtime();
         let mut inputs = self.inputs.clone().lock_owned().await;
+        self.capture_input_runtime();
         let worker = self.input_worker();
         let button = button.to_owned();
         tokio::spawn(async move {
@@ -856,8 +856,8 @@ impl Device for Kvmd {
     }
 
     async fn release_inputs(&self) -> Result<()> {
-        self.capture_input_runtime();
         let mut inputs = self.inputs.clone().lock_owned().await;
+        self.capture_input_runtime();
         let worker = self.input_worker();
         tokio::spawn(async move {
             let mut failed = false;

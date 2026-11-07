@@ -343,6 +343,61 @@ async fn timed_out_press_remains_indeterminate_after_release() {
 }
 
 #[tokio::test]
+async fn cancelled_waiter_cannot_replace_cleanup_runtime() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let device = Arc::new(input_device(listener.local_addr().unwrap()));
+    let (accepted_tx, accepted_rx) = tokio::sync::oneshot::channel();
+    let (finish_tx, finish_rx) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        let mut buffer = [0; 4096];
+        let (mut press, _) = listener.accept().await.unwrap();
+        press.read(&mut buffer).await.unwrap();
+        accepted_tx.send(()).unwrap();
+        finish_rx.await.unwrap();
+        press
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}",
+            )
+            .await
+            .unwrap();
+        let (mut release, _) = listener.accept().await.unwrap();
+        let n = release.read(&mut buffer).await.unwrap();
+        assert!(String::from_utf8_lossy(&buffer[..n]).contains("state=false"));
+        release
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}",
+            )
+            .await
+            .unwrap();
+    });
+    let pressing = device.clone();
+    let press = tokio::spawn(async move { pressing.key("KeyA", true).await });
+    accepted_rx.await.unwrap();
+    let waiting = device.clone();
+    std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let task = tokio::spawn(async move { waiting.release_inputs().await });
+            tokio::task::yield_now().await;
+            task.abort();
+            assert!(task.await.unwrap_err().is_cancelled());
+        });
+    })
+    .join()
+    .unwrap();
+    finish_tx.send(()).unwrap();
+    press.await.unwrap().unwrap();
+    std::thread::spawn(move || drop(device)).join().unwrap();
+    tokio::time::timeout(Duration::from_secs(3), server)
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test]
 async fn ambiguous_release_is_not_replayed_on_drop() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let device = input_device(listener.local_addr().unwrap());
