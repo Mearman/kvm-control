@@ -485,7 +485,7 @@ impl RestorePending<'_> {
 impl Drop for RestorePending<'_> {
     fn drop(&mut self) {
         if self.owed {
-            self.flag.store(true, Ordering::SeqCst);
+            let _ = self.flag.load(Ordering::SeqCst);
         }
     }
 }
