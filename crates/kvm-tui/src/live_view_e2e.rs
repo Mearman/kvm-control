@@ -319,6 +319,19 @@ async fn live_view_renders_distinct_frames_forwards_input_and_restores_terminal(
                 std::thread::yield_now();
                 return Ok(None);
             }
+            // Input mode needs the capabilities the startup refresh reads in the background; wait until it has been shown.
+            let refreshing = terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>()
+                .contains("Refreshing device state");
+            if refreshing {
+                std::thread::yield_now();
+                return Ok(None);
+            }
             Ok(input_events.next())
         }),
     )
