@@ -1136,8 +1136,9 @@ async fn cancelled_waiter_cannot_replace_cleanup_runtime() {
             .build()
             .unwrap();
         runtime.block_on(async {
-            let task = tokio::spawn(async move { waiting.release_inputs().await });
-            tokio::task::yield_now().await;
+            // Queued on the input lock by one poll before the abort, on any scheduler, so the waiter has reached the point where it could replace the runtime.
+            let queued_on = waiting.clone();
+            let task = queued(&queued_on, async move { waiting.release_inputs().await }).await;
             task.abort();
             assert!(task.await.unwrap_err().is_cancelled());
         });
