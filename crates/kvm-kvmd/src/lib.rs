@@ -1604,19 +1604,8 @@ impl Drop for Kvmd {
         if self.cleanup_on_drop
             && let Some(last) = last
         {
-            let current = tokio::runtime::Handle::try_current()
-                .ok()
-                .filter(|current| current.id() != last.id());
             let worker = self.input_worker();
-            let released = last.spawn(async move { worker.release_for_drop().await });
-            if let Some(current) = current {
-                let worker = self.input_worker();
-                current.spawn(async move {
-                    if released.await.is_err() {
-                        worker.release_for_drop().await;
-                    }
-                });
-            }
+            last.spawn(async move { worker.release_for_drop().await });
         }
     }
 }
