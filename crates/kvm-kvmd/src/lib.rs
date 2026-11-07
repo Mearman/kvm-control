@@ -1223,9 +1223,8 @@ impl Kvmd {
                 name: name.clone(),
                 sequence,
             });
-            let result = if !pressed && cleaned.contains(&(kind, name.clone())) {
-                Ok(())
-            } else {
+            let _ = cleaned;
+            let result = {
                 inputs.last.insert((kind, name.clone()), sequence);
                 inputs.owes = owes.clone();
                 worker.send_held(&mut inputs, kind, &name, pressed).await
