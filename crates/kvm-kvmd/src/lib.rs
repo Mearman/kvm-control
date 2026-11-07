@@ -1380,12 +1380,6 @@ impl Device for Kvmd {
         self.capture_input_runtime();
         let worker = self.input_worker();
         let (result_tx, result_rx) = tokio::sync::oneshot::channel();
-        // A delivered failure of a submitted movement that the caller never reads is reported when it drops the outcome, as for a key or button request; a failed state read or capability check sent nothing and is not reported.
-        let handover = Handover {
-            device: self,
-            task: "movement task",
-            outcome: Some(result_rx),
-        };
         tokio::spawn(async move {
             // Only a submitted movement has an outcome the device may still apply; a failed state read or capability check sent nothing, so an abandoned caller needs no report of it.
             let (result, submitted) = match worker.settled_move(inputs, x, y, &result_tx).await {
@@ -1396,7 +1390,10 @@ impl Device for Kvmd {
                 worker.report_abandoned(&error);
             }
         });
-        handover.outcome().await
+        result_rx
+            .await
+            .map_err(|_| Error::AmbiguousInput("movement task failed".into()))?
+            .0
     }
 
     async fn control(
