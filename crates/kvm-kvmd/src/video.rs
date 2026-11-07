@@ -489,7 +489,6 @@ impl Mjpeg {
                     _ = pressure.wait_for(|waiting| !waiting.is_empty()), if holds_storage => {
                         parser.discard();
                         if matches!(pending, Some(Ok(Some(_)))) {
-                            parser.lost = true;
                             // A later frame supersedes an unclaimed one, but the final frame has no successor, so its loss is reported.
                             pending = parser.ended.then(|| Err(storage_reclaimed()));
                         }
