@@ -1489,8 +1489,9 @@ mod tests {
 
         let mut idle_body = part(&first, true, false);
         idle_body.extend_from_slice(&part(&later, true, true));
-        // The first part's headers and the start of its body, after which the idle stream's buffer is the whole part.
-        let sent = part(&first, true, false).len() - first.len();
+        // The first part's headers and half its body. That is more than a header buffer holds, so however it is split into reads, the idle stream has grown its buffer to the whole part before it waits for the rest.
+        let sent = part(&first, true, false).len() - first.len() + FRAME / 2;
+        const { assert!(FRAME / 2 > MAX_HEADER) };
         let (response, mut socket) = multipart().await;
         let (resume_tx, resume) = tokio::sync::oneshot::channel::<()>();
         let idle_server = tokio::spawn(async move {
