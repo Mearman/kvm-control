@@ -312,7 +312,7 @@ async fn execute(device: &impl Device, command: Command) -> Result<Value, String
             Ok(json!({"output": output, "bytes": snapshot.jpeg.len()}))
         }
         Command::Key { key } => {
-            // Registered before the press future exists, so no signal can precede the handlers, and a registration failure is reported before anything is sent.
+            // Registered before the press future exists, so once the press has been sent no signal can reach the default disposition, and a registration failure is reported before anything is sent.
             let interrupt =
                 termination_signal().map_err(|e| format!("signal handler failed: {e}"))?;
             press_and_release(device, device.key(&key, true), interrupt).await?;
