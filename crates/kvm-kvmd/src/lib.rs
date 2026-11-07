@@ -313,7 +313,7 @@ impl reqwest::cookie::CookieStore for SessionCookies {
 
 /// A KVMD connection with an explicitly authenticated session.
 ///
-/// Input requests already submitted continue after caller cancellation. Dropping a submitted key or button request before collecting its outcome is safe outside a runtime and releases tracked inputs before any later input, movement or explicit release runs, including one already waiting for the input lock, so cleanup never interleaves with later inputs: a request whose outcome was not yet delivered releases them before giving up the lock, and one whose outcome was delivered marks cleanup pending for the next lock holder and schedules it on the captured runtime. A completed request does not hold the input lock while its outcome waits to be collected, and a release of an input that cleanup has just released is not sent again. Ambiguous outcomes permanently render cleanup indeterminate because a server may apply a timed-out request later, and a request interrupted by runtime shutdown counts as ambiguous and leaves cleanup pending for the next lock holder. An ambiguous release is not replayed automatically. Dropping the last owner attempts to release tracked inputs on the captured runtime; process or runtime termination provides no cleanup guarantee.
+/// Input requests already submitted continue after caller cancellation. Dropping a submitted key or button request before collecting its outcome is safe outside a runtime and releases tracked inputs before any later input, movement or explicit release runs, including one already waiting for the input lock, so cleanup never interleaves with later inputs: a request whose outcome was not yet delivered releases them before giving up the lock, and one whose outcome was delivered marks cleanup pending for the next lock holder and schedules it on the captured runtime. A completed request does not hold the input lock while its outcome waits to be collected, and a release of an input that cleanup has just confirmed released is not sent again unless an earlier press of it was ambiguous. Ambiguous outcomes permanently render cleanup indeterminate because a server may apply a timed-out request later, and a request interrupted by runtime shutdown counts as ambiguous and leaves cleanup pending for the next lock holder. An ambiguous release is not replayed automatically. Dropping the last owner attempts to release tracked inputs on the captured runtime; process or runtime termination provides no cleanup guarantee.
 ///
 /// Cookies are accepted only from login or approval responses. Later `Set-Cookie` headers, including rotation and expiry updates, are ignored. The inspected [PiKVM](https://github.com/pikvm/kvmd/blob/fcb903eb3be70d8eee4aee99e5fcc1c743e3ccef/kvmd/apps/kvmd/api/auth.py) and [GLKVM](https://github.com/gl-inet/glkvm/blob/3e8dd23c4bd638a4650433664cc3b0f3b4d29395/kvmd/apps/kvmd/api/auth.py) revisions issue authentication cookies on login, and GLKVM also issues them on approval. Other firmware requiring cookie rotation is not supported. Server-side expiry or revocation can return an authentication error; call `login` again with fresh credentials and complete any approval. Consequential and input requests are never automatically replayed, and ambiguous outcomes require observation before a caller decides what to do.
 pub struct Kvmd {
@@ -382,6 +382,13 @@ impl Inputs {
         match kind {
             Held::Key => &self.keys,
             Held::Button => &self.buttons,
+        }
+    }
+
+    fn uncertain(&self, kind: Held) -> &BTreeSet<String> {
+        match kind {
+            Held::Key => &self.uncertain_keys,
+            Held::Button => &self.uncertain_buttons,
         }
     }
 
@@ -710,12 +717,14 @@ impl Kvmd {
                 "cookie login cannot replace configured header credentials".into(),
             ));
         }
-        let inputs = self.inputs.lock().await;
+        let mut inputs = self.inputs.lock().await;
         if !inputs.keys.is_empty() || !inputs.buttons.is_empty() {
             return Err(Error::AmbiguousInput(
                 "release tracked inputs before changing authentication".into(),
             ));
         }
+        // A release skipped because cleanup already sent it belongs to the session being replaced.
+        inputs.cleaned.clear();
         let mut pending = self.approval_token.lock().await;
         *pending = None;
         let mut active = self.client.write().await;
@@ -776,12 +785,14 @@ impl Kvmd {
                 "device approval requires the GLKVM profile".into(),
             ));
         }
-        let inputs = self.inputs.lock().await;
+        let mut inputs = self.inputs.lock().await;
         if !inputs.keys.is_empty() || !inputs.buttons.is_empty() {
             return Err(Error::AmbiguousInput(
                 "release tracked inputs before changing authentication".into(),
             ));
         }
+        // A release skipped because cleanup already sent it belongs to the session being replaced.
+        inputs.cleaned.clear();
         let mut pending = self.approval_token.lock().await;
         let token = pending
             .as_ref()
@@ -1000,9 +1011,13 @@ impl Kvmd {
         (result, released)
     }
 
-    /// Releases tracked inputs for an abandoned request, the caller holding the input lock, recording each confirmed release in `inputs.cleaned`.
+    /// Releases tracked inputs for an abandoned request, the caller holding the input lock, recording each confirmed release in `inputs.cleaned` unless the input is tracked as uncertain, since an earlier ambiguous press may still be applied after the release.
     async fn clean_abandoned(&self, inputs: &mut Inputs) {
         let (result, released) = self.release_owed(inputs).await;
+        let released: Vec<_> = released
+            .into_iter()
+            .filter(|(kind, name)| !inputs.uncertain(*kind).contains(name))
+            .collect();
         inputs.cleaned.extend(released);
         if let Err(error) = result {
             eprintln!("Input cleanup uncertain: {error}");

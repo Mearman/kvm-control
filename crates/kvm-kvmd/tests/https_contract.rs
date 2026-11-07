@@ -36,7 +36,10 @@ async fn gated_input(State(calls): State<Calls>, uri: Uri) -> impl IntoResponse 
     calls.3.notify_one();
     calls.4.notified().await;
     let query = uri.query().unwrap();
-    if query.contains("ambiguous") && query.contains("state=false") {
+    // "ambiguous" fails its release and "late" its press, standing for requests a server may still apply after the timeout.
+    if (query.contains("ambiguous") && query.contains("state=false"))
+        || (query.contains("late") && query.contains("state=true"))
+    {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({"ok": false})),
@@ -860,6 +863,63 @@ fn input_interrupted_by_runtime_shutdown_stays_tracked_as_ambiguous() {
             "key=KeyA&state=true",
             "key=KeyA&state=false",
             "key=KeyB&state=true"
+        ]
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn release_after_an_ambiguous_press_is_sent_after_cleanup() {
+    let (mut endpoint, ca, calls, server) = fixture().await;
+    endpoint.set_path("/gated/");
+    let device = Arc::new(client(endpoint, Some(ca)));
+    assert!(matches!(
+        drive(&calls, device.key("late", true)).await,
+        Err(Error::AmbiguousInput(_))
+    ));
+    let sender = device.clone();
+    let abandoned = tokio::spawn(async move { sender.key("KeyB", true).await });
+    calls.3.notified().await;
+    abandoned.abort();
+    assert!(abandoned.await.unwrap_err().is_cancelled());
+    calls.4.notify_one();
+    // Cleanup releases both inputs, but the device may still apply the timed-out press of "late" afterwards.
+    let _ = drive(&calls, device.key("late", false)).await;
+    assert_eq!(
+        input_events(&calls),
+        [
+            "key=late&state=true",
+            "key=KeyB&state=true",
+            "key=KeyB&state=false",
+            "key=late&state=false",
+            "key=late&state=false",
+        ]
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn release_after_cleanup_is_sent_again_in_a_new_login() {
+    let (mut endpoint, ca, calls, server) = fixture().await;
+    endpoint.set_path("/gated/");
+    let device = Arc::new(client(endpoint, Some(ca)));
+    let sender = device.clone();
+    let press = tokio::spawn(async move { sender.key("KeyA", true).await });
+    calls.3.notified().await;
+    press.abort();
+    assert!(press.await.unwrap_err().is_cancelled());
+    calls.4.notify_one();
+    drive(&calls, async {
+        device.login("test-user", "test-password").await.unwrap();
+        device.key("KeyA", false).await.unwrap();
+    })
+    .await;
+    assert_eq!(
+        input_events(&calls),
+        [
+            "key=KeyA&state=true",
+            "key=KeyA&state=false",
+            "key=KeyA&state=false"
         ]
     );
     server.abort();
