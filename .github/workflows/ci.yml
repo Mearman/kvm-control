@@ -14,9 +14,10 @@ on:
 permissions:
   contents: read
 
+# A run on main can push a release tag and then spend its remaining jobs building and publishing that release, so main runs queue instead of cancelling each other; a superseded pull request run has no such cost.
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_INCREMENTAL: 0
@@ -24,11 +25,13 @@ env:
 
 jobs:
   checks:
+    name: Checks (${{ matrix.os }})
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
@@ -37,144 +40,112 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
-      - name: Install release test dependency
-        if: matrix.os == 'ubuntu-latest'
-        run: cargo install convco --version 0.7.2 --locked
-      - name: Test release recovery
-        if: matrix.os == 'ubuntu-latest'
-        run: bash .github/scripts/test-release.sh
-      - run: cargo fmt --all --check
-      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
-      - run: cargo test --workspace --locked
-      - name: Test release version metadata
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Check formatting
+        run: cargo fmt --all --check
+      - name: Check Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Test workspace
+        run: cargo test --workspace --locked
+      - name: Test independent consumer
+        run: cargo test --locked --manifest-path examples/in-process/Cargo.toml
+      - name: Test release version stamping
         run: bash .github/scripts/test-release-version.sh
 
+  release-scripts:
+    name: Release scripts
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
+        with:
+          tool: convco@0.7.2
+      - name: Test release planning and recovery
+        run: bash .github/scripts/test-release.sh
+
   commits:
+    name: Conventional commits
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           fetch-depth: 0
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
-      - run: cargo install convco --version 0.7.2 --locked
+      - uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
+        with:
+          tool: convco@0.7.2
       - name: Check conventional commits
         env:
           BASE: ${{ github.event.pull_request.base.sha }}
           HEAD: ${{ github.event.pull_request.head.sha }}
         run: convco check "$BASE..$HEAD"
 
-  validate-release-archives:
-    if: github.event_name == 'pull_request' && github.base_ref == 'ci'
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-24.04
-            target: x86_64-unknown-linux-gnu
-          - os: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-gnu
-          - os: macos-15-intel
-            target: x86_64-apple-darwin
-          - os: macos-15
-            target: aarch64-apple-darwin
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
-        with:
-          ref: 7c0eb187aa5d34036ca6827c5f54ab95b3ba1751
-          persist-credentials: false
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
-        with:
-          ref: ${{ github.sha }}
-          path: .release-tools
-          persist-credentials: false
-      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
-        with:
-          targets: ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
-      - name: Set release package version
-        run: bash .release-tools/.github/scripts/set-release-version.sh v0.1.0
-      - name: Build all interfaces
-        env:
-          TARGET: ${{ matrix.target }}
-        run: cargo build --locked --release --target "$TARGET" --workspace --bins --message-format=json > build-messages.json
-      - name: Package and smoke test installed binaries
-        shell: bash
-        env:
-          TARGET: ${{ matrix.target }}
-        run: |
-          set -euo pipefail
-          name="kvm-control-v0.1.0-${TARGET}.tar.gz"
-          mkdir -p dist installed
-          jq -r 'select(.reason == "compiler-artifact" and (.target.kind | index("bin")) != null and .executable != null) | .target.name' build-messages.json | sort -u > binaries.txt
-          printf '%s\n' kvm-cli kvm-mcp kvm-tui > expected-binaries.txt
-          diff -u expected-binaries.txt binaries.txt
-          while IFS= read -r binary; do
-            test -x "target/$TARGET/release/$binary"
-          done < binaries.txt
-          tar -czf "dist/$name" -C "target/$TARGET/release" -T "$GITHUB_WORKSPACE/binaries.txt"
-          (cd dist && shasum -a 256 "$name" > "$name.sha256" && shasum -a 256 -c "$name.sha256")
-          tar -xzf "dist/$name" -C installed
-          installed/kvm-cli --help >/dev/null
-          installed/kvm-tui --help >/dev/null
-          if env -i installed/kvm-mcp >mcp.stdout 2>mcp.stderr; then
-            printf 'Expected kvm-mcp to reject missing configuration\n' >&2
-            exit 1
-          fi
-          grep -Fx 'Error: NotPresent' mcp.stderr
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: validation-${{ matrix.target }}
-          path: dist/
-          if-no-files-found: error
-
-  version:
-    if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main'
-    needs: checks
+  # Decides what the archive jobs build. On main it is the release plan from version.sh: every tagged release whose publication is unfinished, then the next version the conventional commits since the last release call for, if any. A pull request builds its own head, stamped with version 0.0.0, which no release can carry because the first release is 0.1.0.
+  plan:
+    name: Release plan
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
+    timeout-minutes: 15
     outputs:
-      plan: ${{ steps.version.outputs.plan }}
-      matrix: ${{ steps.version.outputs.matrix }}
+      plan: ${{ steps.plan.outputs.plan }}
+      abandon: ${{ steps.plan.outputs.abandon }}
+      matrix: ${{ steps.plan.outputs.matrix }}
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           fetch-depth: 0
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
-      - run: cargo install convco --version 0.7.2 --locked
-      - id: version
-        name: Calculate release version
+        if: github.event_name != 'pull_request'
+      - uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
+        if: github.event_name != 'pull_request'
+        with:
+          tool: convco@0.7.2
+      - id: plan
+        name: Calculate release plan
         shell: bash
         env:
+          EVENT: ${{ github.event_name }}
           ATTEMPT: ${{ github.run_attempt }}
           GH_TOKEN: ${{ github.token }}
           ABANDON_INVALID_TAG: ${{ inputs.abandon_invalid_tag }}
-        run: bash .github/scripts/version.sh
+        run: |
+          set -euo pipefail
+          if [ "$EVENT" = pull_request ]; then
+            plan=$(jq -cn --arg commit "$GITHUB_SHA" '[{tag:"v0.0.0",commit:$commit}]')
+            printf 'plan=%s\nabandon=\n' "$plan" >> "$GITHUB_OUTPUT"
+            PLAN="$plan" bash .github/scripts/release-matrix.sh
+          else
+            bash .github/scripts/version.sh
+          fi
       - name: Verify release binaries exist
+        if: github.event_name != 'pull_request'
         env:
-          PLAN: ${{ steps.version.outputs.plan }}
+          PLAN: ${{ steps.plan.outputs.plan }}
         run: bash .github/scripts/check-release-binaries.sh
-      - name: Record release intent
-        env:
-          PLAN: ${{ steps.version.outputs.plan }}
-        run: bash .github/scripts/record-release-intent.sh
 
   archives:
-    needs: version
-    if: needs.version.outputs.plan != '[]'
+    name: Archive (${{ matrix.tag }}, ${{ matrix.target }})
+    needs: plan
+    if: needs.plan.outputs.plan != '[]'
     strategy:
       fail-fast: false
       matrix:
-        include: ${{ fromJSON(needs.version.outputs.matrix) }}
+        include: ${{ fromJSON(needs.plan.outputs.matrix) }}
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           ref: ${{ matrix.commit }}
           persist-credentials: false
+      # A recovered release builds its own commit, which may predate the release tooling, so the tooling comes from the commit that started the run.
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           ref: ${{ github.sha }}
@@ -184,55 +155,107 @@ jobs:
         with:
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          key: ${{ matrix.target }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Set release package version
         env:
           TAG: ${{ matrix.tag }}
         run: bash .release-tools/.github/scripts/set-release-version.sh "$TAG"
-      - name: Build all interfaces
+      - name: Build release binaries
         env:
           TARGET: ${{ matrix.target }}
-        run: cargo build --locked --release --target "$TARGET" --workspace --bins --message-format=json > build-messages.json
-      - name: Create and verify archive
-        shell: bash
+        run: cargo build --locked --release --target "$TARGET" --workspace --bins --message-format=json > "$RUNNER_TEMP/build-messages.json"
+      - name: Package archive
         env:
           TARGET: ${{ matrix.target }}
           TAG: ${{ matrix.tag }}
-        run: |
-          set -euo pipefail
-          name="kvm-control-${TAG}-${TARGET}.tar.gz"
-          mkdir -p dist
-          jq -r 'select(.reason == "compiler-artifact" and (.target.kind | index("bin")) != null and .executable != null) | .target.name' build-messages.json | sort -u > binaries.txt
-          test -s binaries.txt
-          while IFS= read -r binary; do
-            test -x "target/$TARGET/release/$binary"
-          done < binaries.txt
-          tar -czf "dist/$name" -C "target/$TARGET/release" -T "$GITHUB_WORKSPACE/binaries.txt"
-          (cd dist && shasum -a 256 "$name" > "$name.sha256" && shasum -a 256 -c "$name.sha256")
+        run: bash .release-tools/.github/scripts/package-archive.sh "$TARGET" "$TAG" "$RUNNER_TEMP/build-messages.json"
+      - name: Smoke test archive
+        env:
+          TARGET: ${{ matrix.target }}
+          TAG: ${{ matrix.tag }}
+        run: bash .release-tools/.github/scripts/smoke-test-archive.sh "dist/kvm-control-${TAG}-${TARGET}.tar.gz" "${TAG#v}"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: ${{ matrix.tag }}-${{ matrix.target }}
           path: dist/
           if-no-files-found: error
 
-  publish:
-    needs: [version, archives]
-    if: needs.version.outputs.plan != '[]' && needs.archives.result == 'success'
+  # The release jobs below run only for main: they push tags and publish GitHub releases with the workflow token.
+  release-intent:
+    name: Record release intent
+    needs: [checks, release-scripts, plan]
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request' && (needs.plan.outputs.plan != '[]' || needs.plan.outputs.abandon != '')
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
       contents: write
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           fetch-depth: 0
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+      - name: Push release and abandonment tags
+        env:
+          PLAN: ${{ needs.plan.outputs.plan }}
+          ABANDON: ${{ needs.plan.outputs.abandon }}
+        run: bash .github/scripts/record-release-intent.sh
+
+  publish:
+    name: Publish release
+    needs: [plan, release-intent, archives]
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request' && needs.plan.outputs.plan != '[]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
+          fetch-depth: 0
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: v*
           path: dist
           merge-multiple: true
-      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
-      - run: cargo install convco --version 0.7.2 --locked
-      - name: Verify assets and publish draft
-        shell: bash
+      - uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
+        with:
+          tool: convco@0.7.2
+      - name: Verify assets and publish releases
         env:
           GH_TOKEN: ${{ github.token }}
-          PLAN: ${{ needs.version.outputs.plan }}
+          PLAN: ${{ needs.plan.outputs.plan }}
         run: bash .github/scripts/publish-plan.sh
+
+  # Installs each published archive the way a user would: an unauthenticated download of the public release assets, checksum verification, and the smoke test on a runner of the archive's target.
+  verify-release:
+    name: Verify release (${{ matrix.tag }}, ${{ matrix.target }})
+    needs: [plan, publish]
+    if: needs.plan.outputs.plan != '[]'
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+      - name: Download and verify published archive
+        env:
+          TARGET: ${{ matrix.target }}
+          TAG: ${{ matrix.tag }}
+        run: |
+          set -euo pipefail
+          name="kvm-control-${TAG}-${TARGET}.tar.gz"
+          mkdir "$RUNNER_TEMP/release"
+          cd "$RUNNER_TEMP/release"
+          curl -fsSLO "https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/${name}"
+          curl -fsSLO "https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/${name}.sha256"
+          shasum -a 256 -c "${name}.sha256"
+      - name: Smoke test published archive
+        env:
+          TARGET: ${{ matrix.target }}
+          TAG: ${{ matrix.tag }}
+        run: bash .github/scripts/smoke-test-archive.sh "$RUNNER_TEMP/release/kvm-control-${TAG}-${TARGET}.tar.gz" "${TAG#v}"
