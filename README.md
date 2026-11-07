@@ -27,7 +27,7 @@ kvm-control/kvm-cli --version
 
 Connect to the device's HTTPS origin, or an HTTPS reverse-proxy prefix exposing its KVMD routes. The endpoint must not contain credentials, a query or a fragment. For example, `https://kvm.example.com` is an origin, not a cloud account or relay. The adapter appends `/api/` to the supplied prefix. Live video also needs the prefix's `/streamer/stream` route and a WebSocket upgrade at `/api/ws?stream=true`. Network access to the device or proxy and working device credentials are required.
 
-Use a certificate trusted by the client or supply the device CA with `--ca`. `--insecure-tls` disables certificate verification and should not be used on an untrusted network.
+Use a certificate trusted by the client or supply the device CA with `--ca`. `--insecure-tls` disables certificate verification and should not be used on an untrusted network; it cannot be combined with `--ca`, which it would make unused.
 
 ## CLI
 
@@ -53,7 +53,7 @@ In viewing mode, `i` enters input mode, `F12` leaves it, `r` refreshes, and `q` 
 
 `kvm-mcp` is a local stdio MCP server, not a network listener. It reads `KVM_ENDPOINT`, `KVM_PROFILE` (`pikvm` or `glkvm`), `KVM_USERNAME` and `KVM_PASSWORD_FD`. On Unix the last variable names an inherited pipe descriptor numbered at least 3, containing the password. If any of the four is unset or not valid Unicode, it exits before connecting with an error naming each such variable, and what to set an unset one to, without printing any variable's value. The launcher must arrange the pipe separately from MCP stdin and close its write end after supplying the password. Do not put passwords in command arguments, URLs, MCP tool arguments or environment variables. The current password-descriptor implementation does not support non-Unix systems.
 
-Optional `KVM_CA_FILE` selects a PEM CA; `KVM_INSECURE_TLS=1` disables certificate verification. Status, capabilities and snapshot tools are available by default. `KVM_ALLOW_CONTROL=1` enables key and mouse operations; `KVM_ALLOW_CONSEQUENTIAL=1` independently enables power, switch, GPIO and media operations. A tool's `confirmed` field is not evidence of human consent: the host must obtain consent independently. See [security](SECURITY.md).
+Optional `KVM_CA_FILE` selects a PEM CA; `KVM_INSECURE_TLS=1` disables certificate verification, and the server refuses to start when both are set. Status, capabilities and snapshot tools are available by default. `KVM_ALLOW_CONTROL=1` enables key and mouse operations; `KVM_ALLOW_CONSEQUENTIAL=1` independently enables power, switch, GPIO and media operations. A tool's `confirmed` field is not evidence of human consent: the host must obtain consent independently. See [security](SECURITY.md).
 
 ## Two-factor authentication
 
@@ -63,9 +63,9 @@ For devices requiring TOTP, `--totp` prompts for a current code in the CLI or TU
 
 `kvm-core` exposes the async `Device` and `VideoStream` traits, status and capability types, input methods and explicitly confirmed control operations, and the contracts for reaching a device: a serialisable `Endpoint` (address, explicit profile, `AuthScheme`, `ServerTrust` and timeout, with an optional label and never a secret), `Credentials` whose `Secret` values are zeroed on drop, redacted from `Debug` output and never serialised, the `Authenticate` trait (`login`, `complete_approval`, `check_auth` and the session's `CallerIdentity`), the `Connection` trait (a `Device` that also authenticates and reads its `DeviceIdentity`) and the `Connector` trait, whose `connect` opens a connection, logs in and returns it authenticated or pending approval. A `Device` implementation that needs no login implements `Device` alone.
 
-`DeviceIdentity` keeps what the caller configured apart from what the device claims: the endpoint label, address and profile are the caller's, `address_verified` says whether TLS authenticated the server for the address, and the serial number and host name are the device's own unverified reports, `Unknown` or `Unsupported` when not observed. `DeviceIdentity::id` derives a stable `DeviceId` from the endpoint label (or the address without one), the profile and the reported serial number; nothing is inferred from model names.
+`DeviceIdentity` keeps what the caller configured apart from what the device claims: the endpoint label, address and profile are the caller's, `address_verified` says whether TLS authenticated the server for the address, and the serial number and host name are the device's own unverified reports, `Unknown` or `Unsupported` when not observed. `DeviceIdentity::id` (or `Endpoint::device_id`) derives a `DeviceId` from the configuration alone: the endpoint label, or the address when there is no label (tagged, so a label spelt like an address does not collide with it), and the profile. It is stable under what the caller configured, so a failed read or a firmware that changes what it reports leaves it unchanged, and it identifies the configured endpoint rather than the hardware; compare the reported serial number separately where that matters. Nothing is inferred from model names.
 
-`kvm-kvmd` implements these contracts as `Kvmd`, opened by `KvmdConnector` (or `Kvmd::new`) without contacting the device. `AuthScheme::Session` is KVMD's cookie login, with an optional TOTP code and, under the GLKVM profile, device approval; `Header` and `Basic` send the credentials with every request, so their `login` installs them without a request and returns `LoginState::Unverified`, and `Connector::connect` then confirms them with `check_auth`. Inspect `examples/in-process/src/main.rs` for an in-process consumer that connects, authenticates and reads the identity of a synthetic device through `kvm-core` alone; run it with `cargo run --manifest-path examples/in-process/Cargo.toml`. It is not a hardware demonstration.
+`kvm-kvmd` implements these contracts as `Kvmd`, opened by `KvmdConnector` (or `Kvmd::new`) without contacting the device. `AuthScheme::Session` is KVMD's cookie login, with an optional TOTP code and, under the GLKVM profile, device approval; `Header` and `Basic` send the credentials with every request, so their `login` installs them without a request and returns `LoginState::Unverified`, and `Connector::connect` (or `Connected::authenticate` after `Connector::open`, which lets a caller validate the endpoint before asking for secrets) then confirms them with `check_auth`. `identity` reads the info route alone. Inspect `examples/in-process/src/main.rs` for an in-process consumer that connects, authenticates and reads the identity of a synthetic device through `kvm-core` alone; run it with `cargo run --manifest-path examples/in-process/Cargo.toml`. It is not a hardware demonstration.
 
 Library callers should explicitly await `release_inputs()` when ending input and handle its error. A submitted KVMD input request continues if its caller is cancelled; an ambiguous outcome must not be replayed blindly and leaves cleanup indeterminate for that adapter instance. Dropping the adapter attempts asynchronous cleanup on its captured runtime, but does not wait for confirmation and cannot guarantee cleanup after runtime or process termination. Dropping a video stream releases its transport resources. See [security](SECURITY.md) for the client shutdown boundaries.
 
@@ -86,11 +86,11 @@ url = "2"
 zeroize = "1"
 ```
 
-To pin by commit, replace `tag = "v0.1.1"` with `rev = "529c8f88010c8b9d1342914a33bbe8c185209132"`, the commit `v0.1.1` points to, in both lines. `Cargo.lock` records the resolved commit either way; change the reference in `Cargo.toml` to move to another release. The crates use the 2024 edition and declare no minimum supported Rust version, so build them with a current stable toolchain. A project that only consumes or implements the `Device` contract, as [`examples/in-process`](examples/in-process) does, needs `kvm-core` and not `kvm-kvmd`; its [manifest](examples/in-process/Cargo.toml) lists the other crates that implementing the traits needs.
+To pin by commit, replace `tag = "v0.1.1"` with `rev = "529c8f88010c8b9d1342914a33bbe8c185209132"`, the commit `v0.1.1` points to, in both lines. `Cargo.lock` records the resolved commit either way; change the reference in `Cargo.toml` to move to another release. The crates use the 2024 edition and declare their minimum supported Rust version as `rust-version` in the workspace manifest, the highest that their locked dependencies declare; `cargo` refuses an older toolchain. A project that only consumes or implements the `Device` contract, as [`examples/in-process`](examples/in-process) does, needs `kvm-core` and not `kvm-kvmd`; its [manifest](examples/in-process/Cargo.toml) lists the other crates that implementing the traits needs.
 
-A minimal consumer of a real device runs the adapter in its own process, like `examples/in-process`, but with `KvmdConnector` in place of the synthetic connector. It uses the connection contracts, which a release tagged before the commit adding them lacks. It reads the password from redirected standard input; the key press types the letter `a` on the controlled host.
+A minimal consumer of a real device runs the adapter in its own process, like `examples/in-process`, but with `KvmdConnector` in place of the synthetic connector. It uses the connection contracts, which a release tagged before the commit adding them lacks. It reads the password from redirected standard input; the key press types the letter `a` on the controlled host. The workspace tests compile this example, without running it, as a documentation test of `kvm-kvmd`.
 
-```rust
+```rust,no_run
 use std::{io::BufRead, time::Duration};
 
 use kvm_core::{
@@ -124,7 +124,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let credentials = Credentials::new("operator", password);
     let Connected::Authenticated(connection) = KvmdConnector.connect(endpoint, credentials).await?
     else {
-        return Err("approve the login on the device, then call complete_approval".into());
+        // A device asking for approval needs a loop on complete_approval, as the CLI has.
+        return Err("this example does not handle device approval".into());
     };
     println!("Connected to {:?}", connection.identity().await?.id());
     // Depend on the Device contract, as examples/in-process does.
