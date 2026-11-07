@@ -532,6 +532,47 @@ async fn cancelled_move_finishes_before_button_press() {
 }
 
 #[tokio::test]
+async fn movement_abandoned_during_its_state_read_is_not_sent() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let device = Arc::new(input_device(listener.local_addr().unwrap()));
+    let (read_tx, read_rx) = tokio::sync::oneshot::channel();
+    let (answer_tx, answer_rx) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        let (mut state, _) = listener.accept().await.unwrap();
+        assert!(read_request(&mut state).await.contains("/api/hid "));
+        read_tx.send(()).unwrap();
+        answer_rx.await.unwrap();
+        let body = b"{\"ok\":true,\"result\":{\"enabled\":true,\"mouse\":{\"online\":true,\"absolute\":true}}}";
+        state
+            .write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        state.write_all(body).await.unwrap();
+        listener
+    });
+    let moving = device.clone();
+    let movement = tokio::spawn(async move { moving.mouse_move(1, 2).await });
+    read_rx.await.unwrap();
+    // The caller leaves while the state read is unanswered, after the check that follows settlement.
+    movement.abort();
+    assert!(movement.await.unwrap_err().is_cancelled());
+    answer_tx.send(()).unwrap();
+    let listener = tokio::time::timeout(INPUT_TIMEOUT, server)
+        .await
+        .unwrap()
+        .unwrap();
+    // Once the input task has finished, any movement it sent is already waiting to be accepted.
+    input_tasks_finished(&device.inputs).await;
+    assert_no_waiting_connection(listener, "an abandoned movement was sent");
+}
+
+#[tokio::test]
 async fn cancelled_waiter_cannot_replace_cleanup_runtime() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let device = Arc::new(input_device(listener.local_addr().unwrap()));
