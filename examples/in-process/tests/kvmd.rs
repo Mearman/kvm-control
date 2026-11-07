@@ -14,7 +14,7 @@ use axum::{
 use axum_server::tls_rustls::RustlsConfig;
 use kvm_core::{
     AuthScheme, CallerIdentity, Connector, Credentials, Device, DeviceProfile, Endpoint,
-    LoginState, Reported, ServerTrust,
+    EndpointName, LoginState, Reported, ServerTrust,
 };
 use kvm_kvmd::KvmdConnector;
 use serde_json::json;
@@ -163,8 +163,11 @@ async fn downstream_uses_real_adapter_against_synthetic_https_device() {
         Reported::Supported("SYNTHETIC-0001".into())
     );
     assert_eq!(identity.host, Reported::Supported("synthetic-kvm".into()));
-    assert_eq!(identity.id().endpoint, "synthetic-bench");
-    assert_eq!(identity.id(), connection.identity().await.unwrap().id());
+    assert_eq!(identity.id(), endpoint.device_id());
+    assert_eq!(
+        identity.id().endpoint,
+        EndpointName::Label("synthetic-bench".into())
+    );
     let device: Arc<dyn Device> = connection;
     let status = device.status().await.unwrap();
     assert_eq!(

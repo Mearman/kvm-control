@@ -6,8 +6,9 @@ use async_trait::async_trait;
 use kvm_core::{
     AuthScheme, Authenticate, CallerIdentity, Capabilities, Capability, Confirmation, Connected,
     Connection, Connector, Control, ControlOutcome, Credentials, Device, DeviceIdentity,
-    DeviceProfile, DeviceStatus, Endpoint, Error, LoginState, MouseMode, PlatformInfo, Reported,
-    Result, ServerTrust, Snapshot, SwitchPort, SwitchStatus, SystemInfo, VideoStream,
+    DeviceProfile, DeviceStatus, Endpoint, EndpointName, Error, LoginState, MouseMode,
+    PlatformInfo, Reported, Result, ServerTrust, Snapshot, SwitchPort, SwitchStatus, SystemInfo,
+    VideoStream,
 };
 use std::{
     sync::{Arc, Mutex},
@@ -276,7 +277,7 @@ impl Connection for FakeConnection {
         Ok(DeviceIdentity::observe(
             &self.endpoint,
             false,
-            &self.status().await?,
+            &self.status().await?.info,
         ))
     }
 }
@@ -395,19 +396,59 @@ fn endpoint(auth: AuthScheme) -> Endpoint {
     }
 }
 
-/// Connects through any connector, waits out a pending approval, then reads the device's identity. A consumer written against the contract alone, as this one is, works with any implementation.
+/// Why the consumer could not connect, beside the device's own errors.
+#[derive(Debug)]
+enum ConnectError {
+    Device(Error),
+    /// The device holds the login for approval without saying when the request expires, so there is no bound on waiting.
+    NoApprovalExpiry,
+    /// The approval request expired before it was granted.
+    ApprovalExpired,
+}
+
+impl From<Error> for ConnectError {
+    fn from(error: Error) -> Self {
+        Self::Device(error)
+    }
+}
+
+impl std::fmt::Display for ConnectError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Device(error) => error.fmt(formatter),
+            Self::NoApprovalExpiry => formatter.write_str("device approval has no expiry"),
+            Self::ApprovalExpired => formatter.write_str("device approval expired"),
+        }
+    }
+}
+
+impl std::error::Error for ConnectError {}
+
+/// Connects through any connector, waits out a pending approval by checking every `poll` until the device's expiry, then reads the device's identity. A consumer written against the contract alone, as this one is, works with any implementation.
 async fn connect(
     connector: &dyn Connector,
     endpoint: Endpoint,
     credentials: Credentials,
-) -> Result<(Arc<dyn Connection>, DeviceIdentity)> {
+    poll: Duration,
+) -> std::result::Result<(Arc<dyn Connection>, DeviceIdentity), ConnectError> {
     let connection = match connector.connect(endpoint, credentials).await? {
         Connected::Authenticated(connection) => connection,
-        Connected::ApprovalPending { connection, .. } => {
+        Connected::ApprovalPending {
+            connection,
+            expires_in,
+        } => {
             println!("Approve the login on the device");
-            // A real consumer would also wait between checks and give up when the approval expires.
-            while connection.complete_approval().await? != LoginState::Authenticated {}
-            connection
+            let expiry = expires_in.ok_or(ConnectError::NoApprovalExpiry)?;
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(expiry);
+            loop {
+                tokio::time::sleep_until((tokio::time::Instant::now() + poll).min(deadline)).await;
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(ConnectError::ApprovalExpired);
+                }
+                if connection.complete_approval().await? == LoginState::Authenticated {
+                    break connection;
+                }
+            }
         }
     };
     let identity = connection.identity().await?;
@@ -415,12 +456,13 @@ async fn connect(
 }
 
 #[tokio::main]
-async fn main() -> std::result::Result<(), ConsumeError> {
+async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let connector = FakeConnector { approval_checks: 2 };
     let (connection, identity) = connect(
         &connector,
         endpoint(AuthScheme::Session),
         Credentials::new(USERNAME, PASSWORD),
+        Duration::from_secs(1),
     )
     .await?;
     println!(
@@ -436,6 +478,9 @@ async fn main() -> std::result::Result<(), ConsumeError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The interval between approval checks in tests: short, so the synthetic approval is not waited for.
+    const TEST_POLL: Duration = Duration::from_millis(1);
 
     #[tokio::test]
     async fn consumer_uses_the_device_contract_in_process() {
@@ -465,6 +510,7 @@ mod tests {
                 &connector,
                 endpoint(AuthScheme::Session),
                 Credentials::new(USERNAME, PASSWORD),
+                TEST_POLL,
             )
             .await
             .unwrap();
@@ -479,7 +525,10 @@ mod tests {
             assert!(!identity.address_verified);
             assert_eq!(identity.serial, Reported::Supported(SERIAL.into()));
             assert_eq!(identity.host, Reported::Unknown);
-            assert_eq!(identity.id().endpoint, "bench-kvm");
+            assert_eq!(
+                identity.id().endpoint,
+                EndpointName::Label("bench-kvm".into())
+            );
             assert_eq!(
                 consume(connection.as_ref()).await.unwrap(),
                 ControlOutcome::Unverified
@@ -495,9 +544,10 @@ mod tests {
                 &connector,
                 endpoint(AuthScheme::Session),
                 Credentials::new(USERNAME, "wrong"),
+                TEST_POLL,
             )
             .await,
-            Err(Error::Authentication)
+            Err(ConnectError::Device(Error::Authentication))
         ));
         // A login that only installs per-request credentials leaves the check to the caller; the contract's `connect` makes it.
         let connection = connector.open(endpoint(AuthScheme::Header)).await.unwrap();
