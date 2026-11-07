@@ -135,14 +135,16 @@ fn record() -> impl Strategy<Value = Record> {
 }
 
 proptest! {
-    // The held sets follow each input's last operation whether or not it was confirmed, the two kinds never mix, and any unconfirmed or abandoned request marks its input and the session indeterminate permanently. Breaks if a release leaves the name held, an abandoned request is forgotten, or the indeterminate flag is ever cleared.
+    // The held sets follow each input's last operation whether or not it was confirmed, the two kinds never mix, any unconfirmed or abandoned request marks its input and the session indeterminate permanently, and the record of each input's last request covers only tracked inputs. Breaks if a release leaves the name held, an abandoned request is forgotten, the indeterminate flag is ever cleared, or a release leaves its input's last request recorded.
     #[test]
     fn held_inputs_follow_their_last_operation(records in vec(record(), 0..32)) {
         let mut inputs = Inputs::default();
         let mut last: BTreeMap<(bool, String), bool> = BTreeMap::new();
         let mut unconfirmed: BTreeSet<(bool, String)> = BTreeSet::new();
-        for step in records {
+        for (sequence, step) in (1..).zip(records) {
             let kind = if step.key { Held::Key } else { Held::Button };
+            // Recorded before sending, as a key or button request does.
+            inputs.last.insert((kind, step.name.clone()), sequence);
             let in_flight = InFlight {
                 inputs: &mut inputs,
                 kind,
@@ -177,6 +179,9 @@ proptest! {
             prop_assert_eq!(&inputs.uncertain_keys, &uncertain(true));
             prop_assert_eq!(&inputs.uncertain_buttons, &uncertain(false));
             prop_assert_eq!(inputs.indeterminate, !unconfirmed.is_empty());
+            for (kind, name) in inputs.last.keys() {
+                prop_assert!(inputs.held(*kind).contains(name), "{name} is not tracked");
+            }
         }
     }
 }
