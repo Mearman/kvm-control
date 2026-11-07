@@ -161,6 +161,39 @@ fn assert_no_waiting_connection(listener: TcpListener, message: &str) {
     );
 }
 
+/// Builds a video test device as the other video tests do: a client with no request timeout, as `Kvmd::new` gives the video client, and `VIDEO_TIMEOUT` in its configuration.
+fn video_device(address: std::net::SocketAddr, profile: DeviceProfile) -> Kvmd {
+    let endpoint = Url::parse(&format!("http://{address}/")).unwrap();
+    let client = reqwest::Client::builder().http1_only().build().unwrap();
+    Kvmd {
+        client: Arc::new(tokio::sync::RwLock::new(crate::Session {
+            client: client.clone(),
+            video: client,
+            cookies: Default::default(),
+        })),
+        config: Config {
+            endpoint: endpoint.clone(),
+            profile,
+            trusted_ca_pem: None,
+            insecure_tls: false,
+            timeout: VIDEO_TIMEOUT,
+        },
+        endpoint,
+        profile,
+        inputs: Default::default(),
+        owed: Default::default(),
+        auth_headers: Default::default(),
+        approval_token: Default::default(),
+        snapshot_proven: Default::default(),
+        video_proven: Default::default(),
+        cleanup_on_drop: true,
+        input_runtime: Default::default(),
+        reporter: Default::default(),
+        stream_storage: Arc::new(tokio::sync::Semaphore::new(crate::MAX_JPEG_VALIDATIONS)),
+        snapshot_storage: Arc::new(tokio::sync::Semaphore::new(crate::MAX_JPEG_VALIDATIONS)),
+    }
+}
+
 fn input_device(address: std::net::SocketAddr) -> Kvmd {
     let endpoint = Url::parse(&format!("http://{address}/")).unwrap();
     let client = reqwest::Client::builder()
@@ -2142,9 +2175,7 @@ async fn explicit_video_reopen_after_complete_or_interrupted_stream() {
                 .unwrap();
             }
         });
-        let mut device = input_device(address);
-        device.profile = profile;
-        device.config.profile = profile;
+        let device = video_device(address, profile);
         for attempt in 0..2 {
             let mut video = device.video().await.unwrap();
             if interrupted && attempt == 0 {
