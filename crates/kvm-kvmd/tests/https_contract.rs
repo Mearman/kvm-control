@@ -650,7 +650,7 @@ async fn cancelled_input_is_cleaned_up_with_a_retained_owner() {
     }
 }
 
-/// Polls a request once, which queues it on the input lock, then spawns it. A request queued this way is ahead of anything that waits for the lock afterwards, on any runtime flavour.
+/// Polls a request once, so it holds or is queued on the input lock, then spawns it. On any runtime flavour it takes the lock before anything that waits for the lock afterwards; when its spawned work then runs relative to other tasks depends on the runtime.
 async fn queue<F>(future: F) -> tokio::task::JoinHandle<F::Output>
 where
     F: std::future::Future + Send + 'static,
@@ -1063,7 +1063,8 @@ async fn cancelled_ambiguous_release_is_not_replayed() {
     server.abort();
 }
 
-#[tokio::test]
+// Pinned to the current-thread runtime: the second request's task must run its settlement after the first is dropped, which a worker thread could run earlier.
+#[tokio::test(flavor = "current_thread")]
 async fn request_abandoned_during_owed_cleanup_leaves_nothing_held() {
     let (mut endpoint, ca, calls, server) = fixture().await;
     endpoint.set_path("/gated/");
