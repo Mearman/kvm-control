@@ -205,11 +205,15 @@ struct Mjpeg {
         std::sync::Arc<std::sync::Mutex<Option<std::sync::Arc<tokio::sync::OwnedSemaphorePermit>>>>,
     >,
     idle: Duration,
+    expiry: Option<JoinHandle<()>>,
 }
 
 impl Drop for Mjpeg {
     fn drop(&mut self) {
         self.actor.abort();
+        if let Some(expiry) = self.expiry.take() {
+            expiry.abort();
+        }
     }
 }
 
@@ -284,6 +288,7 @@ impl Mjpeg {
             final_result: None,
             final_storage: None,
             idle,
+            expiry: None,
         }
     }
 }
@@ -300,6 +305,9 @@ impl VideoStream for Mjpeg {
                 .lock()
                 .expect("delivery lock poisoned")
                 .take();
+            if let Some(expiry) = self.expiry.take() {
+                expiry.abort();
+            }
             if let Some(storage) = self.final_storage.take() {
                 storage.lock().expect("storage lock poisoned").take();
             }
@@ -332,7 +340,7 @@ impl VideoStream for Mjpeg {
                         let result = std::sync::Arc::downgrade(&delivery.result);
                         let storage = std::sync::Arc::downgrade(&storage);
                         let idle = self.idle;
-                        tokio::spawn(async move {
+                        self.expiry = Some(tokio::spawn(async move {
                             tokio::time::sleep(idle).await;
                             if let Some(result) = result.upgrade() {
                                 let mut result = result.lock().expect("delivery lock poisoned");
@@ -341,7 +349,7 @@ impl VideoStream for Mjpeg {
                                     storage.lock().expect("storage lock poisoned").take();
                                 }
                             }
-                        });
+                        }));
                         delivery
                             .claimed
                             .store(true, std::sync::atomic::Ordering::Release);
@@ -356,6 +364,9 @@ impl VideoStream for Mjpeg {
                         .lock()
                         .expect("delivery lock poisoned")
                         .take();
+                    if let Some(expiry) = self.expiry.take() {
+                        expiry.abort();
+                    }
                     if let Some(storage) = self.final_storage.take() {
                         storage.lock().expect("storage lock poisoned").take();
                     }
@@ -852,6 +863,7 @@ mod tests {
             actor,
             final_result: None,
             final_storage: None,
+            expiry: None,
             idle: Duration::from_secs(3),
         };
         let mut first = Box::pin(stream.next_frame());
@@ -866,10 +878,14 @@ mod tests {
             tokio::task::yield_now().await;
         }
         assert_eq!(slots.available_permits(), 0);
+        let expiry = stream.expiry.as_ref().unwrap().abort_handle();
         assert_eq!(
             stream.next_frame().await.unwrap().unwrap().jpeg,
             vec![1, 2, 3]
         );
+        assert!(stream.expiry.is_none());
+        tokio::task::yield_now().await;
+        assert!(expiry.is_finished());
         assert_eq!(slots.available_permits(), 1);
     }
 
@@ -907,6 +923,7 @@ mod tests {
             actor,
             final_result: None,
             final_storage: None,
+            expiry: None,
             idle: Duration::from_secs(60),
         };
         let mut first = Box::pin(stream.next_frame());
@@ -917,8 +934,11 @@ mod tests {
             tokio::task::yield_now().await;
         }
         assert_eq!(slots.available_permits(), 0);
+        let expiry = stream.expiry.as_ref().unwrap().abort_handle();
         drop(stream);
         assert_eq!(slots.available_permits(), 1);
+        tokio::task::yield_now().await;
+        assert!(expiry.is_finished());
     }
 
     #[tokio::test]
@@ -955,6 +975,7 @@ mod tests {
             actor,
             final_result: None,
             final_storage: None,
+            expiry: None,
             idle: Duration::from_millis(30),
         };
         let mut first = Box::pin(stream.next_frame());
