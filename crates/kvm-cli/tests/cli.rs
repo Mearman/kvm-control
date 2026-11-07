@@ -175,6 +175,39 @@ fn version_names_the_kvm_cli_binary() {
     );
 }
 
+/// An unreadable `--ca` file is reported, naming the option and path, before any password is read or connection made.
+#[test]
+fn unreadable_ca_names_the_option_and_path() {
+    let path = std::env::temp_dir().join(format!("kvm-cli-missing-ca-{}.pem", std::process::id()));
+    let output = Command::new(env!("CARGO_BIN_EXE_kvm-cli"))
+        .args([
+            "--endpoint",
+            "https://localhost:1",
+            "--profile",
+            "pikvm",
+            "--username",
+            "synthetic",
+            "--password-stdin",
+            "--ca",
+        ])
+        .arg(&path)
+        .arg("status")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let error: Value = serde_json::from_slice(&output.stderr).unwrap();
+    assert_eq!(error["ok"], false);
+    let message = error["error"].as_str().unwrap();
+    assert!(
+        message.starts_with(&format!(
+            "cannot read --ca certificate {}: ",
+            path.display()
+        )),
+        "{message}"
+    );
+}
+
 #[test]
 fn status_is_json_and_authentication_is_not_leaked() {
     let ok = b"{\"ok\":true,\"result\":{}}";
