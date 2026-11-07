@@ -2,12 +2,12 @@
 
 use kvm_core::{
     AtxStatus, AuthScheme, CallerIdentity, Capabilities, Capability, Control, Credentials,
-    DeviceId, DeviceIdentity, DeviceProfile, DeviceStatus, Endpoint, Error, GpioInput, GpioOutput,
-    GpioStatus, HidOutputs, HidStatus, JigglerStatus, KernelInfo, KeyboardLeds, KeyboardStatus,
-    Limits, LoginState, MediaDrive, MediaImage, MediaStatus, MouseMode, MouseStatus, PlatformInfo,
-    PowerAction, Reported, Resolution, Secret, ServerTrust, StoragePartition, StreamerFeatures,
-    StreamerStatus, SwitchPort, SwitchStatus, SystemInfo, VideoSource, escape_json_for_terminal,
-    is_terminal_unsafe,
+    DeviceId, DeviceIdentity, DeviceProfile, DeviceStatus, Endpoint, EndpointName, Error,
+    GpioInput, GpioOutput, GpioStatus, HidOutputs, HidStatus, JigglerStatus, KernelInfo,
+    KeyboardLeds, KeyboardStatus, Limits, LoginState, MediaDrive, MediaImage, MediaStatus,
+    MouseMode, MouseStatus, PlatformInfo, PowerAction, Reported, Resolution, Secret, ServerTrust,
+    StoragePartition, StreamerFeatures, StreamerStatus, SwitchPort, SwitchStatus, SystemInfo,
+    VideoSource, escape_json_for_terminal, is_terminal_unsafe,
 };
 use proptest::{collection::vec, option, prelude::*};
 use serde_json::json;
@@ -564,56 +564,119 @@ proptest! {
         prop_assert_eq!(serde_json::from_value::<LoginState>(encoded).unwrap(), state);
     }
 
-    // Breaks if identity keeps a value the device did not report, takes the profile or label from anywhere but the endpoint, or does not survive serialisation.
+    // Breaks if identity takes its label, address or profile from anywhere but the endpoint, or its serial number or host name from anywhere but the report, keeps a value the device did not report, or does not survive serialisation.
     #[test]
     fn identity_separates_configuration_from_device_claims(
         endpoint in endpoint(),
         verified in any::<bool>(),
-        status in device_status(),
+        serial in any::<String>(),
+        host in any::<String>(),
     ) {
-        let identity = DeviceIdentity::observe(&endpoint, verified, &status);
-        prop_assert_eq!(&identity.label, &endpoint.label);
-        prop_assert_eq!(&identity.address, &endpoint.address);
-        prop_assert_eq!(identity.profile, endpoint.profile);
-        prop_assert_eq!(identity.address_verified, verified);
-        let (serial, host) = match &status.info {
-            Reported::Supported(info) => (
-                match &info.platform {
-                    Reported::Supported(platform) => platform.serial.clone(),
-                    Reported::Unsupported => Reported::Unsupported,
-                    Reported::Unknown => Reported::Unknown,
-                },
-                info.host.clone(),
-            ),
-            Reported::Unsupported => (Reported::Unsupported, Reported::Unsupported),
-            Reported::Unknown => (Reported::Unknown, Reported::Unknown),
+        let info = |platform: Reported<PlatformInfo>, host: Reported<String>| {
+            Reported::Supported(SystemInfo {
+                kvmd_version: Reported::Unknown,
+                streamer_app: Reported::Unknown,
+                streamer_version: Reported::Unknown,
+                kernel: Reported::Unknown,
+                platform,
+                host,
+            })
         };
-        prop_assert_eq!(&identity.serial, &serial);
-        prop_assert_eq!(&identity.host, &host);
-        let encoded = serde_json::to_value(&identity).unwrap();
-        prop_assert_eq!(serde_json::from_value::<DeviceIdentity>(encoded).unwrap(), identity.clone());
-        let id = identity.id();
-        let encoded = serde_json::to_value(&id).unwrap();
-        prop_assert_eq!(serde_json::from_value::<DeviceId>(encoded).unwrap(), id);
+        let platform = |serial: Reported<String>| {
+            Reported::Supported(PlatformInfo {
+                kind: Reported::Unknown,
+                base: Reported::Unknown,
+                serial,
+                model: Reported::Supported("not an identifier".into()),
+                video: Reported::Unknown,
+                board: Reported::Unknown,
+            })
+        };
+        let cases = [
+            (
+                info(platform(Reported::Supported(serial.clone())), Reported::Supported(host.clone())),
+                Reported::Supported(serial.clone()),
+                Reported::Supported(host.clone()),
+            ),
+            (info(platform(Reported::Unknown), Reported::Unsupported), Reported::Unknown, Reported::Unsupported),
+            (info(platform(Reported::Unsupported), Reported::Unknown), Reported::Unsupported, Reported::Unknown),
+            (info(Reported::Unknown, Reported::Supported(host.clone())), Reported::Unknown, Reported::Supported(host.clone())),
+            (info(Reported::Unsupported, Reported::Unknown), Reported::Unsupported, Reported::Unknown),
+            (Reported::Unknown, Reported::Unknown, Reported::Unknown),
+            (Reported::Unsupported, Reported::Unsupported, Reported::Unsupported),
+        ];
+        for (reported, expected_serial, expected_host) in cases {
+            let identity = DeviceIdentity::observe(&endpoint, verified, &reported);
+            prop_assert_eq!(&identity.label, &endpoint.label);
+            prop_assert_eq!(&identity.address, &endpoint.address);
+            prop_assert_eq!(identity.profile, endpoint.profile);
+            prop_assert_eq!(identity.address_verified, verified);
+            prop_assert_eq!(&identity.serial, &expected_serial);
+            prop_assert_eq!(&identity.host, &expected_host);
+            let encoded = serde_json::to_value(&identity).unwrap();
+            prop_assert_eq!(serde_json::from_value::<DeviceIdentity>(encoded).unwrap(), identity.clone());
+            let id = identity.id();
+            prop_assert_eq!(&id, &endpoint.device_id());
+            let encoded = serde_json::to_value(&id).unwrap();
+            prop_assert_eq!(serde_json::from_value::<DeviceId>(encoded).unwrap(), id);
+        }
     }
 
-    // Breaks if the identifier changes with anything but the endpoint name, the profile or the reported serial, or if two devices that differ in one of those share it.
+    // Each field of an identity is varied alone. Breaks if the identifier changes with anything the device reports or with the address of a labelled endpoint, stays the same when the label, the profile or an unlabelled address changes, or lets a label spelt like an address collide with that address.
     #[test]
-    fn device_ids_follow_endpoint_name_profile_and_serial(
+    fn device_ids_depend_only_on_the_configured_name_and_profile(
         endpoint in endpoint(),
-        other in endpoint(),
+        other_label in any::<String>(),
+        other_host in "[a-z]{1,12}",
         status in device_status(),
-        other_status in device_status(),
     ) {
-        let first = DeviceIdentity::observe(&endpoint, true, &status);
-        let second = DeviceIdentity::observe(&other, false, &other_status);
-        let name = |identity: &DeviceIdentity| identity.label.clone().unwrap_or_else(|| identity.address.to_string());
-        prop_assert_eq!(first.id().endpoint, name(&first));
-        let same = name(&first) == name(&second) && first.profile == second.profile && first.serial == second.serial;
-        prop_assert_eq!(first.id() == second.id(), same);
-        // The host name and the address verification are not part of the identifier.
-        let renamed = DeviceIdentity { host: Reported::Unknown, address_verified: !first.address_verified, ..first.clone() };
-        prop_assert_eq!(renamed.id(), first.id());
+        let identity = DeviceIdentity::observe(&endpoint, true, &status.info);
+        let id = identity.id();
+        let expected_name = match &endpoint.label {
+            Some(label) => EndpointName::Label(label.clone()),
+            None => EndpointName::Address(endpoint.address.clone()),
+        };
+        prop_assert_eq!(&id.endpoint, &expected_name);
+        prop_assert_eq!(id.profile, endpoint.profile);
+
+        // What the device reports, and whether the address was verified, never move the identifier.
+        let claims = DeviceIdentity {
+            serial: Reported::Supported("another serial".into()),
+            host: Reported::Unknown,
+            address_verified: false,
+            ..identity.clone()
+        };
+        prop_assert_eq!(claims.id(), id.clone());
+        let unread = DeviceIdentity::observe(&endpoint, false, &Reported::Unknown);
+        prop_assert_eq!(unread.id(), id.clone());
+
+        let moved = DeviceIdentity {
+            address: url::Url::parse(&format!("https://{other_host}.example.invalid/moved/")).unwrap(),
+            ..identity.clone()
+        };
+        prop_assert_eq!(moved.id() == id, identity.label.is_some());
+
+        let relabelled = DeviceIdentity {
+            label: Some(other_label.clone()),
+            ..identity.clone()
+        };
+        prop_assert_eq!(relabelled.id() == id, identity.label.as_deref() == Some(other_label.as_str()));
+
+        let reprofiled = DeviceIdentity {
+            profile: match identity.profile {
+                DeviceProfile::PiKvm => DeviceProfile::GlKvm,
+                DeviceProfile::GlKvm => DeviceProfile::PiKvm,
+            },
+            ..identity.clone()
+        };
+        prop_assert_ne!(reprofiled.id(), id);
+
+        let unlabelled = DeviceIdentity { label: None, ..identity.clone() };
+        let spelt_as_address = DeviceIdentity {
+            label: Some(identity.address.to_string()),
+            ..identity.clone()
+        };
+        prop_assert_ne!(unlabelled.id(), spelt_as_address.id());
     }
 
     // Breaks if a secret reaches debug output, which is what logs and panic messages print.
