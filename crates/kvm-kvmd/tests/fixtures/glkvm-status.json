@@ -22,7 +22,7 @@
       "outputs": {"available": [], "active": ""}
     },
     "mouse": {
-      "outputs": {"available": ["usb"], "active": "usb"},
+      "outputs": {"available": ["usb", "usb_rel"], "active": "usb_rel"},
       "online": false,
       "absolute": false
     },
@@ -46,7 +46,9 @@
       "units": [],
       "ports": [
         {"unit": 0, "channel": 0, "name": "Desk", "id": "1.1"},
-        {"unit": 0, "channel": 1, "name": "Lab", "id": "1.2"}
+        {"unit": 0, "channel": 1, "name": "Lab", "id": "1.2"},
+        {"unit": 0, "channel": 2, "name": "", "id": "1.3"},
+        {"unit": 0, "channel": 3, "name": "", "id": "1.4"}
       ],
       "limits": {}
     },

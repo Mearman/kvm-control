@@ -162,7 +162,7 @@ async fn status(State(calls): State<Calls>, uri: Uri, headers: HeaderMap) -> imp
     (StatusCode::OK, Json(json!({"ok": true, "result": result})))
 }
 
-/// Serves a profile's synthetic status fixture (`glstatus` for GLKVM, `pikvmstatus` for PiKVM, and `corestatus` with only the info, HID and streamer routes) and records every request's method and path, so a test can check that reading status sends nothing else.
+/// Serves a profile's synthetic status fixture (`glstatus` for GLKVM, `pikvmstatus` for PiKVM, `corestatus` with only the info, HID and streamer routes, and `failstatus` whose media route fails with HTTP 500 and whose ATX route answers `ok: false`) and records every request's method and path, so a test can check that reading status sends nothing else.
 async fn typed_status(State(calls): State<Calls>, method: Method, uri: Uri) -> impl IntoResponse {
     calls
         .0
@@ -181,6 +181,15 @@ async fn typed_status(State(calls): State<Calls>, method: Method, uri: Uri) -> i
     })
     .unwrap();
     let routed = prefix != "corestatus" || matches!(route, "info" | "hid" | "streamer");
+    if prefix == "failstatus" && route == "msd" {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"ok": false, "result": {}})),
+        );
+    }
+    if prefix == "failstatus" && route == "atx" {
+        return (StatusCode::OK, Json(json!({"ok": false, "result": {}})));
+    }
     match fixture.get(route) {
         Some(state) if method == Method::GET && routed => {
             (StatusCode::OK, Json(json!({"ok": true, "result": state})))
@@ -349,6 +358,7 @@ async fn fixture() -> (Url, Vec<u8>, Calls, tokio::task::JoinHandle<()>) {
         .route("/pikvmstatus/{*route}", any(typed_status))
         .route("/glstatus/{*route}", any(typed_status))
         .route("/corestatus/{*route}", any(typed_status))
+        .route("/failstatus/{*route}", any(typed_status))
         .route("/api/auth/check", get(status))
         .route("/api/info", get(status))
         .route("/api/hid", get(status))
@@ -1882,9 +1892,10 @@ async fn oversized_json_is_rejected_for_length_and_chunked_responses() {
     let mut url = endpoint;
     url.set_path("/bigstatus/");
     let device = client(url, Some(ca));
-    assert!(
-        matches!(device.status().await, Err(Error::InvalidResponse(message)) if message.contains("size limit"))
-    );
+    // An oversized route is unreadable, not a reason to discard the routes that were read.
+    let status = device.status().await.unwrap();
+    assert_eq!(status.info, Reported::Unknown);
+    assert_eq!(status.atx, Reported::Unsupported);
     server.abort();
 }
 
@@ -2326,7 +2337,12 @@ async fn typed_status_reads_every_subsystem_with_get_requests_only() {
         let info = status.info.value().unwrap();
         assert!(matches!(info.platform, Reported::Supported(_)));
         let switch = status.switch.value().unwrap();
-        assert_eq!(switch.ports.value().unwrap().len(), 2);
+        // GLKVM's sysfs-only switch always lists its four channels.
+        let port_count = match profile {
+            DeviceProfile::PiKvm => 2,
+            DeviceProfile::GlKvm => 4,
+        };
+        assert_eq!(switch.ports.value().unwrap().len(), port_count);
         let atx = status.atx.value().unwrap();
         let media = status.media.value().unwrap();
         let streamer = status.streamer.value().unwrap();
@@ -2391,5 +2407,27 @@ async fn status_reports_absent_subsystems_as_unsupported() {
             .iter()
             .all(|call| call.starts_with("GET "))
     );
+    server.abort();
+}
+
+#[tokio::test]
+async fn a_failing_route_leaves_the_other_subsystems_readable() {
+    let (endpoint, ca, calls, server) = fixture().await;
+    let status = status_client(&endpoint, &ca, "failstatus", DeviceProfile::PiKvm)
+        .status()
+        .await
+        .unwrap();
+    assert_eq!(status.media, Reported::Unknown);
+    assert_eq!(status.atx, Reported::Unknown);
+    for capability in [
+        status.info.capability(),
+        status.hid.capability(),
+        status.streamer.capability(),
+        status.switch.capability(),
+        status.gpio.capability(),
+    ] {
+        assert_eq!(capability, Capability::Supported);
+    }
+    assert_eq!(calls.0.lock().unwrap().len(), STATUS_ROUTES.len());
     server.abort();
 }
