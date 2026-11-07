@@ -14,7 +14,9 @@ Input and consequential operations are disabled separately by default. `KVM_ALLO
 
 ## Uncertain outcomes
 
-A network failure can leave input or control outcomes uncertain. Do not blindly retry an ambiguous operation: observe the device and controlled host first. `ControlOutcome::ObservedMatching` indicates an observed matching state; `Unverified` means an acknowledgement did not establish the post-state. Input cleanup is attempted in relevant client shutdown and interruption paths, but a failed cleanup cannot guarantee that a remote key or button was released.
+A network failure can leave input or control outcomes uncertain. Do not blindly retry an ambiguous operation: observe the device and controlled host first. `ControlOutcome::ObservedMatching` indicates an observed matching state; `Unverified` means an acknowledgement did not establish the post-state. A submitted input request continues after caller cancellation. An ambiguous KVMD input outcome leaves that adapter instance's input session indeterminate: even a later `release_inputs()` or reauthentication cannot establish that an earlier timed-out request will not arrive late. An ambiguous release is not automatically replayed.
+
+The CLI attempts input release after a key or click, including when interrupted by Ctrl-C or, on Unix, SIGTERM during the press. The MCP server attempts shutdown cleanup after its service ends or handles Ctrl-C or Unix SIGTERM, when input control is enabled. The TUI also attempts release on its input and shutdown paths. These are best-effort paths, not guarantees for every signal or failure: SIGKILL, process termination or a stopped runtime can prevent cleanup. Dropping the KVMD adapter schedules cleanup on its captured runtime and does not await it. A failed or indeterminate cleanup cannot establish that a remote key or button was released.
 
 ## Reporting
 
