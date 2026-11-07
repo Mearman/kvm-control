@@ -684,6 +684,75 @@ async fn failed_outcome_of_an_abandoned_press_is_reported_once() {
 }
 
 #[tokio::test]
+async fn release_interrupted_by_runtime_shutdown_is_reported_once_by_the_next_lock_holder() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut device = input_device(listener.local_addr().unwrap());
+    let reports = capture_reports(&mut device);
+    let device = Arc::new(device);
+    let (arrived_tx, arrived_rx) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        for _ in ["KeyA", "KeyB"] {
+            let (mut press, _) = listener.accept().await.unwrap();
+            assert!(read_input_request(&mut press).await.contains("state=true"));
+            respond(&mut press, "200 OK", b"{\"ok\":true}").await;
+        }
+        // The release of KeyA is held unanswered while its runtime shuts down.
+        let (mut interrupted, _) = listener.accept().await.unwrap();
+        assert!(
+            read_input_request(&mut interrupted)
+                .await
+                .contains("key=KeyA&state=false")
+        );
+        arrived_tx.send(()).unwrap();
+        let (mut release, _) = listener.accept().await.unwrap();
+        assert!(
+            read_input_request(&mut release)
+                .await
+                .contains("key=KeyB&state=false")
+        );
+        respond(&mut release, "200 OK", b"{\"ok\":true}").await;
+        let (mut press, _) = listener.accept().await.unwrap();
+        assert!(
+            read_input_request(&mut press)
+                .await
+                .contains("key=KeyC&state=true")
+        );
+        respond(&mut press, "200 OK", b"{\"ok\":true}").await;
+        drop(interrupted);
+        listener
+    });
+    device.key("KeyA", true).await.unwrap();
+    device.key("KeyB", true).await.unwrap();
+    let releasing = device.clone();
+    tokio::task::spawn_blocking(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async move {
+            tokio::select! {
+                result = releasing.release_inputs() => panic!("release completed unexpectedly: {result:?}"),
+                arrived = arrived_rx => arrived.unwrap(),
+            }
+        });
+        // Shutdown drops the release task with the KeyA release in flight, leaving no task to report it.
+    })
+    .await
+    .unwrap();
+    assert_eq!(*reports.lock().unwrap(), Vec::<String>::new());
+    device.key("KeyC", true).await.unwrap();
+    let listener = tokio::time::timeout(INPUT_TIMEOUT, server)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        *reports.lock().unwrap(),
+        ["Input cleanup uncertain: an interrupted release was not confirmed"]
+    );
+    assert_no_waiting_connection(listener, "the interrupted release was sent again");
+}
+
+#[tokio::test]
 async fn failed_release_by_an_owner_dropped_on_another_runtime_is_reported_once() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let mut device = input_device(listener.local_addr().unwrap());

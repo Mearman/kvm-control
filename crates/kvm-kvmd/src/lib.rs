@@ -358,6 +358,8 @@ struct Inputs {
     sequence: u64,
     // Set while an explicit release runs, so one interrupted by runtime shutdown is finished by the next lock holder.
     release_pending: bool,
+    // Whether the release that set `release_pending` has a failed or unconfirmed request. Kept under the lock so a release interrupted by runtime shutdown, with no task left to report it, is reported by the lock holder that finishes it.
+    release_failed: bool,
 }
 
 /// The release a press owes when its caller abandons it: the input and the sequence number of the request that pressed it.
@@ -1016,20 +1018,23 @@ impl Kvmd {
         result
     }
 
-    /// Sends a release for every tracked input, the caller holding the input lock, and returns whether any of them failed. `release_pending` stays set until every release has been attempted.
+    /// Sends a release for every tracked input, the caller holding the input lock, and returns whether any of them failed. `release_pending` stays set until every release has been attempted, and `release_failed` is set while a release is unconfirmed, so an interruption leaves both set.
     async fn release_held(&self, inputs: &mut Inputs) -> bool {
         inputs.release_pending = true;
-        let mut failed = false;
+        inputs.release_failed = false;
         for kind in [Held::Key, Held::Button] {
             for name in inputs.held(kind).clone() {
-                failed |= self.send_held(inputs, kind, &name, false).await.is_err();
+                let failed = inputs.release_failed;
+                inputs.release_failed = true;
+                let confirmed = self.send_held(inputs, kind, &name, false).await.is_ok();
+                inputs.release_failed = failed || !confirmed;
             }
         }
         inputs.release_pending = false;
-        failed
+        inputs.release_failed
     }
 
-    /// Releases tracked inputs for a dropped owner, reporting only a release that fails here: an earlier failure was reported to the call that saw it, or printed when that call had been abandoned.
+    /// Releases tracked inputs for a dropped owner, reporting only a release that fails here: an earlier failure was returned to the call that saw it, sent to the reporter when that call had been abandoned, or is reported by `settle_owed` when its release was interrupted.
     async fn release_for_drop(&self) {
         let mut inputs = self.inputs.lock().await;
         self.settle_owed(&mut inputs).await;
@@ -1054,11 +1059,12 @@ impl Kvmd {
 
     /// Sends cleanup owed to earlier requests, the caller holding the input lock: finishes an interrupted explicit release, then releases each input an abandoned press still holds unless a later request changed it. A confirmed owed release is recorded in `inputs.cleaned` unless the input is tracked as uncertain, since an earlier ambiguous press may still be applied after the release. An owed release interrupted by runtime shutdown is recorded as ambiguous by `send_held`, so it is never resent.
     async fn settle_owed(&self, inputs: &mut Inputs) {
-        // Only a failure of the finishing release is new; one already known was reported to the call that saw it, or printed when that call had been abandoned.
-        if inputs.release_pending && self.release_held(inputs).await {
-            self.report(
-                "Input cleanup uncertain: a release finishing an interrupted release was not confirmed",
-            );
+        // An interrupted release left its failure, or its unconfirmed request, unreported, since its task was dropped; it is reported once here together with any failure of the release that finishes it.
+        if inputs.release_pending {
+            let interrupted_failed = inputs.release_failed;
+            if self.release_held(inputs).await || interrupted_failed {
+                self.report("Input cleanup uncertain: an interrupted release was not confirmed");
+            }
         }
         loop {
             let next = self
