@@ -1551,6 +1551,40 @@ fn owner_dropped_while_its_runtime_shuts_down_releases_inputs_on_the_last_runtim
     server.abort();
 }
 
+#[test]
+fn owner_dropped_outside_a_runtime_uses_the_runtime_a_login_last_locked_on() {
+    let server_runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let (mut endpoint, ca, calls, server) = server_runtime.block_on(fixture());
+    endpoint.set_path("/gated/");
+    let device = client(endpoint, Some(ca));
+    let input_runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    input_runtime
+        .block_on(drive(&calls, device.key("KeyA", true)))
+        .unwrap();
+    drop(input_runtime);
+    // A login on a live runtime takes the input lock after the press's runtime has shut down.
+    assert!(matches!(
+        server_runtime.block_on(device.login("test-user", "test-password")),
+        Err(Error::AmbiguousInput(_))
+    ));
+    std::thread::spawn(move || drop(device)).join().unwrap();
+    server_runtime.block_on(async {
+        arrival(&calls).await;
+        calls.4.notify_one();
+    });
+    assert_eq!(
+        input_events(&calls),
+        ["key=KeyA&state=true", "key=KeyA&state=false"]
+    );
+    server.abort();
+}
+
 #[tokio::test]
 async fn expired_session_requires_explicit_reauthentication() {
     let (endpoint, ca, calls, server) = fixture().await;

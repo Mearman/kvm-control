@@ -527,6 +527,7 @@ impl Drop for Collect<'_> {
         let worker = self.device.input_worker();
         self.runtime.spawn(async move {
             let mut inputs = worker.inputs.lock().await;
+            worker.capture_input_runtime();
             worker.settle_owed(&mut inputs).await;
         });
     }
@@ -1036,6 +1037,8 @@ impl Kvmd {
     /// Takes the input lock and sends owed releases on a task that hands the lock back, so a caller cancelled during settlement cannot interrupt a release: the task finishes it and then unlocks.
     async fn settled_inputs(&self) -> Result<tokio::sync::OwnedMutexGuard<Inputs>> {
         let mut inputs = self.inputs.clone().lock_owned().await;
+        // Recorded once the lock is held, as every lock holder does, so cleanup scheduled later targets a runtime that has recently run.
+        self.capture_input_runtime();
         let worker = self.input_worker();
         tokio::spawn(async move {
             worker.settle_owed(&mut inputs).await;
