@@ -1732,12 +1732,12 @@ mod tests {
             .collect()
     }
 
-    /// Gives `next` no events until the start-up refresh, which runs as its own task, has been applied, so a test's first key sees the capabilities it read.
+    /// Gives `next` no events until the start-up refresh, which runs as its own task, has shown the capabilities it read, so a test's first key sees them. It watches the capability header, which every terminal size used here shows in full, rather than the device-state line, which a narrow footer wraps out of view; the fake devices it is used with always report capabilities.
     fn after_start_up_refresh(
         mut next: impl FnMut(&Terminal<TestBackend>) -> io::Result<Option<Event>>,
     ) -> impl FnMut(&Terminal<TestBackend>) -> io::Result<Option<Event>> {
         move |terminal| {
-            if screen_text(terminal).contains("Refreshing device state") {
+            if screen_text(terminal).contains("Capabilities unknown") {
                 std::thread::yield_now();
                 return Ok(None);
             }
