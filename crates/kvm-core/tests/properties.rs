@@ -26,29 +26,30 @@ fn mouse_mode() -> impl Strategy<Value = MouseMode> {
     ])
 }
 
-fn reported<T: Clone + std::fmt::Debug>(
-    inner: impl Strategy<Value = T>,
-) -> impl Strategy<Value = Reported<T>> {
+fn reported<T: Clone + std::fmt::Debug + 'static>(
+    inner: impl Strategy<Value = T> + 'static,
+) -> BoxedStrategy<Reported<T>> {
     prop_oneof![
         inner.prop_map(Reported::Supported),
         Just(Reported::Unsupported),
         Just(Reported::Unknown),
     ]
+    .boxed()
 }
 
-fn flag() -> impl Strategy<Value = Reported<bool>> {
+fn flag() -> BoxedStrategy<Reported<bool>> {
     reported(any::<bool>())
 }
 
-fn text() -> impl Strategy<Value = Reported<String>> {
+fn text() -> BoxedStrategy<Reported<String>> {
     reported(any::<String>())
 }
 
-fn number() -> impl Strategy<Value = Reported<u32>> {
+fn number() -> BoxedStrategy<Reported<u32>> {
     reported(any::<u32>())
 }
 
-fn system_info() -> impl Strategy<Value = SystemInfo> {
+fn system_info() -> BoxedStrategy<SystemInfo> {
     let kernel =
         (text(), text(), text(), text()).prop_map(|(system, release, version, machine)| {
             KernelInfo {
@@ -86,16 +87,17 @@ fn system_info() -> impl Strategy<Value = SystemInfo> {
                 host,
             },
         )
+        .boxed()
 }
 
-fn hid_outputs() -> impl Strategy<Value = Reported<HidOutputs>> {
+fn hid_outputs() -> BoxedStrategy<Reported<HidOutputs>> {
     reported(
         (vec(any::<String>(), 0..3), option::of(any::<String>()))
             .prop_map(|(available, active)| HidOutputs { available, active }),
     )
 }
 
-fn hid_status() -> impl Strategy<Value = HidStatus> {
+fn hid_status() -> BoxedStrategy<HidStatus> {
     let leds =
         (flag(), flag(), flag()).prop_map(|(caps, scroll, num)| KeyboardLeds { caps, scroll, num });
     let keyboard = (flag(), reported(leds), hid_outputs()).prop_map(|(online, leds, outputs)| {
@@ -137,9 +139,10 @@ fn hid_status() -> impl Strategy<Value = HidStatus> {
                 jiggler,
             },
         )
+        .boxed()
 }
 
-fn streamer_status() -> impl Strategy<Value = StreamerStatus> {
+fn streamer_status() -> BoxedStrategy<StreamerStatus> {
     let features = (flag(), flag(), flag(), flag(), flag(), flag()).prop_map(
         |(quality, resolution, h264, h265, zero_delay, venc_mode)| StreamerFeatures {
             quality,
@@ -201,21 +204,24 @@ fn streamer_status() -> impl Strategy<Value = StreamerStatus> {
                 clients,
             },
         )
+        .boxed()
 }
 
-fn atx_status() -> impl Strategy<Value = AtxStatus> {
-    (flag(), flag(), flag(), flag(), flag()).prop_map(
-        |(busy, power_led, hdd_led, power_busy, reset_busy)| AtxStatus {
-            busy,
-            power_led,
-            hdd_led,
-            power_busy,
-            reset_busy,
-        },
-    )
+fn atx_status() -> BoxedStrategy<AtxStatus> {
+    (flag(), flag(), flag(), flag(), flag())
+        .prop_map(
+            |(busy, power_led, hdd_led, power_busy, reset_busy)| AtxStatus {
+                busy,
+                power_led,
+                hdd_led,
+                power_busy,
+                reset_busy,
+            },
+        )
+        .boxed()
 }
 
-fn switch_status() -> impl Strategy<Value = SwitchStatus> {
+fn switch_status() -> BoxedStrategy<SwitchStatus> {
     let port = (any::<u32>(), number(), number(), text(), text()).prop_map(
         |(port, unit, channel, id, name)| SwitchPort {
             port,
@@ -235,9 +241,10 @@ fn switch_status() -> impl Strategy<Value = SwitchStatus> {
             active_port,
             synced,
         })
+        .boxed()
 }
 
-fn gpio_status() -> impl Strategy<Value = GpioStatus> {
+fn gpio_status() -> BoxedStrategy<GpioStatus> {
     let input = (any::<String>(), flag(), flag()).prop_map(|(channel, online, state)| GpioInput {
         channel,
         online,
@@ -254,31 +261,32 @@ fn gpio_status() -> impl Strategy<Value = GpioStatus> {
     );
     (reported(vec(input, 0..3)), reported(vec(output, 0..3)))
         .prop_map(|(inputs, outputs)| GpioStatus { inputs, outputs })
+        .boxed()
 }
 
-fn media_image() -> impl Strategy<Value = MediaImage> {
-    (any::<String>(), reported(any::<u64>()), flag(), flag()).prop_map(
-        |(name, size, complete, removable)| MediaImage {
+fn media_image() -> BoxedStrategy<MediaImage> {
+    (any::<String>(), reported(any::<u64>()), flag(), flag())
+        .prop_map(|(name, size, complete, removable)| MediaImage {
             name,
             size,
             complete,
             removable,
-        },
-    )
+        })
+        .boxed()
 }
 
-fn media_drive() -> impl Strategy<Value = MediaDrive> {
-    (flag(), flag(), flag(), reported(option::of(media_image()))).prop_map(
-        |(connected, cdrom, rw, image)| MediaDrive {
+fn media_drive() -> BoxedStrategy<MediaDrive> {
+    (flag(), flag(), flag(), reported(option::of(media_image())))
+        .prop_map(|(connected, cdrom, rw, image)| MediaDrive {
             connected,
             cdrom,
             rw,
             image,
-        },
-    )
+        })
+        .boxed()
 }
 
-fn media_status() -> impl Strategy<Value = MediaStatus> {
+fn media_status() -> BoxedStrategy<MediaStatus> {
     let partition = (
         any::<String>(),
         reported(any::<u64>()),
@@ -309,9 +317,10 @@ fn media_status() -> impl Strategy<Value = MediaStatus> {
                 partitions,
             },
         )
+        .boxed()
 }
 
-fn device_status() -> impl Strategy<Value = DeviceStatus> {
+fn device_status() -> BoxedStrategy<DeviceStatus> {
     (
         reported(system_info()),
         reported(hid_status()),
@@ -332,6 +341,7 @@ fn device_status() -> impl Strategy<Value = DeviceStatus> {
                 media,
             },
         )
+        .boxed()
 }
 
 fn control() -> impl Strategy<Value = Control> {
