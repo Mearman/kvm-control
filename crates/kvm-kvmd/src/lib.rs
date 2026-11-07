@@ -884,6 +884,8 @@ mod tests {
             inputs: Default::default(),
             auth_headers: Default::default(),
             approval_token: Default::default(),
+            snapshot_proven: Default::default(),
+            video_proven: Default::default(),
         };
         assert!(matches!(
             device.snapshot().await,
