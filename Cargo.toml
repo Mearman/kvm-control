@@ -17,6 +17,7 @@ futures-util = "0.3"
 image = { version = "0.25.10", default-features = false, features = ["jpeg"] }
 kvm-core = { version = "0.1.0", path = "crates/kvm-core" }
 kvm-kvmd = { version = "0.1.0", path = "crates/kvm-kvmd" }
+libc = "0.2.191"
 proptest = "1.12.0"
 rcgen = "0.14.10"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "cookies"] }

@@ -1617,6 +1617,7 @@ dependencies = [
  "image",
  "kvm-core",
  "kvm-kvmd",
+ "libc",
  "ratatui",
  "ratatui-image",
  "rcgen",
