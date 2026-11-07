@@ -734,7 +734,7 @@ async fn owed_release_interrupted_by_runtime_shutdown_is_reported() {
             answer_tx.send(()).unwrap();
             releasing_rx.await.unwrap();
         });
-        // Shutdown drops the press's task with its owed release in flight; the owed entry is already taken and no release is pending, so only the interrupted request marks it.
+        // Shutdown drops the press's task with its owed release in flight. Its lock guard queues the owed release again, but the interrupted release took KeyA out of the tracked inputs and its last-request record, so the next lock holder skips it; no release is pending, so only the interrupted request marks the failure.
     })
     .await
     .unwrap();
@@ -744,10 +744,7 @@ async fn owed_release_interrupted_by_runtime_shutdown_is_reported() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(
-        *reports.lock().unwrap(),
-        ["Input cleanup uncertain: an interrupted request was not confirmed"]
-    );
+    assert_eq!(*reports.lock().unwrap(), [crate::UNSEEN_FAILURE_REPORT]);
     assert_no_waiting_connection(listener, "the interrupted owed release was sent again");
 }
 
@@ -775,10 +772,7 @@ async fn release_interrupted_by_runtime_shutdown_is_reported_once_by_the_next_lo
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(
-        *reports.lock().unwrap(),
-        ["Input cleanup uncertain: an interrupted request was not confirmed"]
-    );
+    assert_eq!(*reports.lock().unwrap(), [crate::UNSEEN_FAILURE_REPORT]);
     assert_no_waiting_connection(listener, "the interrupted release was sent again");
 }
 
