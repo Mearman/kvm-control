@@ -28,7 +28,7 @@ The inspected [GL switch handler](https://github.com/gl-inet/glkvm/blob/3e8dd23c
 
 ## Connection and video
 
-The adapter requires HTTPS and rejects endpoint URLs containing credentials, query parameters or fragments. It does not follow redirects. A direct device origin and a reverse-proxy path prefix are both represented by the same endpoint configuration. A proxy must preserve the API routes and WebSocket upgrade as well as the separate MJPEG route. Live video opens a WebSocket stream lease and reads multipart JPEG from `streamer/stream`; it is not a WebRTC client. A device or proxy that does not expose those routes cannot provide this live stream through the adapter.
+The adapter requires HTTPS and rejects endpoint URLs containing credentials, query parameters or fragments. It does not follow redirects. A direct device origin and a reverse-proxy path prefix are both represented by the same endpoint configuration. A proxy must preserve the API routes and WebSocket upgrade as well as the separate MJPEG route. Live video opens a WebSocket stream lease and reads multipart JPEG from `streamer/stream`; it is not a WebRTC client. A device or proxy that does not expose those routes cannot provide this live stream through the adapter. The H.264 media WebSocket and Janus WebRTC transports the inspected PiKVM source offers, and GLKVM's Janus extra and adaptive WebRTC mode, are not implemented; the [video transport investigation](docs/video-transports.md) records how each is negotiated and how the adapter could select one.
 
 ## Terminal and platform
 
