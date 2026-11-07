@@ -747,16 +747,12 @@ fn video_mouse_coordinates(column: u16, row: u16, viewport: &VideoViewport) -> O
         if start >= pixels {
             return None;
         }
-        let last = (pixels - 1) / cell_size;
-        if last == 0 {
+        if pixels < 2 {
             return None;
         }
         let centre = (start + (cell_size - 1) / 2).min(pixels - 1);
-        let first_centre = ((cell_size - 1) / 2).min(pixels - 1);
-        let last_centre = (last * cell_size + (cell_size - 1) / 2).min(pixels - 1);
-        let value = i64::from(i16::MIN)
-            + i64::from(centre - first_centre) * i64::from(u16::MAX)
-                / i64::from(last_centre - first_centre);
+        let value =
+            i64::from(i16::MIN) + i64::from(centre) * i64::from(u16::MAX) / i64::from(pixels - 1);
         Some(value as i16)
     };
     if x >= u32::from(viewport.cells.width) || y >= u32::from(viewport.cells.height) {
@@ -1070,17 +1066,20 @@ pub async fn run(device: std::sync::Arc<dyn Device>) -> io::Result<()> {
     let result = wait_for_termination(run, &mut terminate).await;
     #[cfg(not(unix))]
     let result = run.await;
-    let cleanup = device.release_inputs().await.map_err(io::Error::other);
+    let restored = guard.restore();
+    let cleanup = tokio::time::timeout(Duration::from_secs(5), device.release_inputs())
+        .await
+        .map_err(|_| io::Error::other("input cleanup timed out"))
+        .and_then(|result| result.map_err(io::Error::other));
     input_cleanup.0 = None;
-    finish_terminal(result, cleanup, &mut guard)
+    finish_terminal(result, cleanup, restored)
 }
 
-fn finish_terminal<T: TerminalModes>(
+fn finish_terminal(
     result: io::Result<()>,
     cleanup: io::Result<()>,
-    guard: &mut TerminalGuard<T>,
+    restored: io::Result<()>,
 ) -> io::Result<()> {
-    let restored = guard.restore();
     let errors: Vec<String> = [result, cleanup, restored]
         .into_iter()
         .filter_map(Result::err)
@@ -2660,11 +2659,11 @@ mod tests {
         assert_eq!(viewport.pixels, (640, 480));
         assert_eq!(
             video_mouse_coordinates(1, 5, &viewport),
-            Some((i16::MIN, i16::MIN))
+            Some((-32461, -31811))
         );
         assert_eq!(
             video_mouse_coordinates(80, 34, &viewport),
-            Some((i16::MAX, i16::MAX))
+            Some((32356, 31672))
         );
         let padded =
             video_viewport(ratatui::layout::Rect::new(0, 0, 12, 12), 100, 31, (8, 16)).unwrap();
@@ -2672,7 +2671,7 @@ mod tests {
         assert_eq!(padded.pixels, (80, 25));
         assert_eq!(
             video_mouse_coordinates(10, 6, &padded),
-            Some((i16::MAX, i16::MAX))
+            Some((29448, i16::MAX))
         );
         assert_eq!(video_mouse_coordinates(10, 7, &padded), None);
     }
@@ -2963,7 +2962,7 @@ mod tests {
                 std::io::stdout().flush().unwrap();
                 let result = wait_for_termination(std::future::pending(), &mut signal).await;
                 let cleanup = device.release_inputs().await.map_err(io::Error::other);
-                assert!(finish_terminal(result, cleanup, &mut guard).is_err());
+                assert!(finish_terminal(result, cleanup, guard.restore()).is_err());
                 assert_eq!(*device.calls.lock().unwrap(), ["release"]);
                 assert_eq!(
                     *calls.borrow(),
