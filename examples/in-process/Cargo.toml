@@ -9,7 +9,6 @@ publish = false
 [dependencies]
 kvm-core = { path = "../../crates/kvm-core" }
 async-trait = "0.1"
-serde_json = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 
 [dev-dependencies]
@@ -18,3 +17,4 @@ axum = { version = "0.8", features = ["ws"] }
 axum-server = { version = "0.9.0", features = ["tls-rustls-no-provider"], default-features = false }
 rcgen = "0.13"
 url = "2"
+serde_json = "1"

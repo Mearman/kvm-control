@@ -9,14 +9,14 @@ use std::{
 use axum::{
     Json, Router,
     extract::State,
-    http::{HeaderMap, StatusCode, Uri, header},
+    http::{HeaderMap, Method, StatusCode, Uri, header},
     response::IntoResponse,
-    routing::{get, post},
+    routing::{any, get, post},
 };
 use axum_server::tls_rustls::RustlsConfig;
 use kvm_core::{
     Capability, Confirmation, Control, ControlOutcome, Device, DeviceProfile, Error, MouseMode,
-    PowerAction,
+    PowerAction, Reported,
 };
 use kvm_kvmd::{Config, Kvmd, LoginState};
 use serde_json::json;
@@ -155,6 +155,36 @@ async fn status(State(calls): State<Calls>, uri: Uri, headers: HeaderMap) -> imp
         json!({"online": true})
     };
     (StatusCode::OK, Json(json!({"ok": true, "result": result})))
+}
+
+/// Serves a profile's synthetic status fixture (`glstatus` for GLKVM, `pikvmstatus` for PiKVM, and `corestatus` with only the info, HID and streamer routes) and records every request's method and path, so a test can check that reading status sends nothing else.
+async fn typed_status(State(calls): State<Calls>, method: Method, uri: Uri) -> impl IntoResponse {
+    calls
+        .0
+        .lock()
+        .unwrap()
+        .push(format!("{method} {}", uri.path()));
+    let (prefix, route) = uri
+        .path()
+        .trim_start_matches('/')
+        .split_once("/api/")
+        .unwrap();
+    let fixture: serde_json::Value = serde_json::from_str(if prefix == "glstatus" {
+        include_str!("fixtures/glkvm-status.json")
+    } else {
+        include_str!("fixtures/pikvm-status.json")
+    })
+    .unwrap();
+    let routed = prefix != "corestatus" || matches!(route, "info" | "hid" | "streamer");
+    match fixture.get(route) {
+        Some(state) if method == Method::GET && routed => {
+            (StatusCode::OK, Json(json!({"ok": true, "result": state})))
+        }
+        _ => (
+            StatusCode::NOT_FOUND,
+            Json(json!({"ok": false, "result": {}})),
+        ),
+    }
 }
 
 async fn oversized_length() -> impl IntoResponse {
@@ -305,6 +335,9 @@ async fn fixture() -> (Url, Vec<u8>, Calls, tokio::task::JoinHandle<()>) {
             "/partial/api/msd",
             get(|| async { StatusCode::UNAUTHORIZED }),
         )
+        .route("/pikvmstatus/{*route}", any(typed_status))
+        .route("/glstatus/{*route}", any(typed_status))
+        .route("/corestatus/{*route}", any(typed_status))
         .route("/api/auth/check", get(status))
         .route("/api/info", get(status))
         .route("/api/hid", get(status))
@@ -2172,7 +2205,10 @@ async fn header_auth_over_verified_tls() {
     )
     .unwrap();
     device.check_auth().await.unwrap();
-    assert_eq!(device.status().await.unwrap().info["online"], true);
+    assert_eq!(
+        device.status().await.unwrap().hid.capability(),
+        Capability::Supported
+    );
     server.abort();
 }
 
@@ -2219,7 +2255,12 @@ async fn cookie_login_and_status_over_verified_tls() {
     assert!(matches!(device.status().await, Err(Error::Authentication)));
     device.login("test-user", "test-password").await.unwrap();
     let status = device.status().await.unwrap();
-    assert_eq!(status.info["online"], true);
+    let hid = status.hid.value().unwrap();
+    assert_eq!(hid.online, Reported::Supported(true));
+    assert_eq!(
+        status.atx.value().unwrap().power_led,
+        Reported::Supported(false)
+    );
     let capabilities = device.capabilities().await.unwrap();
     assert_eq!(capabilities.status, Capability::Supported);
     assert_eq!(capabilities.keyboard, Capability::Supported);
@@ -2233,5 +2274,106 @@ async fn cookie_login_and_status_over_verified_tls() {
     assert!(calls.iter().any(|call| call == "/api/info"));
     assert!(calls.iter().any(|call| call == "/api/hid"));
     assert!(calls.iter().any(|call| call == "/api/streamer"));
+    server.abort();
+}
+
+const STATUS_ROUTES: [&str; 7] = ["info", "hid", "streamer", "atx", "switch", "gpio", "msd"];
+
+fn status_client(endpoint: &Url, ca: &[u8], prefix: &str, profile: DeviceProfile) -> Kvmd {
+    let mut endpoint = endpoint.clone();
+    endpoint.set_path(&format!("/{prefix}/"));
+    Kvmd::with_header_auth(
+        Config {
+            endpoint,
+            profile,
+            trusted_ca_pem: Some(ca.to_vec()),
+            insecure_tls: false,
+            timeout: REQUEST_TIMEOUT,
+        },
+        "test-user",
+        "test-password",
+    )
+    .unwrap()
+}
+
+#[tokio::test]
+async fn typed_status_reads_every_subsystem_with_get_requests_only() {
+    let (endpoint, ca, calls, server) = fixture().await;
+    for (prefix, profile) in [
+        ("pikvmstatus", DeviceProfile::PiKvm),
+        ("glstatus", DeviceProfile::GlKvm),
+    ] {
+        let status = status_client(&endpoint, &ca, prefix, profile)
+            .status()
+            .await
+            .unwrap();
+        let info = status.info.value().unwrap();
+        assert!(matches!(info.platform, Reported::Supported(_)));
+        let switch = status.switch.value().unwrap();
+        assert_eq!(switch.ports.value().unwrap().len(), 2);
+        let atx = status.atx.value().unwrap();
+        let media = status.media.value().unwrap();
+        let streamer = status.streamer.value().unwrap();
+        match profile {
+            DeviceProfile::PiKvm => {
+                assert_eq!(atx.power_led, Reported::Supported(true));
+                assert_eq!(atx.power_busy, Reported::Supported(false));
+                assert_eq!(switch.active_port, Reported::Supported(Some(1)));
+                assert_eq!(switch.synced, Reported::Supported(true));
+                let drive = media.drive.value().unwrap();
+                assert_eq!(
+                    drive.image.value().unwrap().as_ref().unwrap().name,
+                    "remote.iso"
+                );
+                assert_eq!(media.partition_drive, Reported::Unsupported);
+                let outputs = status.gpio.value().unwrap().outputs.value().unwrap();
+                assert_eq!(outputs[1].channel, "relay");
+                assert_eq!(outputs[1].switchable, Reported::Supported(true));
+                assert_eq!(streamer.clients, Reported::Supported(1));
+            }
+            DeviceProfile::GlKvm => {
+                assert_eq!(atx.power_busy, Reported::Unsupported);
+                assert_eq!(switch.active_port, Reported::Supported(None));
+                assert_eq!(switch.synced, Reported::Unknown);
+                let partition = media.partition_drive.value().unwrap();
+                assert_eq!(
+                    partition.image.value().unwrap().as_ref().unwrap().name,
+                    "sda1"
+                );
+                assert_eq!(streamer.source, Reported::Unknown);
+            }
+        }
+        let expected: Vec<String> = STATUS_ROUTES
+            .iter()
+            .map(|route| format!("GET /{prefix}/api/{route}"))
+            .collect();
+        assert_eq!(*calls.0.lock().unwrap(), expected);
+        calls.0.lock().unwrap().clear();
+    }
+    server.abort();
+}
+
+#[tokio::test]
+async fn status_reports_absent_subsystems_as_unsupported() {
+    let (endpoint, ca, calls, server) = fixture().await;
+    let status = status_client(&endpoint, &ca, "corestatus", DeviceProfile::PiKvm)
+        .status()
+        .await
+        .unwrap();
+    assert_eq!(status.info.capability(), Capability::Supported);
+    assert_eq!(status.hid.capability(), Capability::Supported);
+    assert_eq!(status.streamer.capability(), Capability::Supported);
+    assert_eq!(status.atx, Reported::Unsupported);
+    assert_eq!(status.switch, Reported::Unsupported);
+    assert_eq!(status.gpio, Reported::Unsupported);
+    assert_eq!(status.media, Reported::Unsupported);
+    assert!(
+        calls
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|call| call.starts_with("GET "))
+    );
     server.abort();
 }

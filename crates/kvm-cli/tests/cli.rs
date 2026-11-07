@@ -163,21 +163,49 @@ fn invoke_with_signal(
 
 #[test]
 fn status_is_json_and_authentication_is_not_leaked() {
-    let body = b"{\"ok\":true,\"result\":{\"online\":true}}";
-    let (output, requests) = invoke(
-        &["status"],
-        vec![b"{\"ok\":true,\"result\":{}}", body, body, body, body],
-    );
+    let ok = b"{\"ok\":true,\"result\":{}}";
+    let info =
+        b"{\"ok\":true,\"result\":{\"system\":{\"kvmd\":{\"version\":\"0.0.0-synthetic\"}}}}";
+    let hid = b"{\"ok\":true,\"result\":{\"enabled\":true,\"online\":true}}";
+    let atx = b"{\"ok\":true,\"result\":{\"enabled\":false}}";
+    let (output, requests) = invoke(&["status"], vec![ok, ok, info, hid, ok, atx, ok, ok, ok]);
     assert!(
         output.status.success(),
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
     let result: Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(result["result"]["status"]["hid"]["online"], true);
+    let status = &result["result"]["status"];
+    assert_eq!(
+        status["info"],
+        serde_json::json!({"support": "Supported", "value": {
+            "kvmd_version": {"support": "Supported", "value": "0.0.0-synthetic"},
+            "streamer_app": {"support": "Unknown"},
+            "streamer_version": {"support": "Unknown"},
+            "kernel": {"support": "Unknown"},
+            "platform": {"support": "Unknown"},
+            "host": {"support": "Unknown"},
+        }})
+    );
+    assert_eq!(status["hid"]["support"], "Supported");
+    assert_eq!(
+        status["hid"]["value"]["online"],
+        serde_json::json!({"support": "Supported", "value": true})
+    );
+    assert_eq!(status["atx"], serde_json::json!({"support": "Unsupported"}));
+    assert_eq!(status["media"], serde_json::json!({"support": "Unknown"}));
     assert!(requests[0].starts_with("POST /api/auth/login "));
     assert!(requests[1].starts_with("GET /api/auth/check "));
-    assert!(requests[2].starts_with("GET /api/info "));
+    for (request, route) in requests[2..]
+        .iter()
+        .zip(["info", "hid", "streamer", "atx", "switch", "gpio", "msd"])
+    {
+        assert!(
+            request.starts_with(&format!("GET /api/{route} ")),
+            "{request}"
+        );
+    }
+    assert_eq!(requests.len(), 9);
     assert!(!String::from_utf8_lossy(&output.stdout).contains("synthetic-password"));
     assert!(!String::from_utf8_lossy(&output.stderr).contains("synthetic-password"));
 }
@@ -223,7 +251,9 @@ fn approval_pending_is_reported_and_polled_before_status() {
     let (output, requests) = invoke_with_signal(
         "glkvm",
         &["status"],
-        vec![login, pending, approved, body, body, body, body],
+        vec![
+            login, pending, approved, body, body, body, body, body, body, body, body,
+        ],
         false,
     );
     assert!(

@@ -1,0 +1,105 @@
+{
+  "info": {
+    "auth": {"enabled": true},
+    "extras": {"synthetic": {"daemon": "synthetic", "credential": "SECRET-extras"}},
+    "fan": null,
+    "meta": {"server": {"host": "pikvm.example"}, "kvm": {}},
+    "node": {},
+    "system": {
+      "kvmd": {"version": "0.0.0-synthetic"},
+      "streamer": {"app": "ustreamer", "version": "0.0.0-synthetic", "features": {"WITH_GPIO": true}},
+      "kernel": {"system": "Linux", "release": "0.0.0-synthetic", "version": "#1 SMP", "machine": "aarch64"}
+    },
+    "uptime": {},
+    "hw": {
+      "health": {},
+      "platform": {"type": "rpi", "base": "Synthetic Board", "serial": "0000000000000000", "model": "synthetic", "video": "hdmi", "board": "synthetic"}
+    }
+  },
+  "hid": {
+    "enabled": true,
+    "online": true,
+    "busy": false,
+    "connected": null,
+    "keyboard": {
+      "online": true,
+      "leds": {"caps": false, "scroll": false, "num": true},
+      "outputs": {"available": [], "active": ""}
+    },
+    "mouse": {
+      "outputs": {"available": ["usb", "usb_rel"], "active": "usb"},
+      "online": true,
+      "absolute": true
+    },
+    "jiggler": {"enabled": false, "active": false, "interval": 60}
+  },
+  "streamer": {
+    "features": {"quality": true, "resolution": false, "h264": true},
+    "limits": {"desired_fps": {"min": 0, "max": 70}, "h264_bitrate": {"min": 25, "max": 20000}, "h264_gop": {"min": 0, "max": 60}},
+    "params": {"desired_fps": 40, "quality": 80, "h264_bitrate": 5000, "h264_gop": 30},
+    "applied": {"desired_fps": 40, "quality": 80},
+    "streamer": {
+      "instance_id": "",
+      "encoder": {"type": "M2M-IMAGE", "quality": 80},
+      "h264": {"bitrate": 5000, "gop": 30, "online": true, "fps": 40},
+      "sinks": {"jpeg": {"has_clients": false}, "h264": {"has_clients": true}},
+      "source": {"resolution": {"width": 1920, "height": 1080}, "online": true, "desired_fps": 40, "captured_fps": 39},
+      "stream": {"queued_fps": 39, "clients": 1, "clients_stat": {"1a2b": {"fps": 39, "extra_headers": false, "advance_headers": false, "dual_final_frames": false, "zero_data": false, "key": "SECRET-client-key"}}}
+    },
+    "snapshot": {"saved": null}
+  },
+  "atx": {
+    "enabled": true,
+    "busy": false,
+    "acts": {"power": false, "reset": false},
+    "leds": {"power": true, "hdd": false}
+  },
+  "switch": {
+    "model": {
+      "firmware": {"version": 7},
+      "units": [{"firmware": {"version": 7, "devbuild": false}}],
+      "ports": [
+        {"unit": 0, "channel": 0, "name": "Server", "id": "1", "atx": {}, "video": {"dummy": false}},
+        {"unit": 0, "channel": 1, "name": "", "id": "2", "atx": {}, "video": {"dummy": false}}
+      ],
+      "limits": {}
+    },
+    "summary": {"active_port": 1, "active_id": "2", "synced": true}
+  },
+  "gpio": {
+    "model": {
+      "scheme": {
+        "inputs": {"led": {"hw": {"driver": "__gpio__", "pin": "5"}}},
+        "outputs": {
+          "button": {"switch": false, "pulse": {"delay": 0.1, "min_delay": 0.1, "max_delay": 0.1}, "hw": {"driver": "__gpio__", "pin": "6"}},
+          "relay": {"switch": true, "pulse": {"delay": 0, "min_delay": 0, "max_delay": 0}, "hw": {"driver": "__gpio__", "pin": "7"}}
+        }
+      },
+      "view": {}
+    },
+    "state": {
+      "inputs": {"led": {"online": true, "state": true}},
+      "outputs": {
+        "button": {"online": true, "state": false, "busy": true},
+        "relay": {"online": true, "state": true, "busy": false}
+      }
+    }
+  },
+  "msd": {
+    "enabled": true,
+    "online": true,
+    "busy": false,
+    "storage": {
+      "images": {"disk.iso": {"size": 1048576, "mod_ts": 1.0, "writable": false, "cdromable": true, "removable": true, "complete": true}},
+      "parts": {"": {"size": 8589934592, "free": 4294967296, "writable": true}},
+      "downloading": null,
+      "uploading": null
+    },
+    "drive": {
+      "image": {"name": "remote.iso", "proto": "nbd", "in_storage": false, "size": 2048, "mod_ts": 0.0, "writable": false, "cdromable": true, "removable": false, "complete": true, "url": "https://user:SECRET-nbd@images.example/remote.iso"},
+      "connected": true,
+      "cdrom": true,
+      "rw": false
+    }
+  }
+}

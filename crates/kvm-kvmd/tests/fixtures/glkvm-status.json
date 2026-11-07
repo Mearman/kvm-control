@@ -1,0 +1,78 @@
+{
+  "info": {
+    "auth": {"enabled": true},
+    "extras": {},
+    "health": {},
+    "meta": {"server": {"host": "glkvm.example"}},
+    "system": {
+      "kvmd": {"version": "0.0.0-synthetic"},
+      "streamer": {"app": "ustreamer", "version": "6.13", "features": {"WITH_SETPROCTITLE": true}},
+      "kernel": {"system": "Linux", "release": "0.0.0-synthetic", "version": "#1 SMP", "machine": "aarch64"},
+      "platform": {"type": "rpi", "base": "Synthetic Board", "serial": "1111111111111111", "model": null, "video": null, "board": null}
+    }
+  },
+  "hid": {
+    "enabled": true,
+    "online": true,
+    "busy": false,
+    "connected": true,
+    "keyboard": {
+      "online": true,
+      "leds": {"caps": true, "scroll": false, "num": false},
+      "outputs": {"available": [], "active": ""}
+    },
+    "mouse": {
+      "outputs": {"available": ["usb"], "active": "usb"},
+      "online": false,
+      "absolute": false
+    },
+    "jiggler": {"enabled": true, "active": true, "interval": 30}
+  },
+  "streamer": {
+    "features": {"quality": true, "resolution": true, "h264": true, "h265": true, "zero_delay": true, "venc_mode": true},
+    "limits": {"desired_fps": {"min": 1, "max": 60}, "available_resolutions": ["1920x1080", "1280x720"], "h264_bitrate": {"min": 100, "max": 16000}, "h264_gop": {"min": 1, "max": 120}},
+    "params": {"desired_fps": 30, "quality": 70, "resolution": "1920x1080", "video_format": 0, "h264_bitrate": 4000, "h264_gop": 60, "zero_delay": false, "venc_mode": "synthetic"},
+    "streamer": null,
+    "snapshot": {"saved": null}
+  },
+  "atx": {
+    "enabled": true,
+    "busy": true,
+    "leds": {"power": false, "hdd": true}
+  },
+  "switch": {
+    "model": {
+      "firmware": {"version": 1},
+      "units": [],
+      "ports": [
+        {"unit": 0, "channel": 0, "name": "Desk", "id": "1.1"},
+        {"unit": 0, "channel": 1, "name": "Lab", "id": "1.2"}
+      ],
+      "limits": {}
+    },
+    "summary": {"active_port": -1, "active_id": "1.0", "synced": true}
+  },
+  "gpio": {
+    "model": {"scheme": {"inputs": {}, "outputs": {}}, "view": {}},
+    "state": {"inputs": {}, "outputs": {}}
+  },
+  "msd": {
+    "enabled": true,
+    "online": true,
+    "busy": false,
+    "storage": {
+      "images": {"gl.img": {"complete": false, "removable": true, "size": 4096, "mod_ts": 1.0}},
+      "parts": {"": {"size": 100, "free": 50, "writable": true}},
+      "downloading": null,
+      "uploading": null
+    },
+    "drive": {"image": null, "connected": false, "cdrom": false, "rw": false},
+    "drive_partition": {
+      "image": {"name": "sda1", "in_storage": false, "complete": true, "removable": false, "size": 8192, "mod_ts": 2.0},
+      "connected": true,
+      "cdrom": false,
+      "rw": true
+    },
+    "available_devices": {}
+  }
+}

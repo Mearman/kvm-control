@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use kvm_core::{
-    Capabilities, Capability, Confirmation, Control, ControlOutcome, Device, DeviceStatus,
-    MouseMode, Result, Snapshot,
+    AtxStatus, Capabilities, Capability, Confirmation, Control, ControlOutcome, Device,
+    DeviceStatus, MouseMode, Reported, Result, Snapshot,
 };
 use kvm_mcp::Server;
 use rmcp::ServiceExt;
@@ -20,9 +20,19 @@ impl Device for Fake {
     }
     async fn status(&self) -> Result<DeviceStatus> {
         Ok(DeviceStatus {
-            info: json!({}),
-            hid: json!({}),
-            streamer: json!({}),
+            info: Reported::Unknown,
+            hid: Reported::Unknown,
+            streamer: Reported::Unknown,
+            atx: Reported::Supported(AtxStatus {
+                busy: Reported::Supported(false),
+                power_led: Reported::Supported(true),
+                hdd_led: Reported::Unknown,
+                power_busy: Reported::Unsupported,
+                reset_busy: Reported::Unsupported,
+            }),
+            switch: Reported::Unsupported,
+            gpio: Reported::Unsupported,
+            media: Reported::Unsupported,
         })
     }
     async fn capabilities(&self) -> Result<Capabilities> {
@@ -114,6 +124,19 @@ async fn protocol_round_trip() {
     assert_eq!(capabilities["snapshot"], "Unknown");
     assert_eq!(capabilities["mouse_mode"], "Relative");
     assert_eq!(capabilities["live_video"], "Unsupported");
+    let status = call(&mut write, &mut lines, json!({"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"status","arguments":{}}})).await;
+    let status: Value =
+        serde_json::from_str(status["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        status["atx"]["value"]["power_led"],
+        json!({"support": "Supported", "value": true})
+    );
+    assert_eq!(
+        status["atx"]["value"]["power_busy"],
+        json!({"support": "Unsupported"})
+    );
+    assert_eq!(status["switch"], json!({"support": "Unsupported"}));
+    assert_eq!(status["info"], json!({"support": "Unknown"}));
     let image = call(&mut write, &mut lines, json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"snapshot","arguments":{}}})).await;
     assert_eq!(image["result"]["content"][0]["type"], "image");
     assert_eq!(image["result"]["content"][0]["mimeType"], "image/jpeg");

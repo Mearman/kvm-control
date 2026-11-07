@@ -1,0 +1,888 @@
+//! Typed status read from the KVMD state routes.
+//!
+//! Response shapes follow PiKVM `kvmd` revision fcb903eb3be70d8eee4aee99e5fcc1c743e3ccef and GLKVM `glkvm` revision 3e8dd23c4bd638a4650433664cc3b0f3b4d29395: the [PiKVM](https://github.com/pikvm/kvmd/blob/fcb903eb3be70d8eee4aee99e5fcc1c743e3ccef/kvmd/apps/kvmd/info/__init__.py) and [GLKVM](https://github.com/gl-inet/glkvm/blob/3e8dd23c4bd638a4650433664cc3b0f3b4d29395/kvmd/apps/kvmd/info/__init__.py) info managers, the [PiKVM](https://github.com/pikvm/kvmd/blob/fcb903eb3be70d8eee4aee99e5fcc1c743e3ccef/kvmd/plugins/hid/otg/__init__.py) and [GLKVM](https://github.com/gl-inet/glkvm/blob/3e8dd23c4bd638a4650433664cc3b0f3b4d29395/kvmd/plugins/hid/otg/__init__.py) OTG HID plugins, the [PiKVM](https://github.com/pikvm/kvmd/blob/fcb903eb3be70d8eee4aee99e5fcc1c743e3ccef/kvmd/apps/kvmd/streamer/__init__.py) and [GLKVM](https://github.com/gl-inet/glkvm/blob/3e8dd23c4bd638a4650433664cc3b0f3b4d29395/kvmd/apps/kvmd/streamer.py) streamer managers with uStreamer's [state handler](https://github.com/pikvm/ustreamer/blob/11fd828ab00c01a39bd0843ef442ef0b6d3cac41/src/ustreamer/http/server.c), the [PiKVM](https://github.com/pikvm/kvmd/blob/fcb903eb3be70d8eee4aee99e5fcc1c743e3ccef/kvmd/plugins/atx/gpio.py) and [GLKVM](https://github.com/gl-inet/glkvm/blob/3e8dd23c4bd638a4650433664cc3b0f3b4d29395/kvmd/plugins/atx/gpio.py) ATX plugins, the [PiKVM](https://github.com/pikvm/kvmd/blob/fcb903eb3be70d8eee4aee99e5fcc1c743e3ccef/kvmd/apps/kvmd/switch/state.py) and [GLKVM](https://github.com/gl-inet/glkvm/blob/3e8dd23c4bd638a4650433664cc3b0f3b4d29395/kvmd/apps/kvmd/switch/state.py) switch state, the [PiKVM](https://github.com/pikvm/kvmd/blob/fcb903eb3be70d8eee4aee99e5fcc1c743e3ccef/kvmd/apps/kvmd/ugpio.py) and [GLKVM](https://github.com/gl-inet/glkvm/blob/3e8dd23c4bd638a4650433664cc3b0f3b4d29395/kvmd/apps/kvmd/ugpio.py) user GPIO, and the [PiKVM](https://github.com/pikvm/kvmd/blob/fcb903eb3be70d8eee4aee99e5fcc1c743e3ccef/kvmd/plugins/msd/otg/__init__.py) and [GLKVM](https://github.com/gl-inet/glkvm/blob/3e8dd23c4bd638a4650433664cc3b0f3b4d29395/kvmd/plugins/msd/otg/__init__.py) OTG media plugins. These are source revisions, not firmware releases, and no physical device has been read.
+//!
+//! Profile differences in those sources: only PiKVM reports per-button ATX activity (`acts`), only GLKVM reports a partition-backed media drive (`drive_partition`) and the `h265`, `zero_delay` and `venc_mode` streamer features, and GLKVM hard-codes the switch's `synced` flag and the streamer version in its system information, so those are reported as unknown for that profile. A field present in a response is read whatever the profile.
+
+use kvm_core::{
+    AtxStatus, DeviceProfile, DeviceStatus, Error, GpioInput, GpioOutput, GpioStatus, HidOutputs,
+    HidStatus, JigglerStatus, KernelInfo, KeyboardLeds, KeyboardStatus, Limits, MediaDrive,
+    MediaImage, MediaStatus, MouseStatus, PlatformInfo, Reported, Resolution, Result,
+    StoragePartition, StreamerFeatures, StreamerStatus, SwitchPort, SwitchStatus, SystemInfo,
+    VideoSource,
+};
+use serde_json::Value;
+
+use super::{Kvmd, mouse_mode};
+
+/// State routes read for a status, in the order `parse` takes them.
+const ROUTES: [&str; 7] = ["info", "hid", "streamer", "atx", "switch", "gpio", "msd"];
+
+/// The outcome of reading one state route.
+#[derive(Debug, Default)]
+pub(crate) enum Read {
+    State(Value),
+    /// The route does not exist on the device (HTTP 404).
+    Absent,
+    /// The session may not read the route.
+    #[default]
+    Denied,
+}
+
+impl Kvmd {
+    /// Reads every state route with GET requests only, so reading status sends no input or control request.
+    pub(crate) async fn read_status(&self) -> Result<DeviceStatus> {
+        let active = self.client.read().await;
+        let mut reads: [Read; 7] = Default::default();
+        for (read, path) in reads.iter_mut().zip(ROUTES) {
+            *read = match self.json_with(&active.client, path).await {
+                Ok(state) => Read::State(state),
+                Err(Error::Http(404)) => Read::Absent,
+                Err(Error::Authentication) => Read::Denied,
+                Err(error) => return Err(error),
+            };
+        }
+        parse(self.profile, reads)
+    }
+}
+
+/// Builds a typed status from the route reads, in `ROUTES` order. Fails with an authentication error when no route could be read and at least one was denied, since such a session has observed nothing.
+pub(crate) fn parse(profile: DeviceProfile, reads: [Read; 7]) -> Result<DeviceStatus> {
+    if !reads.iter().any(|read| matches!(read, Read::State(_)))
+        && reads.iter().any(|read| matches!(read, Read::Denied))
+    {
+        return Err(Error::Authentication);
+    }
+    let [info, hid, streamer, atx, switch, gpio, msd] = reads;
+    Ok(DeviceStatus {
+        info: section(info, |state| {
+            Reported::Supported(system_info(profile, state))
+        }),
+        hid: section(hid, |state| enabled(state, hid_status)),
+        streamer: section(streamer, |state| {
+            Reported::Supported(streamer_status(profile, state))
+        }),
+        atx: section(atx, |state| {
+            enabled(state, |state| atx_status(profile, state))
+        }),
+        switch: section(switch, |state| {
+            Reported::Supported(switch_status(profile, state))
+        }),
+        gpio: section(gpio, |state| Reported::Supported(gpio_status(state))),
+        media: section(msd, |state| {
+            enabled(state, |state| media_status(profile, state))
+        }),
+    })
+}
+
+/// A subsystem's status: unsupported when its route is absent, unknown when it was denied or is not an object.
+fn section<T>(read: Read, parse: impl FnOnce(&Value) -> Reported<T>) -> Reported<T> {
+    match read {
+        Read::State(state) if state.is_object() => parse(&state),
+        Read::State(_) | Read::Denied => Reported::Unknown,
+        Read::Absent => Reported::Unsupported,
+    }
+}
+
+/// A subsystem that reports `enabled`. A disabled plugin reports placeholder values (all LEDs off, for example), so only an explicitly enabled subsystem is parsed; one that omits the flag is unknown, as in capability discovery.
+fn enabled<T>(state: &Value, parse: impl FnOnce(&Value) -> T) -> Reported<T> {
+    match state.get("enabled").and_then(Value::as_bool) {
+        Some(true) => Reported::Supported(parse(state)),
+        Some(false) => Reported::Unsupported,
+        None => Reported::Unknown,
+    }
+}
+
+fn extract<T>(found: Option<&Value>, read: impl FnOnce(&Value) -> Option<T>) -> Reported<T> {
+    found
+        .and_then(read)
+        .map_or(Reported::Unknown, Reported::Supported)
+}
+
+/// A field that only some profiles' inspected sources report: when absent it is unsupported for a profile whose source never reports it.
+fn profile_field<T>(
+    state: &Value,
+    pointer: &str,
+    reported_by_profile: bool,
+    read: impl FnOnce(&Value) -> Option<T>,
+) -> Reported<T> {
+    match state.pointer(pointer) {
+        None if !reported_by_profile => Reported::Unsupported,
+        found => extract(found, read),
+    }
+}
+
+fn boolean(state: &Value, pointer: &str) -> Reported<bool> {
+    extract(state.pointer(pointer), Value::as_bool)
+}
+
+fn text(state: &Value, pointer: &str) -> Reported<String> {
+    extract(state.pointer(pointer), |value| {
+        value.as_str().map(str::to_owned)
+    })
+}
+
+/// Text for which the device reports an empty string when it could not determine the value, such as a version it failed to read.
+fn determined_text(state: &Value, pointer: &str) -> Reported<String> {
+    match text(state, pointer) {
+        Reported::Supported(value) if value.is_empty() => Reported::Unknown,
+        other => other,
+    }
+}
+
+fn count32(value: &Value) -> Option<u32> {
+    value.as_u64().and_then(|count| u32::try_from(count).ok())
+}
+
+fn number32(state: &Value, pointer: &str) -> Reported<u32> {
+    extract(state.pointer(pointer), count32)
+}
+
+fn number64(state: &Value, pointer: &str) -> Reported<u64> {
+    extract(state.pointer(pointer), Value::as_u64)
+}
+
+fn nested<T>(state: &Value, pointer: &str, parse: impl FnOnce(&Value) -> T) -> Reported<T> {
+    match state.pointer(pointer) {
+        Some(inner) if inner.is_object() => Reported::Supported(parse(inner)),
+        _ => Reported::Unknown,
+    }
+}
+
+/// Entries of an object keyed by name, such as GPIO channels or stored images, in name order.
+fn entries<T>(
+    state: &Value,
+    pointer: &str,
+    parse: impl Fn(String, &Value) -> T,
+) -> Reported<Vec<T>> {
+    match state.pointer(pointer).and_then(Value::as_object) {
+        Some(entries) => Reported::Supported(
+            entries
+                .iter()
+                .map(|(name, entry)| parse(name.clone(), entry))
+                .collect(),
+        ),
+        None => Reported::Unknown,
+    }
+}
+
+fn system_info(profile: DeviceProfile, state: &Value) -> SystemInfo {
+    // PiKVM's default legacy info response moves the platform under `hw`; GLKVM's leaves it under `system`.
+    let platform = state
+        .pointer("/system/platform")
+        .or_else(|| state.pointer("/hw/platform"));
+    SystemInfo {
+        kvmd_version: determined_text(state, "/system/kvmd/version"),
+        streamer_app: determined_text(state, "/system/streamer/app"),
+        streamer_version: match profile {
+            DeviceProfile::PiKvm => determined_text(state, "/system/streamer/version"),
+            // GLKVM's system information returns a fixed version string instead of asking the streamer.
+            DeviceProfile::GlKvm => Reported::Unknown,
+        },
+        kernel: nested(state, "/system/kernel", |kernel| KernelInfo {
+            system: text(kernel, "/system"),
+            release: text(kernel, "/release"),
+            version: text(kernel, "/version"),
+            machine: text(kernel, "/machine"),
+        }),
+        platform: match platform {
+            Some(platform) if platform.is_object() => Reported::Supported(PlatformInfo {
+                kind: text(platform, "/type"),
+                base: text(platform, "/base"),
+                serial: text(platform, "/serial"),
+                model: text(platform, "/model"),
+                video: text(platform, "/video"),
+                board: text(platform, "/board"),
+            }),
+            _ => Reported::Unknown,
+        },
+        host: determined_text(state, "/meta/server/host"),
+    }
+}
+
+fn hid_outputs(device: &Value) -> Reported<HidOutputs> {
+    let available = device
+        .pointer("/outputs/available")
+        .and_then(Value::as_array)
+        .and_then(|outputs| {
+            outputs
+                .iter()
+                .map(|output| output.as_str().map(str::to_owned))
+                .collect::<Option<Vec<_>>>()
+        });
+    let active = match device.pointer("/outputs/active") {
+        Some(Value::String(active)) if active.is_empty() => Some(None),
+        Some(Value::String(active)) => Some(Some(active.clone())),
+        _ => None,
+    };
+    match (available, active) {
+        (Some(available), Some(active)) => Reported::Supported(HidOutputs { available, active }),
+        _ => Reported::Unknown,
+    }
+}
+
+fn hid_status(state: &Value) -> HidStatus {
+    HidStatus {
+        online: boolean(state, "/online"),
+        busy: boolean(state, "/busy"),
+        // PiKVM's OTG plugin reports `null` here, which is unknown rather than disconnected.
+        connected: boolean(state, "/connected"),
+        keyboard: nested(state, "/keyboard", |keyboard| KeyboardStatus {
+            online: boolean(keyboard, "/online"),
+            leds: nested(keyboard, "/leds", |leds| KeyboardLeds {
+                caps: boolean(leds, "/caps"),
+                scroll: boolean(leds, "/scroll"),
+                num: boolean(leds, "/num"),
+            }),
+            outputs: hid_outputs(keyboard),
+        }),
+        mouse: nested(state, "/mouse", |mouse| MouseStatus {
+            online: boolean(mouse, "/online"),
+            mode: mouse_mode(state),
+            outputs: hid_outputs(mouse),
+        }),
+        jiggler: nested(state, "/jiggler", |jiggler| JigglerStatus {
+            enabled: boolean(jiggler, "/enabled"),
+            active: boolean(jiggler, "/active"),
+            interval_seconds: number64(jiggler, "/interval"),
+        }),
+    }
+}
+
+/// A streamer parameter that is absent because the device reports its feature unavailable is unsupported.
+fn parameter<T>(feature: &Reported<bool>, found: Reported<T>) -> Reported<T> {
+    match (feature, found) {
+        (Reported::Supported(false), Reported::Unknown) => Reported::Unsupported,
+        (_, found) => found,
+    }
+}
+
+fn limits(state: &Value, pointer: &str) -> Reported<Limits> {
+    let range = state.pointer(pointer);
+    let bound = |name: &str| range.and_then(|range| range.get(name)).and_then(count32);
+    match (bound("min"), bound("max")) {
+        (Some(min), Some(max)) => Reported::Supported(Limits { min, max }),
+        _ => Reported::Unknown,
+    }
+}
+
+fn streamer_status(profile: DeviceProfile, state: &Value) -> StreamerStatus {
+    let gl = profile == DeviceProfile::GlKvm;
+    let feature = |name: &str, reported_by_profile: bool| {
+        profile_field(
+            state,
+            &format!("/features/{name}"),
+            reported_by_profile,
+            Value::as_bool,
+        )
+    };
+    let features = StreamerFeatures {
+        quality: feature("quality", true),
+        resolution: feature("resolution", true),
+        h264: feature("h264", true),
+        h265: feature("h265", gl),
+        zero_delay: feature("zero_delay", gl),
+        venc_mode: feature("venc_mode", gl),
+    };
+    // uStreamer's own state, which the device reports as `null` while the streamer is not running.
+    let running = state
+        .get("streamer")
+        .filter(|streamer| streamer.is_object());
+    StreamerStatus {
+        desired_fps: number32(state, "/params/desired_fps"),
+        desired_fps_limits: limits(state, "/limits/desired_fps"),
+        quality: parameter(&features.quality, number32(state, "/params/quality")),
+        resolution: parameter(&features.resolution, text(state, "/params/resolution")),
+        available_resolutions: parameter(
+            &features.resolution,
+            extract(state.pointer("/limits/available_resolutions"), |list| {
+                list.as_array()?
+                    .iter()
+                    .map(|entry| entry.as_str().map(str::to_owned))
+                    .collect::<Option<Vec<_>>>()
+            }),
+        ),
+        h264_bitrate: parameter(&features.h264, number32(state, "/params/h264_bitrate")),
+        h264_gop: parameter(&features.h264, number32(state, "/params/h264_gop")),
+        encoder: running.map_or(Reported::Unknown, |streamer| {
+            text(streamer, "/encoder/type")
+        }),
+        source: running.map_or(Reported::Unknown, |streamer| {
+            nested(streamer, "/source", |source| VideoSource {
+                online: boolean(source, "/online"),
+                resolution: {
+                    let width = source.pointer("/resolution/width").and_then(count32);
+                    let height = source.pointer("/resolution/height").and_then(count32);
+                    match (width, height) {
+                        (Some(width), Some(height)) => {
+                            Reported::Supported(Resolution { width, height })
+                        }
+                        _ => Reported::Unknown,
+                    }
+                },
+                captured_fps: number32(source, "/captured_fps"),
+            })
+        }),
+        clients: running.map_or(Reported::Unknown, |streamer| {
+            number32(streamer, "/stream/clients")
+        }),
+        features,
+    }
+}
+
+fn atx_status(profile: DeviceProfile, state: &Value) -> AtxStatus {
+    let pikvm = profile == DeviceProfile::PiKvm;
+    AtxStatus {
+        busy: boolean(state, "/busy"),
+        power_led: boolean(state, "/leds/power"),
+        hdd_led: boolean(state, "/leds/hdd"),
+        power_busy: profile_field(state, "/acts/power", pikvm, Value::as_bool),
+        reset_busy: profile_field(state, "/acts/reset", pikvm, Value::as_bool),
+    }
+}
+
+fn switch_status(profile: DeviceProfile, state: &Value) -> SwitchStatus {
+    SwitchStatus {
+        ports: extract(state.pointer("/model/ports"), |ports| {
+            Some(
+                (0_u32..)
+                    .zip(ports.as_array()?)
+                    .map(|(port, entry)| SwitchPort {
+                        port,
+                        unit: number32(entry, "/unit"),
+                        channel: number32(entry, "/channel"),
+                        id: text(entry, "/id"),
+                        name: text(entry, "/name"),
+                    })
+                    .collect::<Vec<_>>(),
+            )
+        }),
+        // The device reports a negative port when none is selected.
+        active_port: extract(state.pointer("/summary/active_port"), |port| {
+            let port = port.as_i64()?;
+            if port < 0 {
+                Some(None)
+            } else {
+                u32::try_from(port).ok().map(Some)
+            }
+        }),
+        synced: match profile {
+            DeviceProfile::PiKvm => boolean(state, "/summary/synced"),
+            // GLKVM's switch state always reports `true`, which is not an observation of synchronisation.
+            DeviceProfile::GlKvm => Reported::Unknown,
+        },
+    }
+}
+
+fn gpio_status(state: &Value) -> GpioStatus {
+    // The device reports `state: false` for an offline or busy channel without reading it.
+    let read_state = |channel: &Value, readable: bool| {
+        if readable {
+            boolean(channel, "/state")
+        } else {
+            Reported::Unknown
+        }
+    };
+    GpioStatus {
+        inputs: entries(state, "/state/inputs", |channel, input| {
+            let online = boolean(input, "/online");
+            GpioInput {
+                channel,
+                state: read_state(input, online == Reported::Supported(true)),
+                online,
+            }
+        }),
+        outputs: entries(state, "/state/outputs", |channel, output| {
+            let online = boolean(output, "/online");
+            let busy = boolean(output, "/busy");
+            GpioOutput {
+                state: read_state(
+                    output,
+                    online == Reported::Supported(true) && busy == Reported::Supported(false),
+                ),
+                switchable: extract(
+                    state
+                        .pointer("/model/scheme/outputs")
+                        .and_then(|outputs| outputs.get(&channel))
+                        .and_then(|scheme| scheme.get("switch")),
+                    Value::as_bool,
+                ),
+                channel,
+                online,
+                busy,
+            }
+        }),
+    }
+}
+
+fn media_image(name: String, image: &Value) -> MediaImage {
+    MediaImage {
+        name,
+        size: number64(image, "/size"),
+        complete: boolean(image, "/complete"),
+        removable: boolean(image, "/removable"),
+    }
+}
+
+/// A virtual drive; the device reports `null` while the drive is unavailable. A remote image's URL is not read, since it can embed credentials.
+fn media_drive(drive: Option<&Value>) -> Reported<MediaDrive> {
+    let Some(drive) = drive.filter(|drive| drive.is_object()) else {
+        return Reported::Unknown;
+    };
+    Reported::Supported(MediaDrive {
+        connected: boolean(drive, "/connected"),
+        cdrom: boolean(drive, "/cdrom"),
+        rw: boolean(drive, "/rw"),
+        image: match drive.get("image") {
+            Some(Value::Null) => Reported::Supported(None),
+            Some(image) => extract(image.get("name"), |name| {
+                Some(Some(media_image(name.as_str()?.to_owned(), image)))
+            }),
+            None => Reported::Unknown,
+        },
+    })
+}
+
+fn media_status(profile: DeviceProfile, state: &Value) -> MediaStatus {
+    MediaStatus {
+        online: boolean(state, "/online"),
+        busy: boolean(state, "/busy"),
+        drive: media_drive(state.get("drive")),
+        partition_drive: match state.get("drive_partition") {
+            None if profile == DeviceProfile::PiKvm => Reported::Unsupported,
+            found => media_drive(found),
+        },
+        images: entries(state, "/storage/images", media_image),
+        partitions: entries(state, "/storage/parts", |name, part| StoragePartition {
+            name,
+            size: number64(part, "/size"),
+            free: number64(part, "/free"),
+            writable: boolean(part, "/writable"),
+        }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kvm_core::{Capability, MouseMode};
+    use proptest::{collection::vec, prelude::*};
+    use serde_json::json;
+
+    /// Synthetic responses shaped after each profile's inspected source, shared with the HTTPS contract tests.
+    fn fixture(profile: DeviceProfile) -> Value {
+        serde_json::from_str(match profile {
+            DeviceProfile::PiKvm => include_str!("../tests/fixtures/pikvm-status.json"),
+            DeviceProfile::GlKvm => include_str!("../tests/fixtures/glkvm-status.json"),
+        })
+        .unwrap()
+    }
+
+    fn reads(fixture: &Value) -> [Read; 7] {
+        ROUTES.map(|route| Read::State(fixture[route].clone()))
+    }
+
+    fn parsed(profile: DeviceProfile) -> DeviceStatus {
+        parse(profile, reads(&fixture(profile))).unwrap()
+    }
+
+    fn supported<T: std::fmt::Debug>(reported: &Reported<T>) -> &T {
+        reported
+            .value()
+            .unwrap_or_else(|| panic!("expected a reported value, found {reported:?}"))
+    }
+
+    fn some(value: &str) -> Reported<String> {
+        Reported::Supported(value.to_owned())
+    }
+
+    #[test]
+    fn pikvm_status_is_typed() {
+        let status = parsed(DeviceProfile::PiKvm);
+        let info = supported(&status.info);
+        assert_eq!(info.kvmd_version, some("0.0.0-synthetic"));
+        assert_eq!(info.streamer_app, some("ustreamer"));
+        assert_eq!(supported(&info.kernel).machine, some("aarch64"));
+        // PiKVM's legacy info response carries the platform under `hw`.
+        assert_eq!(supported(&info.platform).model, some("synthetic"));
+        assert_eq!(info.host, some("pikvm.example"));
+
+        let hid = supported(&status.hid);
+        assert_eq!(hid.connected, Reported::Unknown);
+        let keyboard = supported(&hid.keyboard);
+        assert_eq!(supported(&keyboard.leds).num, Reported::Supported(true));
+        assert_eq!(supported(&keyboard.outputs).active, None);
+        let mouse = supported(&hid.mouse);
+        assert_eq!(mouse.mode, MouseMode::Absolute);
+        assert_eq!(
+            *supported(&mouse.outputs),
+            HidOutputs {
+                available: vec!["usb".into(), "usb_rel".into()],
+                active: Some("usb".into()),
+            }
+        );
+        assert_eq!(
+            supported(&hid.jiggler).interval_seconds,
+            Reported::Supported(60)
+        );
+
+        let streamer = supported(&status.streamer);
+        assert_eq!(streamer.features.resolution, Reported::Supported(false));
+        assert_eq!(streamer.resolution, Reported::Unsupported);
+        assert_eq!(streamer.available_resolutions, Reported::Unsupported);
+        assert_eq!(streamer.features.h265, Reported::Unsupported);
+        assert_eq!(streamer.quality, Reported::Supported(80));
+        assert_eq!(
+            streamer.desired_fps_limits,
+            Reported::Supported(Limits { min: 0, max: 70 })
+        );
+        assert_eq!(streamer.encoder, some("M2M-IMAGE"));
+        let source = supported(&streamer.source);
+        assert_eq!(
+            source.resolution,
+            Reported::Supported(Resolution {
+                width: 1920,
+                height: 1080
+            })
+        );
+        assert_eq!(source.captured_fps, Reported::Supported(39));
+        assert_eq!(streamer.clients, Reported::Supported(1));
+
+        let atx = supported(&status.atx);
+        assert_eq!(atx.power_led, Reported::Supported(true));
+        assert_eq!(atx.hdd_led, Reported::Supported(false));
+        assert_eq!(atx.power_busy, Reported::Supported(false));
+
+        let switch = supported(&status.switch);
+        let ports = supported(&switch.ports);
+        assert_eq!(ports.len(), 2);
+        assert_eq!(ports[0].name, some("Server"));
+        assert_eq!(ports[1].port, 1);
+        assert_eq!(ports[1].channel, Reported::Supported(1));
+        assert_eq!(ports[1].id, some("2"));
+        assert_eq!(switch.active_port, Reported::Supported(Some(1)));
+        assert_eq!(switch.synced, Reported::Supported(true));
+
+        let gpio = supported(&status.gpio);
+        let inputs = supported(&gpio.inputs);
+        assert_eq!(inputs[0].channel, "led");
+        assert_eq!(inputs[0].state, Reported::Supported(true));
+        let outputs = supported(&gpio.outputs);
+        assert_eq!(outputs[0].channel, "button");
+        assert_eq!(outputs[0].busy, Reported::Supported(true));
+        assert_eq!(outputs[0].state, Reported::Unknown);
+        assert_eq!(outputs[0].switchable, Reported::Supported(false));
+        assert_eq!(outputs[1].channel, "relay");
+        assert_eq!(outputs[1].state, Reported::Supported(true));
+        assert_eq!(outputs[1].switchable, Reported::Supported(true));
+
+        let media = supported(&status.media);
+        let drive = supported(&media.drive);
+        assert_eq!(drive.connected, Reported::Supported(true));
+        assert_eq!(drive.cdrom, Reported::Supported(true));
+        let image = supported(&drive.image).as_ref().unwrap();
+        assert_eq!(image.name, "remote.iso");
+        assert_eq!(image.size, Reported::Supported(2048));
+        assert_eq!(media.partition_drive, Reported::Unsupported);
+        let images = supported(&media.images);
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].name, "disk.iso");
+        assert_eq!(images[0].complete, Reported::Supported(true));
+        let partitions = supported(&media.partitions);
+        assert_eq!(partitions[0].name, "");
+        assert_eq!(partitions[0].free, Reported::Supported(4_294_967_296));
+    }
+
+    #[test]
+    fn glkvm_status_is_typed() {
+        let status = parsed(DeviceProfile::GlKvm);
+        let info = supported(&status.info);
+        // GLKVM reports a fixed streamer version rather than the running streamer's.
+        assert_eq!(info.streamer_version, Reported::Unknown);
+        assert_eq!(info.streamer_app, some("ustreamer"));
+        // GLKVM's info response carries the platform under `system`, with `null` for fields it could not read.
+        let platform = supported(&info.platform);
+        assert_eq!(platform.serial, some("1111111111111111"));
+        assert_eq!(platform.model, Reported::Unknown);
+        assert_eq!(info.host, some("glkvm.example"));
+
+        let hid = supported(&status.hid);
+        assert_eq!(hid.connected, Reported::Supported(true));
+        let mouse = supported(&hid.mouse);
+        assert_eq!(mouse.online, Reported::Supported(false));
+        assert_eq!(mouse.mode, MouseMode::Relative);
+        assert_eq!(supported(&hid.jiggler).active, Reported::Supported(true));
+
+        let streamer = supported(&status.streamer);
+        assert_eq!(streamer.features.h265, Reported::Supported(true));
+        assert_eq!(streamer.features.venc_mode, Reported::Supported(true));
+        assert_eq!(streamer.resolution, some("1920x1080"));
+        assert_eq!(
+            streamer.available_resolutions,
+            Reported::Supported(vec!["1920x1080".into(), "1280x720".into()])
+        );
+        // The streamer is not running, so its capture state is unobserved.
+        assert_eq!(streamer.encoder, Reported::Unknown);
+        assert_eq!(streamer.source, Reported::Unknown);
+        assert_eq!(streamer.clients, Reported::Unknown);
+
+        let atx = supported(&status.atx);
+        assert_eq!(atx.busy, Reported::Supported(true));
+        assert_eq!(atx.hdd_led, Reported::Supported(true));
+        assert_eq!(atx.power_busy, Reported::Unsupported);
+        assert_eq!(atx.reset_busy, Reported::Unsupported);
+
+        let switch = supported(&status.switch);
+        assert_eq!(supported(&switch.ports)[1].name, some("Lab"));
+        assert_eq!(switch.active_port, Reported::Supported(None));
+        assert_eq!(switch.synced, Reported::Unknown);
+
+        let gpio = supported(&status.gpio);
+        assert_eq!(gpio.inputs, Reported::Supported(Vec::new()));
+        assert_eq!(gpio.outputs, Reported::Supported(Vec::new()));
+
+        let media = supported(&status.media);
+        assert_eq!(supported(&media.drive).image, Reported::Supported(None));
+        let partition = supported(&media.partition_drive);
+        assert_eq!(partition.rw, Reported::Supported(true));
+        assert_eq!(supported(&partition.image).as_ref().unwrap().name, "sda1");
+        assert_eq!(
+            supported(&media.images)[0].complete,
+            Reported::Supported(false)
+        );
+    }
+
+    #[test]
+    fn absent_disabled_and_unreadable_subsystems_are_distinguished() {
+        let status = parse(
+            DeviceProfile::PiKvm,
+            [
+                Read::State(json!("not an object")),
+                Read::State(json!({"enabled": true})),
+                Read::Denied,
+                Read::State(
+                    json!({"enabled": false, "busy": false, "acts": {"power": false, "reset": false}, "leds": {"power": false, "hdd": false}}),
+                ),
+                Read::Absent,
+                Read::State(json!({})),
+                Read::State(
+                    json!({"enabled": false, "online": false, "busy": false, "storage": null, "drive": null}),
+                ),
+            ],
+        )
+        .unwrap();
+        assert_eq!(status.info, Reported::Unknown);
+        let hid = supported(&status.hid);
+        assert_eq!(hid.online, Reported::Unknown);
+        assert_eq!(hid.keyboard, Reported::Unknown);
+        assert_eq!(hid.mouse, Reported::Unknown);
+        assert_eq!(status.streamer, Reported::Unknown);
+        // A disabled ATX plugin reports its LEDs off; that is a placeholder, not an observation.
+        assert_eq!(status.atx, Reported::Unsupported);
+        assert_eq!(status.switch, Reported::Unsupported);
+        let gpio = supported(&status.gpio);
+        assert_eq!(gpio.inputs, Reported::Unknown);
+        assert_eq!(gpio.outputs, Reported::Unknown);
+        assert_eq!(status.media, Reported::Unsupported);
+
+        let status = parse(
+            DeviceProfile::GlKvm,
+            ROUTES.map(|route| match route {
+                "atx" => Read::State(json!({"leds": {"power": true}})),
+                "msd" => Read::State(json!({"online": true})),
+                _ => Read::Absent,
+            }),
+        )
+        .unwrap();
+        // A subsystem that does not say whether it is enabled is unknown, as in capability discovery.
+        assert_eq!(status.atx, Reported::Unknown);
+        assert_eq!(status.media, Reported::Unknown);
+        assert_eq!(status.info.capability(), Capability::Unsupported);
+    }
+
+    #[test]
+    fn a_status_with_nothing_readable_is_an_authentication_failure() {
+        assert!(matches!(
+            parse(DeviceProfile::PiKvm, Default::default()),
+            Err(Error::Authentication)
+        ));
+        let mut mixed: [Read; 7] = Default::default();
+        mixed[3] = Read::Absent;
+        assert!(matches!(
+            parse(DeviceProfile::GlKvm, mixed),
+            Err(Error::Authentication)
+        ));
+        let mut partial: [Read; 7] = Default::default();
+        partial[1] = Read::State(json!({"enabled": true}));
+        let status = parse(DeviceProfile::PiKvm, partial).unwrap();
+        assert_eq!(status.hid.capability(), Capability::Supported);
+        assert_eq!(status.info, Reported::Unknown);
+        let absent = parse(DeviceProfile::PiKvm, ROUTES.map(|_| Read::Absent)).unwrap();
+        assert_eq!(absent.info, Reported::Unsupported);
+        assert_eq!(absent.media, Reported::Unsupported);
+    }
+
+    #[test]
+    fn credential_bearing_device_values_are_not_carried() {
+        for profile in [DeviceProfile::PiKvm, DeviceProfile::GlKvm] {
+            let status = parsed(profile);
+            assert!(!format!("{status:?}").contains("SECRET"));
+            assert!(!serde_json::to_string(&status).unwrap().contains("SECRET"));
+        }
+    }
+
+    /// Keys the parser looks for, so generated responses reach its branches rather than only its unknown cases.
+    const KEYS: &str = "enabled online busy state leds power hdd acts model ports summary active_port synced inputs outputs drive image name storage images parts system platform hw streamer source features params limits keyboard mouse available active jiggler drive_partition scheme switch";
+
+    fn json_value() -> impl Strategy<Value = Value> {
+        let leaf = prop_oneof![
+            Just(Value::Null),
+            any::<bool>().prop_map(Value::from),
+            any::<i64>().prop_map(Value::from),
+            any::<u64>().prop_map(Value::from),
+            "[a-z_]{0,8}".prop_map(Value::from),
+        ];
+        leaf.prop_recursive(4, 48, 6, |inner| {
+            prop_oneof![
+                vec(inner.clone(), 0..4).prop_map(Value::Array),
+                proptest::collection::btree_map(
+                    proptest::sample::select(
+                        KEYS.split(' ').map(str::to_owned).collect::<Vec<_>>(),
+                    ),
+                    inner,
+                    0..6,
+                )
+                .prop_map(|entries| Value::Object(entries.into_iter().collect())),
+            ]
+        })
+    }
+
+    fn profile() -> impl Strategy<Value = DeviceProfile> {
+        proptest::sample::select(vec![DeviceProfile::PiKvm, DeviceProfile::GlKvm])
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(256))]
+
+        // Breaks if an unexpected response shape panics instead of becoming unknown, or if a parsed status fails to survive serialisation.
+        #[test]
+        fn arbitrary_responses_parse_and_round_trip(
+            responses in vec(json_value(), 7),
+            profile in profile(),
+        ) {
+            let reads: [Read; 7] = std::array::from_fn(|index| Read::State(responses[index].clone()));
+            let status = parse(profile, reads).unwrap();
+            let encoded = serde_json::to_value(&status).unwrap();
+            let decoded: DeviceStatus = serde_json::from_value(encoded).unwrap();
+            prop_assert_eq!(decoded, status.clone());
+            for (route, response) in ROUTES.iter().zip(&responses) {
+                if !response.is_object() {
+                    let capability = match *route {
+                        "info" => status.info.capability(),
+                        "hid" => status.hid.capability(),
+                        "streamer" => status.streamer.capability(),
+                        "atx" => status.atx.capability(),
+                        "switch" => status.switch.capability(),
+                        "gpio" => status.gpio.capability(),
+                        _ => status.media.capability(),
+                    };
+                    prop_assert_eq!(capability, Capability::Unknown, "{}", route);
+                }
+            }
+        }
+
+        // Breaks if a disabled ATX plugin's placeholder LEDs are reported, or an enabled plugin's LEDs are not carried unchanged.
+        #[test]
+        fn atx_leds_are_reported_only_when_enabled(
+            enabled in any::<bool>(),
+            power in any::<bool>(),
+            hdd in any::<bool>(),
+            profile in profile(),
+        ) {
+            let state = json!({"enabled": enabled, "busy": false, "leds": {"power": power, "hdd": hdd}});
+            let atx = section(Read::State(state), |state| enabled_atx(profile, state));
+            if enabled {
+                let atx = atx.value().unwrap();
+                prop_assert_eq!(&atx.power_led, &Reported::Supported(power));
+                prop_assert_eq!(&atx.hdd_led, &Reported::Supported(hdd));
+                let acts = if profile == DeviceProfile::PiKvm { Reported::Unknown } else { Reported::Unsupported };
+                prop_assert_eq!(&atx.power_busy, &acts);
+            } else {
+                prop_assert_eq!(atx, Reported::Unsupported);
+            }
+        }
+
+        // Breaks if a GPIO output's placeholder state is reported while it is offline or busy.
+        #[test]
+        fn gpio_output_state_is_reported_only_when_readable(
+            online in proptest::option::of(any::<bool>()),
+            busy in proptest::option::of(any::<bool>()),
+            value in any::<bool>(),
+            switchable in proptest::option::of(any::<bool>()),
+        ) {
+            let mut output = json!({"state": value});
+            if let Some(online) = online {
+                output["online"] = online.into();
+            }
+            if let Some(busy) = busy {
+                output["busy"] = busy.into();
+            }
+            let mut scheme = json!({});
+            if let Some(switchable) = switchable {
+                scheme["switch"] = switchable.into();
+            }
+            let gpio = gpio_status(&json!({
+                "model": {"scheme": {"outputs": {"a/b~c": scheme}}},
+                "state": {"outputs": {"a/b~c": output}},
+            }));
+            let outputs = gpio.outputs.value().unwrap();
+            prop_assert_eq!(outputs.len(), 1);
+            prop_assert_eq!(&outputs[0].channel, "a/b~c");
+            let expected = if online == Some(true) && busy == Some(false) {
+                Reported::Supported(value)
+            } else {
+                Reported::Unknown
+            };
+            prop_assert_eq!(&outputs[0].state, &expected);
+            prop_assert_eq!(&outputs[0].switchable, &switchable.map_or(Reported::Unknown, Reported::Supported));
+        }
+
+        // Breaks if "no port selected" is confused with a port number, or GLKVM's constant `synced` flag is reported as an observation.
+        #[test]
+        fn switch_selection_distinguishes_no_port(
+            active in any::<i64>(),
+            synced in any::<bool>(),
+            profile in profile(),
+        ) {
+            let switch = switch_status(profile, &json!({"summary": {"active_port": active, "synced": synced}}));
+            let expected = if active < 0 {
+                Reported::Supported(None)
+            } else {
+                u32::try_from(active).map_or(Reported::Unknown, |port| Reported::Supported(Some(port)))
+            };
+            prop_assert_eq!(switch.active_port, expected);
+            prop_assert_eq!(switch.ports, Reported::Unknown);
+            let synced = if profile == DeviceProfile::PiKvm { Reported::Supported(synced) } else { Reported::Unknown };
+            prop_assert_eq!(switch.synced, synced);
+        }
+
+        // Breaks if a value the device reports that can embed a credential (a remote image URL, a stream client key, configured extras) reaches the status.
+        #[test]
+        fn embedded_credentials_never_reach_the_status(
+            secret in "SECRET-[a-z0-9]{1,10}",
+            profile in profile(),
+        ) {
+            let mut responses = fixture(profile);
+            responses["msd"]["drive"]["image"]["url"] = format!("https://user:{secret}@images.example/").into();
+            responses["info"]["extras"] = json!({"synthetic": {"token": secret}});
+            responses["streamer"]["streamer"] = json!({"stream": {"clients": 1, "clients_stat": {"1": {"key": secret}}}});
+            let status = parse(profile, reads(&responses)).unwrap();
+            prop_assert!(!format!("{status:?}").contains(&secret));
+            prop_assert!(!serde_json::to_string(&status).unwrap().contains(&secret));
+        }
+    }
+
+    fn enabled_atx(profile: DeviceProfile, state: &Value) -> Reported<AtxStatus> {
+        enabled(state, |state| atx_status(profile, state))
+    }
+}

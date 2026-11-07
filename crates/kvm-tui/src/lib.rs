@@ -15,7 +15,7 @@ use crossterm::{
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
-use kvm_core::{Capabilities, Capability, Device, DeviceStatus};
+use kvm_core::{Capabilities, Capability, Device, DeviceStatus, Reported};
 use ratatui::{
     Frame, Terminal,
     backend::{Backend, CrosstermBackend},
@@ -839,6 +839,133 @@ fn key_name(code: KeyCode) -> Option<String> {
     }
 }
 
+/// Device-reported text with control characters escaped, so a device cannot send terminal control sequences through the status display.
+fn untrusted(text: &str) -> String {
+    text.chars()
+        .flat_map(|c| {
+            if c.is_control() {
+                c.escape_default().collect::<Vec<_>>()
+            } else {
+                vec![c]
+            }
+        })
+        .collect()
+}
+
+fn shown<T>(value: &Reported<T>, show: impl FnOnce(&T) -> String) -> String {
+    match value {
+        Reported::Supported(value) => show(value),
+        Reported::Unsupported => "unsupported".into(),
+        Reported::Unknown => "unknown".into(),
+    }
+}
+
+fn shown_flag(value: &Reported<bool>, on: &str, off: &str) -> String {
+    shown(value, |value| if *value { on } else { off }.to_owned())
+}
+
+fn shown_text(value: &Reported<String>) -> String {
+    shown(value, |text| untrusted(text))
+}
+
+/// One line per subsystem of a typed status, each value shown as reported, `unsupported` or `unknown`.
+fn status_summary(status: &DeviceStatus) -> String {
+    let system = shown(&status.info, |info| {
+        format!(
+            "KVMD {}, streamer {}, host {}",
+            shown_text(&info.kvmd_version),
+            shown_text(&info.streamer_version),
+            shown_text(&info.host)
+        )
+    });
+    let hid = shown(&status.hid, |hid| {
+        format!(
+            "{}, keyboard {}, mouse {}",
+            shown_flag(&hid.online, "online", "offline"),
+            shown(&hid.keyboard, |keyboard| shown_flag(
+                &keyboard.online,
+                "online",
+                "offline"
+            )),
+            shown(&hid.mouse, |mouse| format!(
+                "{} ({:?})",
+                shown_flag(&mouse.online, "online", "offline"),
+                mouse.mode
+            ))
+        )
+    });
+    let video = shown(&status.streamer, |streamer| {
+        format!(
+            "source {}, clients {}",
+            shown(&streamer.source, |source| format!(
+                "{} {}",
+                shown_flag(&source.online, "online", "without signal"),
+                shown(&source.resolution, |resolution| format!(
+                    "{}x{}",
+                    resolution.width, resolution.height
+                ))
+            )),
+            shown(&streamer.clients, u32::to_string)
+        )
+    });
+    let power = shown(&status.atx, |atx| {
+        format!(
+            "power LED {}, HDD LED {}, {}",
+            shown_flag(&atx.power_led, "on", "off"),
+            shown_flag(&atx.hdd_led, "on", "off"),
+            shown_flag(&atx.busy, "button press in progress", "idle")
+        )
+    });
+    let switch = shown(&status.switch, |switch| {
+        format!(
+            "active port {}, ports {}, {}",
+            shown(&switch.active_port, |port| port
+                .map_or_else(|| "none".into(), |port| port.to_string())),
+            shown(&switch.ports, |ports| ports
+                .iter()
+                .map(|port| port.port.to_string())
+                .collect::<Vec<_>>()
+                .join(" ")),
+            shown_flag(&switch.synced, "synced", "not synced")
+        )
+    });
+    let gpio = shown(&status.gpio, |gpio| {
+        shown(&gpio.outputs, |outputs| {
+            if outputs.is_empty() {
+                return "no outputs".into();
+            }
+            outputs
+                .iter()
+                .map(|output| {
+                    format!(
+                        "{} {}",
+                        untrusted(&output.channel),
+                        shown_flag(&output.state, "on", "off")
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+    });
+    let media = shown(&status.media, |media| {
+        format!(
+            "drive {}, images {}",
+            shown(&media.drive, |drive| format!(
+                "{}{}",
+                shown_flag(&drive.connected, "connected", "disconnected"),
+                shown(&drive.image, |image| image.as_ref().map_or_else(
+                    || ", no image".into(),
+                    |image| format!(", image {}", untrusted(&image.name))
+                ))
+            )),
+            shown(&media.images, |images| images.len().to_string())
+        )
+    });
+    format!(
+        "System: {system}\nHID: {hid}\nVideo: {video}\nPower: {power}\nSwitch: {switch}\nGPIO: {gpio}\nMedia: {media}"
+    )
+}
+
 /// Draws the current state using any ratatui backend, including its test backend.
 pub fn draw(frame: &mut Frame<'_>, app: &App) {
     let areas = Layout::vertical([
@@ -896,7 +1023,7 @@ pub fn draw(frame: &mut Frame<'_>, app: &App) {
         }
     } else {
         let status = match &app.status {
-            Some(s) => format!("Info: {}\nHID: {}\nStreamer: {}", s.info, s.hid, s.streamer),
+            Some(status) => status_summary(status),
             None => "Status unavailable".into(),
         };
         frame.render_widget(
@@ -1543,9 +1670,13 @@ mod tests {
         }
         async fn status(&self) -> kvm_core::Result<DeviceStatus> {
             Ok(DeviceStatus {
-                info: serde_json::json!({}),
-                hid: serde_json::json!({}),
-                streamer: serde_json::json!({}),
+                info: Reported::Unknown,
+                hid: Reported::Unknown,
+                streamer: Reported::Unknown,
+                atx: Reported::Unknown,
+                switch: Reported::Unknown,
+                gpio: Reported::Unknown,
+                media: Reported::Unknown,
             })
         }
         async fn capabilities(&self) -> kvm_core::Result<Capabilities> {
@@ -3100,6 +3231,68 @@ mod tests {
                 |cell| cell.symbol() == "▀" && cell.fg == ratatui::style::Color::Rgb(255, 0, 0)
             )
         );
+    }
+
+    #[test]
+    fn renders_typed_status_and_escapes_device_text() {
+        use kvm_core::{AtxStatus, GpioOutput, GpioStatus, SwitchPort, SwitchStatus};
+        let port = |port| SwitchPort {
+            port,
+            unit: Reported::Supported(0),
+            channel: Reported::Supported(port),
+            id: Reported::Unknown,
+            name: Reported::Unknown,
+        };
+        let status = DeviceStatus {
+            info: Reported::Unknown,
+            hid: Reported::Unsupported,
+            streamer: Reported::Unknown,
+            atx: Reported::Supported(AtxStatus {
+                busy: Reported::Supported(false),
+                power_led: Reported::Supported(true),
+                hdd_led: Reported::Unknown,
+                power_busy: Reported::Unsupported,
+                reset_busy: Reported::Unsupported,
+            }),
+            switch: Reported::Supported(SwitchStatus {
+                ports: Reported::Supported(vec![port(0), port(1)]),
+                active_port: Reported::Supported(Some(1)),
+                synced: Reported::Unknown,
+            }),
+            gpio: Reported::Supported(GpioStatus {
+                inputs: Reported::Supported(Vec::new()),
+                outputs: Reported::Supported(vec![GpioOutput {
+                    channel: "lamp\u{1b}[2J".into(),
+                    online: Reported::Supported(true),
+                    busy: Reported::Supported(false),
+                    state: Reported::Supported(true),
+                    switchable: Reported::Supported(true),
+                }]),
+            }),
+            media: Reported::Unsupported,
+        };
+        let summary = status_summary(&status);
+        assert!(summary.contains("System: unknown"));
+        assert!(summary.contains("HID: unsupported"));
+        assert!(summary.contains("Power: power LED on, HDD LED unknown, idle"));
+        assert!(summary.contains("Switch: active port 1, ports 0 1, unknown"));
+        assert!(summary.contains("GPIO: lamp\\u{1b}[2J on"));
+        assert!(!summary.contains('\u{1b}'));
+        assert!(summary.contains("Media: unsupported"));
+        let mut terminal = Terminal::new(TestBackend::new(100, 20)).unwrap();
+        let app = App {
+            status: Some(status),
+            ..App::default()
+        };
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        let content = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(content.contains("Power: power LED on"));
     }
 
     #[test]
