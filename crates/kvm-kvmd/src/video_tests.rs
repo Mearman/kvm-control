@@ -749,6 +749,66 @@ async fn owed_release_interrupted_by_runtime_shutdown_is_reported() {
 }
 
 #[tokio::test]
+async fn movement_interrupted_by_runtime_shutdown_is_reported_by_the_next_lock_holder() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut device = input_device(listener.local_addr().unwrap());
+    let reports = capture_reports(&mut device);
+    let device = Arc::new(device);
+    let (arrived_tx, arrived_rx) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        let (mut state, _) = listener.accept().await.unwrap();
+        assert!(read_request(&mut state).await.contains("/api/hid "));
+        respond(
+            &mut state,
+            "200 OK",
+            b"{\"ok\":true,\"result\":{\"enabled\":true,\"mouse\":{\"online\":true,\"absolute\":true}}}",
+        )
+        .await;
+        // The movement is held unanswered while its runtime shuts down.
+        let (mut movement, _) = listener.accept().await.unwrap();
+        assert!(
+            read_request(&mut movement)
+                .await
+                .contains("send_mouse_move")
+        );
+        arrived_tx.send(()).unwrap();
+        let (mut press, _) = listener.accept().await.unwrap();
+        assert!(
+            read_input_request(&mut press)
+                .await
+                .contains("key=KeyC&state=true")
+        );
+        respond(&mut press, "200 OK", b"{\"ok\":true}").await;
+        drop(movement);
+        listener
+    });
+    let moving = device.clone();
+    tokio::task::spawn_blocking(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async move {
+            tokio::select! {
+                result = moving.mouse_move(1, 2) => panic!("movement completed unexpectedly: {result:?}"),
+                arrived = arrived_rx => arrived.unwrap(),
+            }
+        });
+        // Shutdown drops the movement task with its request in flight, leaving no task to return or report it.
+    })
+    .await
+    .unwrap();
+    assert_eq!(*reports.lock().unwrap(), Vec::<String>::new());
+    device.key("KeyC", true).await.unwrap();
+    let listener = tokio::time::timeout(INPUT_TIMEOUT, server)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(*reports.lock().unwrap(), [crate::UNSEEN_FAILURE_REPORT]);
+    assert_no_waiting_connection(listener, "the interrupted movement was sent again");
+}
+
+#[tokio::test]
 async fn release_interrupted_by_runtime_shutdown_is_reported_once_by_the_next_lock_holder() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let mut device = input_device(listener.local_addr().unwrap());
