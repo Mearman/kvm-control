@@ -881,10 +881,11 @@ mod tests {
         let parser = &source[..source.find("#[cfg(test)]").unwrap()];
         let keys: Vec<&str> = KEYS.split(' ').collect();
         let mut missing = Vec::new();
-        for line in parser
-            .lines()
-            .filter(|line| !line.trim_start().starts_with("//"))
-        {
+        // The route list names URL paths, not object keys; every other literal in the parser is a key or a JSON pointer of keys.
+        for line in parser.lines().filter(|line| {
+            let line = line.trim_start();
+            !line.starts_with("//") && !line.starts_with("const ROUTES")
+        }) {
             // String literals are the odd-numbered pieces between quotes; the parser's literals contain no escaped quotes.
             for literal in line.split('"').skip(1).step_by(2) {
                 for key in literal.split('/') {
@@ -892,7 +893,7 @@ mod tests {
                         && key
                             .chars()
                             .all(|c| c.is_ascii_lowercase() || c == '_' || c.is_ascii_digit());
-                    if is_key && !ROUTES.contains(&key) && !keys.contains(&key) {
+                    if is_key && !keys.contains(&key) {
                         missing.push(key.to_owned());
                     }
                 }
