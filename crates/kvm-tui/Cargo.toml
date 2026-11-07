@@ -17,6 +17,11 @@ tokio = { workspace = true, features = ["signal"] }
 url.workspace = true
 zeroize = "1.9.1"
 
+
+[target.'cfg(unix)'.dependencies]
+
+libc = "0.2.191"
+
 [dev-dependencies]
 async-trait.workspace = true
 axum = { version = "0.8", features = ["ws"] }

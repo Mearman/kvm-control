@@ -1,7 +1,9 @@
 //! In-process terminal interface for an already connected `kvm_core::Device`.
 //!
 //! Integration assumptions: connection, authentication and device selection belong to the caller.
-//! Video frames are rendered using coloured character cells; input is never retried after an error.
+//! Video frames are rendered with a native terminal image protocol when one is detected or selected, and with coloured character cells otherwise; input is never retried after an error.
+
+mod capabilities;
 
 use std::{io, time::Duration};
 
@@ -1049,7 +1051,7 @@ impl ImagePicker {
     #[cfg(test)]
     fn halfblocks() -> Self {
         Self {
-            cell_size: (10, 20),
+            cell_size: capabilities::DEFAULT_CELL_SIZE,
             protocol: ratatui_image::picker::ProtocolType::Halfblocks,
             tmux: false,
         }
@@ -1093,78 +1095,98 @@ impl ImagePicker {
     }
 }
 
-fn terminal_capabilities() -> io::Result<(ImagePicker, bool)> {
-    use ratatui_image::picker::ProtocolType;
-    let term = std::env::var("TERM").unwrap_or_default();
-    let program = std::env::var("TERM_PROGRAM").unwrap_or_default();
-    let tmux = std::env::var_os("TMUX").is_some() || term.starts_with("tmux") || program == "tmux";
-    let protocol = match std::env::var("KVM_TUI_IMAGE_PROTOCOL").as_deref() {
-        Ok("halfblocks") => ProtocolType::Halfblocks,
-        Ok("kitty") => ProtocolType::Kitty,
-        Ok("sixel") => ProtocolType::Sixel,
-        Ok("iterm2") => ProtocolType::Iterm2,
-        Ok(_) => return Err(io::Error::other("invalid KVM_TUI_IMAGE_PROTOCOL")),
-        Err(std::env::VarError::NotPresent) => match (tmux, term.as_str(), program.as_str()) {
-            (false, "xterm-kitty" | "xterm-ghostty", _) => ProtocolType::Kitty,
-            (false, _, "iTerm.app" | "WezTerm") => ProtocolType::Iterm2,
-            _ => ProtocolType::Halfblocks,
-        },
-        Err(_) => return Err(io::Error::other("invalid KVM_TUI_IMAGE_PROTOCOL encoding")),
-    };
-    let enhanced = !tmux && matches!(term.as_str(), "xterm-kitty" | "xterm-ghostty" | "wezterm");
-    // Terminal ioctls may omit pixel dimensions; use the image library's default cell size in that case.
-    let cell_size = match crossterm::terminal::window_size() {
+/// Cell size from the window size ioctl, which may omit pixel dimensions.
+fn window_cell_size() -> Option<(u16, u16)> {
+    match crossterm::terminal::window_size() {
         Ok(size)
             if size.columns > 0
                 && size.rows > 0
                 && size.width >= size.columns
                 && size.height >= size.rows =>
         {
-            (size.width / size.columns, size.height / size.rows)
+            Some((size.width / size.columns, size.height / size.rows))
         }
-        _ => (10, 20),
+        _ => None,
+    }
+}
+
+/// Decides the image protocol and keyboard enhancement, querying the terminal when both standard input and standard output are terminals. Must run after entering the alternate screen and raw mode, so that replies are not echoed and the query is not left on the user's screen.
+async fn detect_capabilities(
+    environment: &capabilities::TerminalEnvironment,
+    probe_deadline: Duration,
+) -> io::Result<(ImagePicker, bool)> {
+    #[cfg(unix)]
+    let report = {
+        use std::io::IsTerminal;
+        if io::stdin().is_terminal() && io::stdout().is_terminal() {
+            let query = capabilities::query(environment.tmux, environment.image_override.is_none());
+            Some(capabilities::probe(&query, probe_deadline).await?)
+        } else {
+            None
+        }
     };
+    #[cfg(not(unix))]
+    let report = {
+        let _ = probe_deadline;
+        None
+    };
+    let decision = capabilities::decide(environment, report.as_ref(), window_cell_size());
     Ok((
         ImagePicker {
-            cell_size,
-            protocol,
-            tmux,
+            cell_size: decision.cell_size,
+            protocol: decision.protocol,
+            tmux: decision.tmux,
         },
-        enhanced,
+        decision.enhanced_keyboard,
     ))
 }
 
 /// Runs the TUI for an already authenticated device. Cancellation schedules best-effort input release while the runtime remains active.
+///
+/// SIGTERM and SIGINT end the session at any point after the terminal is set up, capability detection included, and the terminal is restored before this returns; the runtime keeps handling both signals for the rest of the process.
+///
+/// # Errors
+/// Returns an error when `KVM_TUI_IMAGE_PROTOCOL` is invalid, the terminal cannot be set up or restored, a termination signal arrives, or input release fails.
 pub async fn run(device: std::sync::Arc<dyn Device>) -> io::Result<()> {
+    run_with_probe_deadline(device, capabilities::PROBE_DEADLINE).await
+}
+
+async fn run_with_probe_deadline(
+    device: std::sync::Arc<dyn Device>,
+    probe_deadline: Duration,
+) -> io::Result<()> {
+    let environment = capabilities::TerminalEnvironment::from_env()?;
     let mut input_cleanup = InputCleanup(Some(device.clone()));
     #[cfg(unix)]
-    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    let mut termination = Termination::new()?;
     let mut guard = TerminalGuard::enter(SystemTerminal)?;
-    let (picker, enhanced) = terminal_capabilities()?;
-    if enhanced {
-        guard.keyboard = true;
-        execute!(
-            io::stdout(),
-            crossterm::event::PushKeyboardEnhancementFlags(
-                crossterm::event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
-                    | crossterm::event::KeyboardEnhancementFlags::REPORT_EVENT_TYPES
-                    | crossterm::event::KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES
-            )
-        )?;
-    }
-    guard.keyboard = enhanced;
-    let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
-    let run = run_loop(&mut terminal, device.as_ref(), &picker, enhanced, |_| {
-        if event::poll(Duration::from_millis(25))? {
-            Ok(Some(event::read()?))
-        } else {
-            Ok(None)
+    let session = async {
+        let (picker, enhanced) = detect_capabilities(&environment, probe_deadline).await?;
+        if enhanced {
+            guard.keyboard = true;
+            execute!(
+                io::stdout(),
+                crossterm::event::PushKeyboardEnhancementFlags(
+                    crossterm::event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                        | crossterm::event::KeyboardEnhancementFlags::REPORT_EVENT_TYPES
+                        | crossterm::event::KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES
+                )
+            )?;
         }
-    });
+        let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
+        run_loop(&mut terminal, device.as_ref(), &picker, enhanced, |_| {
+            if event::poll(Duration::from_millis(25))? {
+                Ok(Some(event::read()?))
+            } else {
+                Ok(None)
+            }
+        })
+        .await
+    };
     #[cfg(unix)]
-    let result = wait_for_termination(run, &mut terminate).await;
+    let result = termination.wait(session).await;
     #[cfg(not(unix))]
-    let result = run.await;
+    let result = session.await;
     let result = cleanup_terminal(result, device.as_ref(), &mut guard).await;
     input_cleanup.0 = None;
     result
@@ -1197,12 +1219,34 @@ fn finish_terminal(
     }
 }
 
+/// SIGTERM and SIGINT handlers registered before the terminal is set up, so that a signal at any later point ends the session through terminal restoration rather than the default disposition.
 #[cfg(unix)]
-async fn wait_for_termination<F: std::future::Future<Output = io::Result<()>>>(
-    run: F,
-    terminate: &mut tokio::signal::unix::Signal,
-) -> io::Result<()> {
-    tokio::select! { result = run => result, _ = terminate.recv() => Err(io::Error::other("terminated by SIGTERM")) }
+struct Termination {
+    terminate: tokio::signal::unix::Signal,
+    interrupt: tokio::signal::unix::Signal,
+}
+
+#[cfg(unix)]
+impl Termination {
+    fn new() -> io::Result<Self> {
+        use tokio::signal::unix::{SignalKind, signal};
+        Ok(Self {
+            terminate: signal(SignalKind::terminate())?,
+            interrupt: signal(SignalKind::interrupt())?,
+        })
+    }
+
+    /// Runs `run` until it completes or a termination signal arrives, dropping it in the latter case.
+    async fn wait<F: std::future::Future<Output = io::Result<()>>>(
+        &mut self,
+        run: F,
+    ) -> io::Result<()> {
+        tokio::select! {
+            result = run => result,
+            _ = self.terminate.recv() => Err(io::Error::other("terminated by SIGTERM")),
+            _ = self.interrupt.recv() => Err(io::Error::other("interrupted by SIGINT")),
+        }
+    }
 }
 
 async fn run_loop<B: Backend>(
@@ -3178,21 +3222,38 @@ mod tests {
         );
     }
 
+    /// Runs the real `run` in a child process on a pseudo-terminal and signals it at each startup stage: under tmux with the image protocol overridden, during a capability probe the terminal never answers (by SIGTERM and by SIGINT), and after an answered probe has enabled keyboard enhancement. Each run must restore the screen, the keyboard mode and the terminal attributes, and must leave standard input to the process afterwards.
     #[cfg(unix)]
     #[test]
-    fn startup_process_restores_pty_on_sigterm() {
+    fn startup_process_restores_pty_on_termination_signals() {
         const CHILD: &str = "KVM_STARTUP_PTY_CHILD";
-        if std::env::var_os(CHILD).is_some() {
+        const NAME: &str = "tests::startup_process_restores_pty_on_termination_signals";
+        if let Some(scenario) = std::env::var_os(CHILD) {
+            let probe_deadline = if scenario == "unanswered" {
+                // Longer than the harness allows for the whole run, so only the signal can end the probe.
+                Duration::from_secs(3600)
+            } else {
+                capabilities::PROBE_DEADLINE
+            };
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
                 .unwrap();
-            let result = runtime.block_on(run(std::sync::Arc::new(FakeDevice::default())));
+            let result = runtime.block_on(run_with_probe_deadline(
+                std::sync::Arc::new(FakeDevice::default()),
+                probe_deadline,
+            ));
             assert!(result.is_err());
+            println!("RUN_RETURNED");
+            // A reader left blocked on standard input by the probe would take this line first.
+            let mut line = String::new();
+            io::stdin().read_line(&mut line).unwrap();
+            println!("STDIN_OWNED {}", line.trim());
             return;
         }
         let script = r#"
 import os, pty, select, signal, subprocess, sys, termios, time, tempfile
+binary, name, scenario, signame = sys.argv[1:5]
 sandbox = tempfile.TemporaryDirectory()
 marker = os.path.join(sandbox.name, 'called')
 with open(os.path.join(sandbox.name, 'tmux'), 'w') as f:
@@ -3200,33 +3261,53 @@ with open(os.path.join(sandbox.name, 'tmux'), 'w') as f:
 os.chmod(os.path.join(sandbox.name, 'tmux'), 0o700)
 master, slave = pty.openpty()
 before = termios.tcgetattr(slave)
-env = dict(os.environ, KVM_STARTUP_PTY_CHILD='1', TERM='tmux-256color', TERM_PROGRAM='tmux', TMUX='/nonexistent', PATH=sandbox.name, KVM_TUI_IMAGE_PROTOCOL='halfblocks')
-proc = subprocess.Popen([sys.argv[1], '--exact', 'tests::startup_process_restores_pty_on_sigterm', '--nocapture'], stdin=slave, stdout=slave, stderr=slave, env=env)
+env = {key: value for key, value in os.environ.items() if key not in ('TMUX', 'TERM_PROGRAM', 'KONSOLE_VERSION', 'KVM_TUI_IMAGE_PROTOCOL')}
+env.update(KVM_STARTUP_PTY_CHILD=scenario, PATH=sandbox.name)
+if scenario == 'tmux':
+    env.update(TERM='tmux-256color', TERM_PROGRAM='tmux', TMUX='/nonexistent', KVM_TUI_IMAGE_PROTOCOL='halfblocks')
+else:
+    env.update(TERM='xterm-256color')
+proc = subprocess.Popen([binary, '--exact', name, '--nocapture'], stdin=slave, stdout=slave, stderr=slave, env=env)
 data = b''
 deadline = time.monotonic() + 10
-try:
-    while b'\x1b[?1049h' not in data:
+def read_until(needle, why):
+    global data
+    while needle not in data:
         if time.monotonic() >= deadline or proc.poll() is not None:
-            raise AssertionError('startup did not enter alternate screen: ' + repr(data))
+            raise AssertionError(why + ': ' + repr(data))
         if select.select([master], [], [], 0.1)[0]:
             data += os.read(master, 65536)
-    os.kill(proc.pid, signal.SIGTERM)
-    while proc.poll() is None:
-        if time.monotonic() >= deadline:
-            raise AssertionError('SIGTERM did not terminate startup')
-        if select.select([master], [], [], 0.1)[0]:
-            data += os.read(master, 65536)
-    while select.select([master], [], [], 0)[0]:
-        data += os.read(master, 65536)
-    assert proc.returncode == 0, (proc.returncode, data)
-    assert not os.path.exists(marker), 'startup invoked tmux'
-    assert b'\x1b[?1049l' in data, data
-    after = termios.tcgetattr(slave)
+def normalised(attributes):
     # Darwin may set PENDIN transiently when canonical mode is restored.
     if hasattr(termios, 'PENDIN'):
-        before[3] &= ~termios.PENDIN
-        after[3] &= ~termios.PENDIN
-    assert after == before, ('terminal attributes not restored', before, after, data)
+        attributes[3] &= ~termios.PENDIN
+    return attributes
+try:
+    read_until(b'\x1b[?1049h', 'startup did not enter alternate screen')
+    if scenario != 'tmux':
+        read_until(b'\x1b[c', 'startup did not send the capability probe')
+        assert data.index(b'\x1b[?1049h') < data.index(b'\x1b[?u'), ('probe sent before the alternate screen', data)
+    if scenario == 'answered':
+        os.write(master, b'\x1b[?0u\x1b_Gi=31;OK\x1b\\\x1b[6;20;10t\x1b[?62;4c')
+        read_until(b'\x1b[>11u', 'answered probe did not enable keyboard enhancement')
+    os.kill(proc.pid, getattr(signal, 'SIG' + signame))
+    read_until(b'RUN_RETURNED', 'signal did not end the session')
+    assert b'\x1b[?1049l' in data, data
+    if scenario == 'answered':
+        assert b'\x1b[<1u' in data[data.index(b'\x1b[>11u'):], ('keyboard enhancement not popped', data)
+    else:
+        assert b'\x1b[>' not in data, ('keyboard enhancement pushed without an answer', data)
+    assert not os.path.exists(marker), 'startup invoked tmux'
+    after = termios.tcgetattr(slave)
+    assert normalised(after) == normalised(before), ('terminal attributes not restored', before, after, data)
+    os.write(master, b'stdin-check\n')
+    read_until(b'STDIN_OWNED stdin-check', 'standard input was not left to the process')
+    while proc.poll() is None:
+        if time.monotonic() >= deadline:
+            raise AssertionError('process did not exit')
+        if select.select([master], [], [], 0.1)[0]:
+            data += os.read(master, 65536)
+    assert proc.returncode == 0, (proc.returncode, data)
 finally:
     if proc.poll() is None:
         proc.kill()
@@ -3234,16 +3315,24 @@ finally:
     os.close(master)
     os.close(slave)
 "#;
-        let output = std::process::Command::new("python3")
-            .args(["-I", "-c", script])
-            .arg(std::env::current_exe().unwrap())
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
+        for (scenario, signal) in [
+            ("tmux", "TERM"),
+            ("unanswered", "TERM"),
+            ("unanswered", "INT"),
+            ("answered", "TERM"),
+        ] {
+            let output = std::process::Command::new("python3")
+                .args(["-I", "-c", script])
+                .arg(std::env::current_exe().unwrap())
+                .args([NAME, scenario, signal])
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{scenario} with SIG{signal}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
     }
 
     #[cfg(unix)]
@@ -3258,9 +3347,7 @@ finally:
                 .build()
                 .unwrap();
             runtime.block_on(async {
-                let mut signal =
-                    tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                        .unwrap();
+                let mut termination = Termination::new().unwrap();
                 let calls = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
                 let mut guard = TerminalGuard::enter(FakeModes {
                     calls: calls.clone(),
@@ -3272,10 +3359,11 @@ finally:
                     delayed_cleanup: true,
                     ..FakeDevice::default()
                 };
-                let _ = terminal_capabilities();
+                let environment = capabilities::TerminalEnvironment::from_env().unwrap();
+                let _ = detect_capabilities(&environment, capabilities::PROBE_DEADLINE).await;
                 println!("SIGTERM_READY");
                 std::io::stdout().flush().unwrap();
-                let result = wait_for_termination(std::future::pending(), &mut signal).await;
+                let result = termination.wait(std::future::pending()).await;
                 let cleanup = cleanup_terminal(result, &device, &mut guard);
                 tokio::pin!(cleanup);
                 tokio::select! {
