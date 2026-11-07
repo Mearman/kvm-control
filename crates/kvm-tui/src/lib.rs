@@ -74,32 +74,20 @@ impl App {
         self.drag_modifiers.clear();
     }
 
-    /// Refreshes capability and status information through the shared device API.
+    /// Refreshes capability and status information through the shared device API. Status is read whatever the status capability says, since each subsystem reports its own support; a failure of either read is shown as the message.
     pub async fn refresh(&mut self, device: &dyn Device) {
-        match device.capabilities().await {
-            Ok(capabilities) => {
-                let status_supported = capabilities.status == Capability::Supported;
-                self.capabilities = Some(capabilities);
-                if status_supported {
-                    match device.status().await {
-                        Ok(status) => self.status = Some(status),
-                        Err(error) => {
-                            self.status = None;
-                            self.message = error.to_string();
-                            return;
-                        }
-                    }
-                } else {
-                    self.status = None;
-                }
-                self.message = "Press v to open live video".into();
-            }
-            Err(error) => {
-                self.capabilities = None;
-                self.status = None;
-                self.message = error.to_string();
-            }
-        }
+        let capabilities = device.capabilities().await;
+        let status = device.status().await;
+        let mut errors = Vec::new();
+        self.capabilities = capabilities
+            .map_err(|error| errors.push(error.to_string()))
+            .ok();
+        self.status = status.map_err(|error| errors.push(error.to_string())).ok();
+        self.message = if errors.is_empty() {
+            "Press v to open live video".into()
+        } else {
+            errors.join("; ")
+        };
     }
 
     /// Forwards mouse events in the viewing area while input mode is active.
@@ -1626,6 +1614,8 @@ mod tests {
         fail_video_after_frame: bool,
         block_control: bool,
         control_release: tokio::sync::Notify,
+        /// Reports the status capability unknown, as the adapter does when the info or streamer route is denied.
+        status_capability_unknown: bool,
     }
     struct FakeStream {
         jpeg: Option<Vec<u8>>,
@@ -1673,7 +1663,7 @@ mod tests {
                 info: Reported::Unknown,
                 hid: Reported::Unknown,
                 streamer: Reported::Unknown,
-                atx: Reported::Unknown,
+                atx: Reported::Unsupported,
                 switch: Reported::Unknown,
                 gpio: Reported::Unknown,
                 media: Reported::Unknown,
@@ -1681,7 +1671,11 @@ mod tests {
         }
         async fn capabilities(&self) -> kvm_core::Result<Capabilities> {
             Ok(Capabilities {
-                status: Capability::Supported,
+                status: if self.status_capability_unknown {
+                    Capability::Unknown
+                } else {
+                    Capability::Supported
+                },
                 snapshot: Capability::Unknown,
                 keyboard: Capability::Supported,
                 mouse: Capability::Supported,
@@ -3231,6 +3225,21 @@ mod tests {
                 |cell| cell.symbol() == "▀" && cell.fg == ratatui::style::Color::Rgb(255, 0, 0)
             )
         );
+    }
+
+    #[tokio::test]
+    async fn refresh_reads_status_when_its_capability_is_unknown() {
+        let device = FakeDevice {
+            status_capability_unknown: true,
+            ..FakeDevice::default()
+        };
+        let mut app = App::default();
+        app.refresh(&device).await;
+        assert_eq!(
+            app.capabilities.as_ref().unwrap().status,
+            Capability::Unknown
+        );
+        assert_eq!(app.status.as_ref().unwrap().atx, Reported::Unsupported);
     }
 
     #[test]
