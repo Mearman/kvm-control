@@ -1434,6 +1434,9 @@ where
 }
 
 #[cfg(test)]
+mod live_view_e2e;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use ratatui::backend::TestBackend;
