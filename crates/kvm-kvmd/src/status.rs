@@ -13,7 +13,7 @@ use kvm_core::{
 };
 use serde_json::Value;
 
-use super::{Kvmd, RequestFailure, mouse_mode};
+use super::{Kvmd, RequestFailure, hid_online, mouse_mode};
 
 /// State routes read for a status, in the order `parse` takes them.
 const ROUTES: [&str; 7] = ["info", "hid", "streamer", "atx", "switch", "gpio", "msd"];
@@ -251,14 +251,19 @@ fn hid_outputs(device: &Value) -> Reported<HidOutputs> {
     }
 }
 
+/// A HID `online` flag, which CH9329 reports as `0` or `1`; other HID fields keep strict boolean reads.
+fn online_flag(state: &Value, pointer: &str) -> Reported<bool> {
+    extract(state.pointer(pointer), hid_online)
+}
+
 fn hid_status(state: &Value) -> HidStatus {
     HidStatus {
-        online: boolean(state, "/online"),
+        online: online_flag(state, "/online"),
         busy: boolean(state, "/busy"),
         // PiKVM's OTG plugin reports `null` here, which is unknown rather than disconnected.
         connected: boolean(state, "/connected"),
         keyboard: nested(state, "/keyboard", |keyboard| {
-            let online = boolean(keyboard, "/online");
+            let online = online_flag(keyboard, "/online");
             KeyboardStatus {
                 // The LEDs start as all off and are only updated by the attached host while the keyboard is online, so offline they are not an observation.
                 leds: if online == Reported::Supported(true) {
@@ -275,9 +280,9 @@ fn hid_status(state: &Value) -> HidStatus {
             }
         }),
         mouse: nested(state, "/mouse", |mouse| MouseStatus {
-            online: boolean(mouse, "/online"),
-            // PiKVM's MCU HID reports `absolute: true` while the whole HID is offline, so the mode is an observation only while the HID reports itself online. The OTG and Bluetooth plugins always report themselves online and report their configured mode whatever the attached host does, so their mode is kept. The CH9329 plugin reports its real online state, so its mode is hidden while it is offline, which is conservative. Capability discovery reads the mode on its own, so this does not change the absolute-move check.
-            mode: if boolean(state, "/online") == Reported::Supported(true) {
+            online: online_flag(mouse, "/online"),
+            // PiKVM's MCU HID reports `absolute: true` while the whole HID is offline, so the mode is an observation only while the HID reports itself online. The OTG and Bluetooth plugins always report themselves online and report their configured mode whatever the attached host does, so their mode is kept. The CH9329 plugin reports its real online state as `0` or `1` and its configured mode either way, so its mode is hidden while it is offline, which is conservative. Capability discovery reads the mode on its own, so this does not change the absolute-move check.
+            mode: if online_flag(state, "/online") == Reported::Supported(true) {
                 mouse_mode(state)
             } else {
                 MouseMode::Unknown
@@ -962,6 +967,51 @@ mod tests {
             }));
             assert_eq!(supported(&hid.mouse).mode, expected);
         }
+    }
+
+    // Breaks if CH9329's integer online flags are not read: its online state, keyboard LEDs and mouse mode would then never be reported.
+    #[test]
+    fn ch9329_integer_online_flags_are_read() {
+        // The shape of the CH9329 plugin's state at revisions P and G.
+        let ch9329 = |online: u64| {
+            json!({
+                "enabled": true,
+                "online": online,
+                "busy": false,
+                "connected": null,
+                "keyboard": {
+                    "online": online,
+                    "leds": {"caps": true, "scroll": false, "num": false},
+                    "outputs": {"available": [], "active": ""},
+                },
+                "mouse": {
+                    "online": online,
+                    "absolute": true,
+                    "outputs": {"available": ["usb", "usb_rel"], "active": "usb"},
+                },
+                "jiggler": {"enabled": false, "active": false, "interval": 60},
+            })
+        };
+        let mut responses = fixture(DeviceProfile::PiKvm);
+        responses["hid"] = ch9329(1);
+        let status = parse(DeviceProfile::PiKvm, reads(&responses)).unwrap();
+        let hid = supported(&status.hid);
+        assert_eq!(hid.online, Reported::Supported(true));
+        let keyboard = supported(&hid.keyboard);
+        assert_eq!(keyboard.online, Reported::Supported(true));
+        assert_eq!(supported(&keyboard.leds).caps, Reported::Supported(true));
+        let mouse = supported(&hid.mouse);
+        assert_eq!(mouse.online, Reported::Supported(true));
+        assert_eq!(mouse.mode, MouseMode::Absolute);
+
+        responses["hid"] = ch9329(0);
+        let status = parse(DeviceProfile::PiKvm, reads(&responses)).unwrap();
+        let hid = supported(&status.hid);
+        assert_eq!(hid.online, Reported::Supported(false));
+        assert_eq!(supported(&hid.keyboard).leds, Reported::Unknown);
+        assert_eq!(supported(&hid.mouse).mode, MouseMode::Unknown);
+        // Other HID fields stay strict booleans.
+        assert_eq!(hid_status(&json!({"busy": 0})).busy, Reported::Unknown);
     }
 
     #[test]
