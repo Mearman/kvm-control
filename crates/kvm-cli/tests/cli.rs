@@ -164,8 +164,8 @@ fn invoke_with_signal(
 #[test]
 fn status_is_json_and_authentication_is_not_leaked() {
     let ok = b"{\"ok\":true,\"result\":{}}";
-    let info =
-        b"{\"ok\":true,\"result\":{\"system\":{\"kvmd\":{\"version\":\"0.0.0-synthetic\"}}}}";
+    // The version carries a C1 control introducer and a bidirectional override, which the output must escape.
+    let info = b"{\"ok\":true,\"result\":{\"system\":{\"kvmd\":{\"version\":\"0.0.0-synthetic\\u009b\\u202e\"}}}}";
     let hid = b"{\"ok\":true,\"result\":{\"enabled\":true,\"online\":true}}";
     let atx = b"{\"ok\":true,\"result\":{\"enabled\":false}}";
     let (output, requests) = invoke(&["status"], vec![ok, ok, info, hid, ok, atx, ok, ok, ok]);
@@ -179,7 +179,7 @@ fn status_is_json_and_authentication_is_not_leaked() {
     assert_eq!(
         status["info"],
         serde_json::json!({"support": "Supported", "value": {
-            "kvmd_version": {"support": "Supported", "value": "0.0.0-synthetic"},
+            "kvmd_version": {"support": "Supported", "value": "0.0.0-synthetic\u{9b}\u{202e}"},
             "streamer_app": {"support": "Unknown"},
             "streamer_version": {"support": "Unknown"},
             "kernel": {"support": "Unknown"},
@@ -206,6 +206,9 @@ fn status_is_json_and_authentication_is_not_leaked() {
         );
     }
     assert_eq!(requests.len(), 9);
+    let stdout = String::from_utf8(output.stdout.clone()).unwrap();
+    assert!(!stdout.contains(['\u{9b}', '\u{202e}']));
+    assert!(stdout.contains("synthetic\\u009b\\u202e"));
     assert!(!String::from_utf8_lossy(&output.stdout).contains("synthetic-password"));
     assert!(!String::from_utf8_lossy(&output.stderr).contains("synthetic-password"));
 }

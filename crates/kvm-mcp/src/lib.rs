@@ -79,8 +79,11 @@ pub enum PowerInput {
 
 fn result<T: serde::Serialize>(value: kvm_core::Result<T>) -> CallToolResult {
     match value {
+        // Device text is untrusted, so characters that can drive a terminal or reorder displayed text are escaped; the decoded JSON is unchanged.
         Ok(value) => match serde_json::to_string(&value) {
-            Ok(text) => CallToolResult::success(vec![ContentBlock::text(text)]),
+            Ok(text) => CallToolResult::success(vec![ContentBlock::text(
+                kvm_core::escape_json_for_terminal(&text),
+            )]),
             Err(_) => {
                 CallToolResult::error(vec![ContentBlock::text("Could not encode device response")])
             }
