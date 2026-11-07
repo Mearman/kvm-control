@@ -27,12 +27,12 @@ pub(crate) enum Read {
     /// The session may not read the route.
     #[default]
     Denied,
-    /// The route answered but its state could not be read: an HTTP error status, `ok: false`, a missing result, malformed JSON or an oversized body.
+    /// The route's state could not be read although the connection was established: an HTTP error status, `ok: false`, a missing result, malformed JSON, an oversized body, no complete response within the response phase, a body that broke off, or a reused connection that had closed.
     Failed(Error),
 }
 
 impl Kvmd {
-    /// Reads every state route with GET requests only, so reading status sends no input or control request. A connection failure (no connection or TLS session could be established) fails the whole status at once. A route that timed out after connecting, or whose body broke off, failed on its own, like one answering an error status; how such outcomes combine is described at [`parse`].
+    /// Reads every state route with GET requests only, so reading status sends no input or control request. A connection failure (no connection or TLS session established within the connect phase of `Config::timeout`) fails the whole status at once, including after earlier routes were read, since the device can no longer be reached. A route that did not answer completely within the response phase, or whose body broke off, failed on its own, like one answering an error status; how such outcomes combine is described at [`parse`].
     pub(crate) async fn read_status(&self) -> Result<DeviceStatus> {
         let active = self.client.read().await;
         let mut reads: [Read; 7] = Default::default();
@@ -62,7 +62,7 @@ impl Kvmd {
 ///
 /// Both inspected sources always register the info, HID and streamer routes, so a 404 on any of them means the endpoint is not a KVMD API and fails with that HTTP error. A status in which no route produced state has observed nothing, so it fails: with an authentication error when a route was denied, otherwise with the info route's error (for example the HTTP 502 of a proxy whose daemon is stopped, or the invalid JSON of a page that is not the API).
 ///
-/// A denied route is unknown, which keeps the subsystems a partly permitted session may read. A session whose credentials became invalid between requests therefore looks the same as one denied some routes; `check_auth` or a new login tells them apart. Otherwise each failed or denied route is unknown, and an absent route is unsupported only when the info route was read, which establishes that the endpoint is a KVMD API; without that it is unknown.
+/// Otherwise each failed or denied route is unknown. Keeping a denied route unknown preserves the subsystems a partly permitted session may read, so a session whose credentials became invalid between requests looks the same as one denied some routes; `check_auth` or a new login tells them apart. An absent route is unsupported only when the info route was read, which establishes that the endpoint is a KVMD API; without that it is unknown.
 pub(crate) fn parse(profile: DeviceProfile, reads: [Read; 7]) -> Result<DeviceStatus> {
     if reads[..3].iter().any(|read| matches!(read, Read::Absent)) {
         return Err(Error::Http(404));
@@ -276,7 +276,7 @@ fn hid_status(state: &Value) -> HidStatus {
         }),
         mouse: nested(state, "/mouse", |mouse| MouseStatus {
             online: boolean(mouse, "/online"),
-            // PiKVM's MCU HID reports `absolute: true` while the whole HID is offline, so the mode is an observation only while the HID reports itself online. The OTG plugins always report themselves online and report the configured gadget mode whatever the attached host does, so their mode is kept. Capability discovery reads the mode on its own, so this does not change the absolute-move check.
+            // PiKVM's MCU HID reports `absolute: true` while the whole HID is offline, so the mode is an observation only while the HID reports itself online. The OTG and Bluetooth plugins always report themselves online and report their configured mode whatever the attached host does, so their mode is kept. The CH9329 plugin reports its real online state, so its mode is hidden while it is offline, which is conservative. Capability discovery reads the mode on its own, so this does not change the absolute-move check.
             mode: if boolean(state, "/online") == Reported::Supported(true) {
                 mouse_mode(state)
             } else {
