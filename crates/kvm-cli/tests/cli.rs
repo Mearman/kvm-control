@@ -257,10 +257,13 @@ fn sigterm_during_key_press_releases_input() {
         invoke_with_signal("pikvm", &["key", "KeyA"], vec![ok, ok, ok, ok], true);
     // An exit status rather than death by the signal shows the handler was registered when the press was sent.
     assert_eq!(output.status.code(), Some(1), "{}", output.status);
-    // The fake device signals the CLI and then closes the press connection without answering. Holding the connection open instead cannot make the signal end the press: the release waits for the input lock, which the submitted press holds until its request finishes, so the release would follow only the client's request timeout. The press therefore fails, and the interruption is reported because the signal, sent before the close, has been observed by the time the release round trip completes.
+    // The fake device signals the CLI and then closes the press connection without answering. Holding the connection open instead would stall the test: the release waits for the input lock, which the submitted press holds until its request finishes, so the release would follow only the client's request timeout. The signal, sent before the close, either ends the press or is observed by the time the release round trip completes, and both are reported as an interruption. A press closed after submission leaves the input session indeterminate, so cleanup cannot be confirmed and the error says so.
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("interrupted; press: "), "{stderr}");
-    assert!(stderr.contains("; cleanup: confirmed"), "{stderr}");
+    assert!(stderr.contains(r#""error":"interrupted; "#), "{stderr}");
+    assert!(
+        stderr.contains("; cleanup: input outcome is uncertain"),
+        "{stderr}"
+    );
     assert!(requests[2].starts_with("POST /api/hid/events/send_key?key=KeyA&state=true "));
     assert!(requests[3].starts_with("POST /api/hid/events/send_key?key=KeyA&state=false "));
 }
