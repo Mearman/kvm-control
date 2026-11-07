@@ -1134,9 +1134,6 @@ impl Kvmd {
         caller: &tokio::sync::oneshot::Sender<(Result<()>, bool)>,
     ) -> Moved {
         self.settle_owed(&mut inputs).await;
-        if caller.is_closed() {
-            return Moved::NotSent(Ok(()));
-        }
         let active = self.client.read().await;
         let checked = match self.json_with(&active.client, "hid").await {
             Ok(state)
