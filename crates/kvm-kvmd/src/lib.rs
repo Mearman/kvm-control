@@ -468,8 +468,6 @@ impl Drop for InFlight<'_> {
         if !self.finished {
             self.inputs
                 .record(self.kind, self.name, self.pressed, false);
-            // No task remains to return or report this request's outcome.
-            self.inputs.unseen_failure = true;
         }
     }
 }
