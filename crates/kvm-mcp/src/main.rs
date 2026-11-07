@@ -135,6 +135,18 @@ mod tests {
     use std::{fs::File, io::Write, os::fd::AsRawFd};
 
     #[test]
+    fn reads_synthetic_totp_from_separate_pipe() {
+        let (reader, writer) = rustix::pipe::pipe().unwrap();
+        let mut writer = File::from(writer);
+        writer.write_all(b"012345\n").unwrap();
+        drop(writer);
+        assert_eq!(
+            &*read_password(&reader.as_raw_fd().to_string()).unwrap(),
+            "012345"
+        );
+    }
+
+    #[test]
     fn accepts_pipe_and_rejects_non_pipe() {
         let (reader, writer) = rustix::pipe::pipe().unwrap();
         let mut writer = File::from(writer);

@@ -380,6 +380,7 @@ async fn run(cli: Cli) -> Result<Value, String> {
             let login = device
                 .login_with_totp(&cli.username, &secret, totp.as_deref().map(String::as_str))
                 .await;
+            drop(totp);
             drop(secret);
             let mut state = login.map_err(|e| e.to_string())?;
             if let LoginState::ApprovalPending { expires_in } = state {
@@ -664,6 +665,35 @@ mod tests {
             ])
             .is_err()
         );
+    }
+
+    #[test]
+    fn totp_is_a_flag_and_cannot_share_password_stdin() {
+        let args = [
+            "kvm",
+            "--endpoint",
+            "https://example.com",
+            "--profile",
+            "pikvm",
+            "--username",
+            "user",
+            "--totp",
+            "status",
+        ];
+        assert!(Cli::try_parse_from(args).unwrap().totp);
+        let args = [
+            "kvm",
+            "--endpoint",
+            "https://example.com",
+            "--profile",
+            "pikvm",
+            "--username",
+            "user",
+            "--totp",
+            "--password-stdin",
+            "status",
+        ];
+        assert!(Cli::try_parse_from(args).is_err());
     }
 
     #[test]

@@ -79,6 +79,11 @@ async fn login(State(calls): State<Calls>, uri: Uri, body: String) -> impl IntoR
     )
 }
 
+async fn gl_totp_login(body: String) -> impl IntoResponse {
+    assert_eq!(body, "user=test-user&passwd=test-password012345");
+    gl_login().await
+}
+
 async fn gl_login() -> impl IntoResponse {
     Json(
         json!({"ok": true, "result": {"two_step_required": true, "two_step_token": "synthetic-approval", "expires_in": 60}}),
@@ -201,6 +206,9 @@ async fn fixture() -> (Url, Vec<u8>, Calls, tokio::task::JoinHandle<()>) {
         .route("/chunk/api/auth/login", post(login))
         .route("/chunk/api/auth/check", get(oversized_chunked))
         .route("/gl/api/auth/login", post(gl_login))
+        .route("/gltotp/api/auth/login", post(gl_totp_login))
+        .route("/gltotp/api/auth/two_step_complete", post(gl_complete))
+        .route("/gltotp/api/auth/check", get(status))
         .route("/gl/api/auth/two_step_complete", post(gl_complete))
         .route("/gl/api/auth/check", get(status))
         .route("/bigapproval/api/auth/login", post(gl_login))
@@ -675,6 +683,41 @@ async fn video_capabilities_require_successful_operations() {
     let observed = device.capabilities().await.unwrap();
     assert_eq!(observed.snapshot, Capability::Supported);
     assert_eq!(observed.live_video, Capability::Unknown);
+    server.abort();
+}
+
+#[tokio::test]
+async fn gl_totp_can_precede_device_approval() {
+    let (mut endpoint, ca, calls, server) = fixture().await;
+    endpoint.set_path("/gltotp/");
+    let device = Kvmd::new(Config {
+        endpoint,
+        profile: DeviceProfile::GlKvm,
+        trusted_ca_pem: Some(ca),
+        insecure_tls: false,
+        timeout: Duration::from_secs(5),
+    })
+    .unwrap();
+    assert!(matches!(
+        device
+            .login_with_totp("test-user", &"x".repeat(58), Some("012345"))
+            .await,
+        Err(Error::InvalidResponse(_))
+    ));
+    assert!(calls.0.lock().unwrap().is_empty());
+    assert_eq!(
+        device
+            .login_with_totp("test-user", "test-password", Some("012345"))
+            .await
+            .unwrap(),
+        LoginState::ApprovalPending {
+            expires_in: Some(60)
+        }
+    );
+    assert_eq!(
+        device.complete_approval().await.unwrap(),
+        LoginState::Authenticated
+    );
     server.abort();
 }
 

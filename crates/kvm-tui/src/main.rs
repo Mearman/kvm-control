@@ -33,6 +33,18 @@ struct Args {
     insecure_tls: bool,
 }
 
+#[cfg(test)]
+mod tests {
+    use super::Args;
+    use clap::Parser;
+
+    #[test]
+    fn accepts_totp_flag_without_a_code_argument() {
+        assert!(Args::try_parse_from(["kvm-tui", "--totp"]).unwrap().totp);
+        assert!(Args::try_parse_from(["kvm-tui", "--totp", "012345"]).is_err());
+    }
+}
+
 #[derive(Clone, Copy, ValueEnum)]
 enum Profile {
     Pikvm,

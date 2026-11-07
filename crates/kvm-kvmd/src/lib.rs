@@ -264,6 +264,11 @@ impl Kvmd {
                 ));
             }
             credential.push_str(code);
+            if self.profile == DeviceProfile::GlKvm && credential.len() > 63 {
+                return Err(Error::InvalidResponse(
+                    "GLKVM login password and TOTP exceed 63 bytes".into(),
+                ));
+            }
         }
         if !self.auth_headers.is_empty() {
             return Err(Error::InvalidResponse(
