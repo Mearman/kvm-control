@@ -30,7 +30,7 @@ use url::Url;
 const MAX_IMAGE_DIMENSION: u32 = 8192;
 const MAX_IMAGE_PIXELS: u64 = 32 * 1024 * 1024;
 const MAX_DECODED_BYTES: u64 = MAX_IMAGE_PIXELS * 4;
-// zune-jpeg may allocate 64 i16 coefficients per 8x8 block, for four components with sampling factors up to 4x4, even for non-interleaved progressive scans.
+// Cargo.lock pins zune-jpeg 0.5.15. Its mcu_prog.rs and mcu.rs allocate at most ceil(width/8) * ceil(height/8) * 64 * horizontal_sample * vertical_sample i16s per component; components.rs limits each factor to 4. Recheck this bound when updating the decoder.
 const MAX_PROGRESSIVE_COEFFICIENT_BYTES: u64 = MAX_DECODED_BYTES;
 const MAX_JPEG_COMPONENTS: u64 = 4;
 const MAX_SAMPLING_AREA: u64 = 4 * 4;
@@ -46,16 +46,25 @@ fn jpeg_dimensions_safe(width: u32, height: u32) -> bool {
 
 async fn validate_jpeg_async(bytes: Vec<u8>) -> Result<Vec<u8>> {
     static SLOTS: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> = std::sync::OnceLock::new();
-    let permit = SLOTS
-        .get_or_init(|| Arc::new(tokio::sync::Semaphore::new(MAX_JPEG_VALIDATIONS)))
-        .clone()
+    let slots = SLOTS.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(MAX_JPEG_VALIDATIONS)));
+    run_jpeg_validation(slots.clone(), move || {
+        validate_jpeg(&bytes)?;
+        Ok(bytes)
+    })
+    .await
+}
+
+async fn run_jpeg_validation<T: Send + 'static>(
+    slots: Arc<tokio::sync::Semaphore>,
+    validate: impl FnOnce() -> Result<T> + Send + 'static,
+) -> Result<T> {
+    let permit = slots
         .acquire_owned()
         .await
         .map_err(|_| Error::Transport("JPEG validation unavailable".into()))?;
     tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        validate_jpeg(&bytes)?;
-        Ok(bytes)
+        validate()
     })
     .await
     .map_err(|_| Error::Transport("JPEG validation task failed".into()))?
@@ -1052,6 +1061,48 @@ impl Drop for Kvmd {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn cancelled_validation_holds_slot_until_blocking_work_finishes() {
+        let slots = Arc::new(tokio::sync::Semaphore::new(1));
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let task = tokio::spawn(run_jpeg_validation(slots.clone(), move || {
+            started_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            Ok(())
+        }));
+        started_rx.await.unwrap();
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert!(slots.clone().try_acquire_owned().is_err());
+        release_tx.send(()).unwrap();
+        let permit = tokio::time::timeout(std::time::Duration::from_secs(3), slots.acquire_owned())
+            .await
+            .unwrap()
+            .unwrap();
+        drop(permit);
+    }
+
+    #[tokio::test]
+    async fn validation_releases_slot_after_failure_and_panic() {
+        let slots = Arc::new(tokio::sync::Semaphore::new(1));
+        assert!(
+            run_jpeg_validation(slots.clone(), || Err::<(), _>(Error::InvalidResponse(
+                "test".into()
+            )))
+            .await
+            .is_err()
+        );
+        assert!(
+            run_jpeg_validation(slots.clone(), || -> Result<()> {
+                panic!("synthetic panic")
+            })
+            .await
+            .is_err()
+        );
+        assert!(slots.try_acquire_owned().is_ok());
+    }
+
     #[test]
     fn jpeg_coefficient_budget_bounds_padded_blocks() {
         let bytes_per_block =
@@ -1060,6 +1111,20 @@ mod tests {
         let width = (blocks * 8) as u32;
         assert!(jpeg_dimensions_safe(width, 8));
         assert!(!jpeg_dimensions_safe(width + 1, 8));
+    }
+
+    #[test]
+    fn progressive_jpeg_is_decoded_and_oversized_header_rejected() {
+        use base64::Engine;
+        // An 8x8 synthetic RGB image encoded by ImageMagick with progressive scans.
+        let mut image = base64::engine::general_purpose::STANDARD.decode("/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAMCAgICAgMCAgIDAwMDBAYEBAQEBAgGBgUGCQgKCgkICQkKDA8MCgsOCwkJDRENDg8QEBEQCgwSExIQEw8QEBD/2wBDAQMDAwQDBAgEBAgQCwkLEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBD/wgARCAAIAAgDAREAAhEBAxEB/8QAFAABAAAAAAAAAAAAAAAAAAAABf/EABQBAQAAAAAAAAAAAAAAAAAAAAb/2gAMAwEAAhADEAAAAT3I3//EABQQAQAAAAAAAAAAAAAAAAAAAAD/2gAIAQEAAQUCf//EABQRAQAAAAAAAAAAAAAAAAAAAAD/2gAIAQMBAT8Bf//EABQRAQAAAAAAAAAAAAAAAAAAAAD/2gAIAQIBAT8Bf//EABQQAQAAAAAAAAAAAAAAAAAAAAD/2gAIAQEABj8Cf//EABQQAQAAAAAAAAAAAAAAAAAAAAD/2gAIAQEAAT8hf//aAAwDAQACAAMAAAAQf//EABQRAQAAAAAAAAAAAAAAAAAAAAD/2gAIAQMBAT8Qf//EABQRAQAAAAAAAAAAAAAAAAAAAAD/2gAIAQIBAT8Qf//EABQQAQAAAAAAAAAAAAAAAAAAAAD/2gAIAQEAAT8Qf//Z").unwrap();
+        assert!(validate_jpeg(&image).is_ok());
+        let sof = image
+            .windows(2)
+            .position(|bytes| bytes == [0xff, 0xc2])
+            .unwrap();
+        image[sof + 5..sof + 9].copy_from_slice(&[0x10, 0x00, 0x10, 0x00]);
+        assert!(validate_jpeg(&image).is_err());
     }
 
     #[test]
