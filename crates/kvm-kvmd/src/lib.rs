@@ -1040,16 +1040,16 @@ impl Kvmd {
 
     /// Submits a press or release on a task that holds the input lock until the outcome is recorded and delivered, not until it is collected. A release of an input whose owed release cleanup confirmed since the previous key or button request is not sent again.
     async fn held_input(&self, kind: Held, name: &str, pressed: bool) -> Result<()> {
-        // Captured before the lock so a call outside a runtime panics before it can lock or owe anything.
-        self.capture_input_runtime();
-        let worker = self.input_worker();
-        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
-        let name = name.to_owned();
         let mut inputs = TaskLock {
             inputs: self.inputs.clone().lock_owned().await,
             owed: self.owed.clone(),
             owes: None,
         };
+        // Captured only once the lock is held, so a waiter cancelled on a short-lived runtime cannot replace the runtime cleanup is scheduled on. A guard dropped before the task submits its request owes nothing.
+        self.capture_input_runtime();
+        let worker = self.input_worker();
+        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+        let name = name.to_owned();
         let collect = Collect {
             device: self,
             outcome: Some(result_rx),
@@ -1212,9 +1212,9 @@ impl Device for Kvmd {
     }
 
     async fn mouse_move(&self, x: i16, y: i16) -> Result<()> {
+        let inputs = self.inputs.clone().lock_owned().await;
         self.capture_input_runtime();
         let worker = self.input_worker();
-        let inputs = self.inputs.clone().lock_owned().await;
         tokio::spawn(async move {
             let mut inputs = inputs;
             worker.settle_owed(&mut inputs).await;
@@ -1410,9 +1410,9 @@ impl Device for Kvmd {
     }
 
     async fn release_inputs(&self) -> Result<()> {
+        let mut inputs = self.inputs.clone().lock_owned().await;
         self.capture_input_runtime();
         let worker = self.input_worker();
-        let mut inputs = self.inputs.clone().lock_owned().await;
         tokio::spawn(async move { worker.release_all(&mut inputs).await })
             .await
             .map_err(|_| Error::AmbiguousInput("release task failed".into()))?
