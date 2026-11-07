@@ -107,9 +107,9 @@ impl fmt::Debug for Credentials {
 /// How credentials reach the device.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum AuthScheme {
-    /// A login exchanges the credentials once for a session, which the device may hold for approval and which may need a one-time code. In `kvm-kvmd` this is KVMD's cookie login.
+    /// A login exchanges the credentials once for a session, which the device may hold for approval and which may need a one-time code.
     Session,
-    /// The credentials are sent with every request in the device's own authentication headers (KVMD's `X-KVMD-User` and `X-KVMD-Passwd`). A one-time code cannot be used, since each request would reuse it.
+    /// The credentials are sent with every request in authentication headers the device defines. A one-time code cannot be used, since each request would reuse it.
     Header,
     /// The credentials are sent with every request as HTTP Basic authentication. A one-time code cannot be used.
     Basic,
@@ -125,17 +125,19 @@ pub enum ServerTrust {
 }
 
 /// Where and how to connect to one device. It carries no secret, so it can be stored and exchanged as configuration.
+///
+/// Its serialised form carries no version field, and like the rest of the API it has no stability guarantee across releases (see the README's API stability note): a stored endpoint is read back reliably only by the release that wrote it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Endpoint {
-    /// A caller-chosen stable name for this endpoint. It is the endpoint part of [`crate::DeviceId`] when present, so a device keeps its identifier when its address changes; without it the address is used.
+    /// A caller-chosen stable name for this endpoint. It names the endpoint in [`crate::DeviceId`] when present, so a device keeps its identifier when its address changes; without it the address does.
     pub label: Option<String>,
-    /// The device's address. Its meaning is the implementation's: for `kvm-kvmd`, the HTTPS origin or reverse-proxy prefix the adapter appends `api/` to.
+    /// The device's address. Its meaning, and which schemes it accepts, are the implementation's.
     pub address: Url,
     /// The device profile, chosen by the caller. Implementations never infer it from what the device reports.
     pub profile: DeviceProfile,
     pub auth: AuthScheme,
     pub trust: ServerTrust,
-    /// The implementation's request deadline. For `kvm-kvmd`, the connection (TCP and TLS) must be established within it and the whole request, response included, ends within twice it, measured from when it is sent; live video has no overall deadline.
+    /// The implementation's request deadline. How it bounds connecting, a whole request and long-lived streams is the implementation's to document. It serialises as an object of whole seconds and nanoseconds (`{"secs": 5, "nanos": 0}`).
     pub timeout: Duration,
 }
 
@@ -195,7 +197,44 @@ pub enum Connected {
     },
 }
 
+impl fmt::Debug for Connected {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let connection = self.connection();
+        let mut debug = match self {
+            Self::Authenticated(_) => formatter.debug_struct("Authenticated"),
+            Self::ApprovalPending { .. } => formatter.debug_struct("ApprovalPending"),
+        };
+        debug
+            .field("endpoint", connection.endpoint())
+            .field("caller", &connection.caller());
+        if let Self::ApprovalPending { expires_in, .. } = self {
+            debug.field("expires_in", expires_in);
+        }
+        debug.finish()
+    }
+}
+
 impl Connected {
+    /// Logs `connection` in with `credentials`. Under a per-request scheme the credentials are then confirmed with [`Authenticate::check_auth`], so a returned connection's credentials have always been accepted or are pending approval.
+    ///
+    /// A caller that should validate the endpoint before collecting credentials, such as one that prompts for a one-time code, calls [`Connector::open`] first and this afterwards.
+    pub async fn authenticate(
+        connection: Arc<dyn Connection>,
+        credentials: Credentials,
+    ) -> Result<Self> {
+        match connection.login(credentials).await? {
+            LoginState::Authenticated => Ok(Self::Authenticated(connection)),
+            LoginState::ApprovalPending { expires_in } => Ok(Self::ApprovalPending {
+                connection,
+                expires_in,
+            }),
+            LoginState::Unverified => {
+                connection.check_auth().await?;
+                Ok(Self::Authenticated(connection))
+            }
+        }
+    }
+
     /// The connection, whatever its state.
     pub fn connection(&self) -> &Arc<dyn Connection> {
         match self {
@@ -209,22 +248,11 @@ impl Connected {
 /// Opens connections to devices of one implementation.
 #[async_trait]
 pub trait Connector: Send + Sync {
-    /// Opens an unauthenticated connection to `endpoint`. An implementation documents whether this contacts the device; `kvm-kvmd` validates the endpoint and builds its client without doing so.
+    /// Opens an unauthenticated connection to `endpoint`. An implementation documents whether this contacts the device and which endpoints it rejects.
     async fn open(&self, endpoint: Endpoint) -> Result<Arc<dyn Connection>>;
 
-    /// Opens a connection and logs in with `credentials`. Under a per-request scheme the credentials are then confirmed with [`Authenticate::check_auth`], so a returned connection's credentials have always been accepted or are pending approval.
+    /// Opens a connection and logs in with `credentials`, as [`Connected::authenticate`] does.
     async fn connect(&self, endpoint: Endpoint, credentials: Credentials) -> Result<Connected> {
-        let connection = self.open(endpoint).await?;
-        match connection.login(credentials).await? {
-            LoginState::Authenticated => Ok(Connected::Authenticated(connection)),
-            LoginState::ApprovalPending { expires_in } => Ok(Connected::ApprovalPending {
-                connection,
-                expires_in,
-            }),
-            LoginState::Unverified => {
-                connection.check_auth().await?;
-                Ok(Connected::Authenticated(connection))
-            }
-        }
+        Connected::authenticate(self.open(endpoint).await?, credentials).await
     }
 }

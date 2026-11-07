@@ -76,3 +76,39 @@ fn unreadable_ca_file_names_the_variable_and_path() {
         "{stderr}"
     );
 }
+
+/// Runs the server with only `envs` set, expecting it to fail at startup, and returns its standard error. `KVM_PASSWORD_FD` names a descriptor the child does not hold, so a server that read it would fail on that instead.
+fn startup_error(envs: &[(&str, &str)]) -> String {
+    let output = Command::new(env!("CARGO_BIN_EXE_kvm-mcp"))
+        .env_clear()
+        .env("KVM_PROFILE", "pikvm")
+        .env("KVM_USERNAME", "synthetic")
+        .env("KVM_PASSWORD_FD", "99")
+        .envs(envs.iter().copied())
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    String::from_utf8_lossy(&output.stderr).into_owned()
+}
+
+/// A CA file is refused while verification is disabled, where it would be ignored unread, before the file or the password is read.
+#[test]
+fn a_ca_file_is_refused_with_insecure_tls() {
+    let stderr = startup_error(&[
+        ("KVM_ENDPOINT", "https://localhost:1"),
+        ("KVM_CA_FILE", "/nonexistent/ca.pem"),
+        ("KVM_INSECURE_TLS", "1"),
+    ]);
+    assert_eq!(
+        stderr,
+        "Error: KVM_CA_FILE cannot be used with KVM_INSECURE_TLS=1\n"
+    );
+}
+
+/// An endpoint the adapter rejects is reported before the password descriptor is read.
+#[test]
+fn an_invalid_endpoint_is_reported_before_the_password_is_read() {
+    let stderr = startup_error(&[("KVM_ENDPOINT", "http://localhost:1")]);
+    assert!(stderr.contains("endpoint must be an HTTPS URL"), "{stderr}");
+}

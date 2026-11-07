@@ -133,11 +133,15 @@ async fn run() -> Result<(), Box<dyn Error>> {
         _ => return Err("KVM_PROFILE must be pikvm or glkvm".into()),
     };
     let insecure_tls = env::var("KVM_INSECURE_TLS").as_deref() == Ok("1");
+    let ca_file = env::var("KVM_CA_FILE").ok();
+    if insecure_tls && ca_file.is_some() {
+        // With verification disabled the CA would be ignored unread, hiding a wrong or unreadable file.
+        return Err("KVM_CA_FILE cannot be used with KVM_INSECURE_TLS=1".into());
+    }
     if insecure_tls {
         eprintln!("Warning: TLS certificate verification is disabled");
     }
-    let ca = env::var("KVM_CA_FILE")
-        .ok()
+    let ca = ca_file
         .map(|path| {
             fs::read_to_string(&path)
                 .map_err(|error| format!("cannot read KVM_CA_FILE {path}: {error}"))
@@ -157,6 +161,8 @@ async fn run() -> Result<(), Box<dyn Error>> {
         },
         timeout: Duration::from_secs(30),
     };
+    // Opening validates the endpoint and the CA without contacting the device, so a mistake there is reported before any secret is read.
+    let connection = KvmdConnector.open(endpoint).await?;
     let password = read_password(&password_fd)?;
     let totp = env::var("KVM_TOTP_FD")
         .ok()
@@ -166,7 +172,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
     if let Some(code) = totp {
         credentials = credentials.with_totp(code);
     }
-    let connection = match KvmdConnector.connect(endpoint, credentials).await? {
+    let connection = match Connected::authenticate(connection, credentials).await? {
         Connected::Authenticated(connection) => connection,
         Connected::ApprovalPending {
             connection,
