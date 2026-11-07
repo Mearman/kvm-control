@@ -19,3 +19,6 @@ zeroize = "1.9.1"
 async-trait.workspace = true
 rcgen = "0.14.10"
 rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
+
+[target.'cfg(unix)'.dev-dependencies]
+libc = "0.2.191"
