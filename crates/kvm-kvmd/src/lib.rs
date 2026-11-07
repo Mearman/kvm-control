@@ -912,20 +912,19 @@ impl Device for Kvmd {
 
 impl Drop for Kvmd {
     fn drop(&mut self) {
-        if self.cleanup_on_drop {
-            if let Some(runtime) = self
+        if self.cleanup_on_drop
+            && let Some(runtime) = self
                 .input_runtime
                 .lock()
                 .expect("input runtime lock poisoned")
                 .clone()
-            {
-                let worker = self.input_worker();
-                runtime.spawn(async move {
-                    if let Err(error) = worker.release_inputs().await {
-                        eprintln!("Input cleanup uncertain: {error}");
-                    }
-                });
-            }
+        {
+            let worker = self.input_worker();
+            runtime.spawn(async move {
+                if let Err(error) = worker.release_inputs().await {
+                    eprintln!("Input cleanup uncertain: {error}");
+                }
+            });
         }
     }
 }
@@ -973,11 +972,11 @@ mod tests {
         let endpoint = Url::parse(&format!("http://{address}/")).unwrap();
         let client = reqwest::Client::new();
         let device = Kvmd {
-            client: RwLock::new(Session {
+            client: Arc::new(RwLock::new(Session {
                 client: client.clone(),
                 video: client,
                 cookies: Default::default(),
-            }),
+            })),
             config: Config {
                 endpoint: endpoint.clone(),
                 profile: DeviceProfile::PiKvm,
@@ -992,6 +991,8 @@ mod tests {
             approval_token: Default::default(),
             snapshot_proven: Default::default(),
             video_proven: Default::default(),
+            cleanup_on_drop: false,
+            input_runtime: Default::default(),
         };
         assert!(matches!(
             device.snapshot().await,
