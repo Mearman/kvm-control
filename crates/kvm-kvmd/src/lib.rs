@@ -984,7 +984,7 @@ impl Kvmd {
 
     /// Releases every tracked input, the caller holding the input lock, and returns the inputs whose release the device confirmed; a failed release is tracked as uncertain and never resent. Any pending cleanup is taken first, so a drop that marks cleanup pending while this runs stays pending for the next lock holder, and a release interrupted before it finishes (runtime shutdown) leaves the flag set.
     async fn release_owed(&self, inputs: &mut Inputs) -> (Result<()>, Vec<(Held, String)>) {
-        let owed = self.cleanup_pending.swap(false, Ordering::SeqCst);
+        let owed = self.cleanup_pending.load(Ordering::SeqCst);
         let restore = RestorePending {
             flag: &self.cleanup_pending,
             owed,
@@ -1001,6 +1001,7 @@ impl Kvmd {
             }
         }
         restore.complete();
+        self.cleanup_pending.store(false, Ordering::SeqCst);
         let result = if failed || inputs.indeterminate {
             Err(Error::AmbiguousInput(
                 "input session remains indeterminate after an ambiguous operation".into(),
