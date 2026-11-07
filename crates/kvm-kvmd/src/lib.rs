@@ -2,7 +2,7 @@
 //!
 //! PiKVM's [stream client](https://github.com/pikvm/kvmd/blob/fcb903eb3be70d8eee4aee99e5fcc1c743e3ccef/web/share/js/kvm/stream_mjpeg.js) and [WebSocket handler](https://github.com/pikvm/kvmd/blob/fcb903eb3be70d8eee4aee99e5fcc1c743e3ccef/kvmd/apps/kvmd/server.py), and GLKVM's [stream client](https://github.com/gl-inet/glkvm/blob/3e8dd23c4bd638a4650433664cc3b0f3b4d29395/web/share/js/kvm/stream_mjpeg.js) and [WebSocket handler](https://github.com/gl-inet/glkvm/blob/3e8dd23c4bd638a4650433664cc3b0f3b4d29395/kvmd/apps/kvmd/server.py), use these routes. [uStreamer](https://github.com/pikvm/ustreamer/blob/11fd828ab00c01a39bd0843ef442ef0b6d3cac41/src/ustreamer/http/server.c) emits multipart JPEG with or without Content-Length.
 //!
-//! These sources do not establish compatibility with every firmware version. Only synthetic server tests have been run; no physical device has been verified. The video API supports MJPEG only and does not change encoder settings. JPEG images are decoded under resource limits before delivery. Video capabilities remain unknown until this connection receives a valid JPEG snapshot or live frame. A successful operation records support for that connection; failures do not prove a capability unsupported.
+//! These sources do not establish compatibility with every firmware version. Only synthetic server tests have been run; no physical device has been verified. The video API supports MJPEG only and does not change encoder settings. JPEG pixel data is decoded under resource limits before delivery; original metadata is preserved but not validated and must be treated as untrusted by consumers. Video capabilities remain unknown until this connection receives a valid JPEG snapshot or live frame. A successful operation records support for that connection; failures do not prove a capability unsupported.
 
 use std::{
     collections::BTreeSet,
@@ -800,7 +800,13 @@ impl Device for Kvmd {
     async fn snapshot(&self) -> Result<Snapshot> {
         // Limit compressed image data before collecting it, including chunked responses.
         const MAX_SNAPSHOT_BYTES: usize = 16 * 1024 * 1024;
-        let permit = jpeg_permit().await?;
+        static STORAGE: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> =
+            std::sync::OnceLock::new();
+        let storage = STORAGE
+            .get_or_init(|| Arc::new(tokio::sync::Semaphore::new(MAX_JPEG_VALIDATIONS)))
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| Error::Transport("snapshot capacity exhausted".into()))?;
         let mut response = self.get("streamer/snapshot").await?;
         if response
             .content_length()
@@ -823,7 +829,14 @@ impl Device for Kvmd {
             }
             bytes.extend_from_slice(&chunk);
         }
-        let jpeg = validate_jpeg_async(bytes, permit).await?;
+        let permit = jpeg_permit().await?;
+        let task = tokio::spawn(async move {
+            let _storage = storage;
+            validate_jpeg_async(bytes, permit).await
+        });
+        let jpeg = task
+            .await
+            .map_err(|_| Error::Transport("JPEG validation task failed".into()))??;
         self.snapshot_proven.store(true, Ordering::Release);
         Ok(Snapshot { jpeg })
     }
