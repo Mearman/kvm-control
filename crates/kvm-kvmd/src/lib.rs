@@ -573,7 +573,7 @@ impl Drop for Collect<'_> {
             return;
         };
         outcome.close();
-        // Not delivered, so the task side handles the outcome. If the task is still settling, it finds its caller gone afterwards and sends nothing, so it owes nothing. If its request was a release that cleanup had already confirmed, it skips the request and its delivery fails carrying success, so nothing is reported or owed. If it has submitted its request, delivery fails under the lock: it reports a failed outcome and, for a press, sends the release it owes. If it was dropped mid-request (runtime shutdown), its lock guard queues that release for a submitted press and owes nothing otherwise.
+        // Not delivered, so the task side handles the outcome. If the task is still settling, it finds its caller gone afterwards and sends nothing, so it owes nothing. If its request was a release that cleanup had already confirmed, it skips the request and its delivery fails carrying success, so nothing is reported or owed. If it has submitted its request, delivery fails under the lock: it reports a failed outcome and, for a press that owes a release, sends it. If it was dropped mid-request (runtime shutdown), its lock guard queues the release a submitted press owes, and nothing otherwise.
         let Ok((result, owed)) = outcome.try_recv() else {
             return;
         };
