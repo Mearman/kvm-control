@@ -1344,6 +1344,19 @@ impl Kvmd {
     }
 }
 
+/// A HID `online` flag. PiKVM's and GLKVM's CH9329 plugins keep their state in integer shared flags and report `online` as `0` or `1`; every other inspected HID plugin reports a boolean. Only those spellings are accepted.
+fn hid_online(value: &serde_json::Value) -> Option<bool> {
+    match value {
+        serde_json::Value::Bool(online) => Some(*online),
+        serde_json::Value::Number(number) => match number.as_u64() {
+            Some(0) => Some(false),
+            Some(1) => Some(true),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 fn hid_capability(state: &serde_json::Value, device: &str) -> Capability {
     match state.get("enabled").and_then(serde_json::Value::as_bool) {
         Some(false) => Capability::Unsupported,
@@ -1351,7 +1364,7 @@ fn hid_capability(state: &serde_json::Value, device: &str) -> Capability {
             if state
                 .get(device)
                 .and_then(|value| value.get("online"))
-                .and_then(serde_json::Value::as_bool)
+                .and_then(hid_online)
                 == Some(true) =>
         {
             Capability::Supported
@@ -2100,6 +2113,25 @@ mod tests {
                     };
                     assert_eq!(hid_capability(&state, device), expected, "{state}");
                 }
+            }
+        }
+    }
+
+    // Breaks if CH9329's integer online flag is not read, which leaves its keyboard and mouse capability unknown however the device reports them.
+    #[test]
+    fn hid_capability_reads_the_ch9329_integer_online_flag() {
+        for (online, expected) in [
+            (serde_json::json!(1), Capability::Supported),
+            (serde_json::json!(0), Capability::Unknown),
+            // Only the spellings a plugin uses are accepted.
+            (serde_json::json!(2), Capability::Unknown),
+            (serde_json::json!(-1), Capability::Unknown),
+            (serde_json::json!(1.0), Capability::Unknown),
+            (serde_json::json!("1"), Capability::Unknown),
+        ] {
+            let state = serde_json::json!({"enabled": true, "keyboard": {"online": online}, "mouse": {"online": online}});
+            for device in ["keyboard", "mouse"] {
+                assert_eq!(hid_capability(&state, device), expected, "{state}");
             }
         }
     }
