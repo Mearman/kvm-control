@@ -151,12 +151,31 @@ async fn jpeg_permit() -> Result<Arc<tokio::sync::OwnedSemaphorePermit>> {
     )?))
 }
 
+#[cfg(test)]
+static VALIDATION_GATE: std::sync::Mutex<
+    Option<(
+        tokio::sync::oneshot::Sender<()>,
+        std::sync::mpsc::Receiver<()>,
+    )>,
+> = std::sync::Mutex::new(None);
+
 async fn validate_jpeg_async(
     bytes: Vec<u8>,
     permit: Arc<tokio::sync::OwnedSemaphorePermit>,
 ) -> Result<Vec<u8>> {
     tokio::task::spawn_blocking(move || {
         let _permit = permit;
+        #[cfg(test)]
+        if bytes
+            .windows(b"validation-test-gate".len())
+            .any(|window| window == b"validation-test-gate")
+        {
+            let gate = VALIDATION_GATE.lock().unwrap().take();
+            if let Some((started, release)) = gate {
+                started.send(()).unwrap();
+                release.recv().unwrap();
+            }
+        }
         validate_jpeg(&bytes)?;
         Ok(bytes)
     })

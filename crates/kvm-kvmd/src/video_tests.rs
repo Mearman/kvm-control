@@ -659,6 +659,204 @@ async fn cancelling_snapshot_read_releases_capacity() {
     server.await.unwrap();
 }
 
+fn gated_jpeg() -> Vec<u8> {
+    let mut frame = jpeg();
+    let payload = b"validation-test-gate";
+    let mut segment = vec![0xff, 0xfe];
+    segment.extend_from_slice(&u16::try_from(payload.len() + 2).unwrap().to_be_bytes());
+    segment.extend_from_slice(payload);
+    frame.splice(2..2, segment);
+    frame
+}
+
+#[tokio::test]
+async fn stream_validation_survives_cancelled_next_frame() {
+    let frame = gated_jpeg();
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    *crate::VALIDATION_GATE.lock().unwrap() = Some((started_tx, release_rx));
+    let (device, closed, server) = device(part(&frame, true, true)).await;
+    let mut video = device.video().await.unwrap();
+    let mut next = Box::pin(video.next_frame());
+    tokio::select! {
+        result = &mut next => panic!("validation finished before cancellation: {result:?}"),
+        result = started_rx => result.unwrap(),
+    }
+    drop(next);
+    release_tx.send(()).unwrap();
+    assert_eq!(video.next_frame().await.unwrap().unwrap().jpeg, frame);
+    assert!(video.next_frame().await.unwrap().is_none());
+    tokio::time::timeout(Duration::from_secs(3), closed.notified())
+        .await
+        .unwrap();
+    server.await.unwrap();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    *crate::VALIDATION_GATE.lock().unwrap() = Some((started_tx, release_rx));
+    let expected = gated_jpeg();
+    let sent = expected.clone();
+    let snapshot_server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut request = [0; 4096];
+        let n = socket.read(&mut request).await.unwrap();
+        assert!(
+            std::str::from_utf8(&request[..n])
+                .unwrap()
+                .starts_with("GET /proxy/streamer/snapshot ")
+        );
+        socket
+            .write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    sent.len()
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        socket.write_all(&sent).await.unwrap();
+    });
+    let client = reqwest::Client::builder().http1_only().build().unwrap();
+    let endpoint = Url::parse(&format!("http://{address}/proxy/")).unwrap();
+    let device = Kvmd {
+        client: tokio::sync::RwLock::new(crate::Session {
+            client: client.clone(),
+            video: client,
+            cookies: Default::default(),
+        }),
+        config: Config {
+            endpoint: endpoint.clone(),
+            profile: DeviceProfile::PiKvm,
+            trusted_ca_pem: None,
+            insecure_tls: false,
+            timeout: Duration::from_secs(3),
+        },
+        endpoint,
+        profile: DeviceProfile::PiKvm,
+        inputs: Default::default(),
+        auth_headers: Default::default(),
+        approval_token: Default::default(),
+    };
+    let mut snapshot = Box::pin(device.snapshot());
+    tokio::select! {
+        result = &mut snapshot => panic!("snapshot validation finished before cancellation: {result:?}"),
+        result = started_rx => result.unwrap(),
+    }
+    drop(snapshot);
+    release_tx.send(()).unwrap();
+    snapshot_server.await.unwrap();
+}
+
+#[tokio::test]
+async fn concurrent_snapshots_exhaust_and_recover_storage() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (arrived_tx, mut arrived_rx) = tokio::sync::mpsc::unbounded_channel();
+    let server = tokio::spawn(async move {
+        let mut sockets = Vec::new();
+        for _ in 0..crate::MAX_JPEG_VALIDATIONS {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0; 4096];
+            let n = socket.read(&mut request).await.unwrap();
+            assert!(
+                std::str::from_utf8(&request[..n])
+                    .unwrap()
+                    .starts_with("GET /proxy/streamer/snapshot ")
+            );
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 999\r\n\r\n")
+                .await
+                .unwrap();
+            sockets.push(socket);
+            arrived_tx.send(()).unwrap();
+        }
+        for mut socket in sockets {
+            let mut byte = [0; 1];
+            assert_eq!(socket.read(&mut byte).await.unwrap(), 0);
+        }
+    });
+    let client = reqwest::Client::builder().http1_only().build().unwrap();
+    let endpoint = Url::parse(&format!("http://{address}/proxy/")).unwrap();
+    let device = Arc::new(Kvmd {
+        client: tokio::sync::RwLock::new(crate::Session {
+            client: client.clone(),
+            video: client,
+            cookies: Default::default(),
+        }),
+        config: Config {
+            endpoint: endpoint.clone(),
+            profile: DeviceProfile::PiKvm,
+            trusted_ca_pem: None,
+            insecure_tls: false,
+            timeout: Duration::from_secs(3),
+        },
+        endpoint,
+        profile: DeviceProfile::PiKvm,
+        inputs: Default::default(),
+        auth_headers: Default::default(),
+        approval_token: Default::default(),
+    });
+    let mut tasks = Vec::new();
+    for _ in 0..crate::MAX_JPEG_VALIDATIONS {
+        let device = device.clone();
+        tasks.push(tokio::spawn(async move { device.snapshot().await }));
+        tokio::time::timeout(Duration::from_secs(3), arrived_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+    }
+    assert!(
+        matches!(device.snapshot().await, Err(kvm_core::Error::Transport(message)) if message == "snapshot capacity exhausted")
+    );
+    for task in tasks {
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+    }
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn concurrent_streams_exhaust_and_recover_storage() {
+    let mut streams = Vec::new();
+    let mut servers = Vec::new();
+    for _ in 0..crate::MAX_JPEG_VALIDATIONS {
+        let mut body = part(&jpeg(), true, false);
+        body.extend_from_slice(b"--frame\r\n");
+        let (device, closed, server) = device(body).await;
+        let mut stream = device.video().await.unwrap();
+        assert_eq!(stream.next_frame().await.unwrap().unwrap().jpeg, jpeg());
+        streams.push(stream);
+        servers.push((closed, server));
+    }
+    let mut body = part(&jpeg(), true, false);
+    body.extend_from_slice(b"--frame\r\n");
+    let (extra, closed, server) = device(body).await;
+    assert!(
+        matches!(extra.video().await, Err(kvm_core::Error::Transport(message)) if message == "video stream capacity exhausted")
+    );
+    drop(streams.pop());
+    let mut replacement = extra.video().await.unwrap();
+    assert_eq!(
+        replacement.next_frame().await.unwrap().unwrap().jpeg,
+        jpeg()
+    );
+    drop(replacement);
+    drop(streams);
+    for (closed, server) in servers {
+        tokio::time::timeout(Duration::from_secs(3), closed.notified())
+            .await
+            .unwrap();
+        server.await.unwrap();
+    }
+    tokio::time::timeout(Duration::from_secs(3), closed.notified())
+        .await
+        .unwrap();
+    server.await.unwrap();
+}
+
 #[tokio::test]
 async fn trusted_tls_login_cookie_reaches_lease_and_stream() {
     use tokio_rustls::TlsAcceptor;
