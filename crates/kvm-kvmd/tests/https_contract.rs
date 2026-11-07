@@ -1634,7 +1634,7 @@ fn owner_dropped_on_a_runtime_without_drivers_releases_on_the_last_runtime() {
         .unwrap();
     bare_runtime.block_on(async move {
         drop(device);
-        // A current-thread runtime runs every task already queued before it polls a yielded block_on future again, so a release started here would run and fail now.
+        // Depends on the current-thread scheduler, which the builder above pins: its block_on (tokio 1.54.1, runtime/scheduler/current_thread/mod.rs, `block_on`) runs every task already queued before it polls a yielded future again, so a release started here runs and fails during this yield. The assertion holds on any scheduler; only whether the test catches a release started here depends on this.
         tokio::task::yield_now().await;
     });
     drop(bare_runtime);
