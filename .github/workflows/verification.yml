@@ -37,4 +37,4 @@ jobs:
       - name: Test workspace
         run: cargo test --workspace --locked
       - name: Test independent consumer
-        run: cargo test --manifest-path examples/in-process/Cargo.toml
+        run: cargo test --locked --manifest-path examples/in-process/Cargo.toml
