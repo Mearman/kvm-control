@@ -591,7 +591,7 @@ async fn respond(stream: &mut tokio::net::TcpStream, status: &str, body: &[u8]) 
 
 #[tokio::test]
 async fn movement_abandoned_during_its_state_read_is_not_sent_and_its_read_failure_not_reported() {
-    // An answer that allows the movement, one that rejects the mouse mode, and a failed read: once the caller has gone during the read, none sends a movement or reports anything. Not covered: a caller leaving after the last abandonment check but before the outcome is delivered, where only the check that the movement was submitted keeps a read failure unreported; that needs a drop from another thread at an exact moment, which no signal here can order.
+    // An answer that allows the movement, one that rejects the mouse mode, and a failed read: once the caller has gone during the read, none sends a movement or reports anything. Not covered: a caller leaving after the last abandonment check but before the outcome is delivered, where the task's delivery fails and only its check that the movement was submitted keeps a read failure unreported; that needs a drop from another thread at an exact moment, which no signal here can order. A caller leaving after delivery is covered by `delivered_read_failure_of_an_abandoned_movement_is_not_reported`.
     for (status, body) in [
         (
             "200 OK",
@@ -755,6 +755,40 @@ impl std::task::Wake for Woken {
     fn wake(self: Arc<Self>) {
         self.0.notify_one();
     }
+}
+
+#[tokio::test]
+async fn delivered_read_failure_of_an_abandoned_movement_is_not_reported() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut device = input_device(listener.local_addr().unwrap());
+    let reports = capture_reports(&mut device);
+    let server = tokio::spawn(async move {
+        let (mut state, _) = listener.accept().await.unwrap();
+        assert!(read_request(&mut state).await.contains("/api/hid "));
+        respond(&mut state, "403 Forbidden", b"{\"ok\":false}").await;
+        listener
+    });
+    let woken = Arc::new(Woken(Notify::new()));
+    let waker = std::task::Waker::from(woken.clone());
+    let mut movement = Box::pin(device.mouse_move(1, 2));
+    assert!(
+        movement
+            .as_mut()
+            .poll(&mut std::task::Context::from_waker(&waker))
+            .is_pending()
+    );
+    // The failed read is delivered, waking the caller, which drops the future without reading it; no movement was submitted, so nothing is reported.
+    tokio::time::timeout(INPUT_TIMEOUT, woken.0.notified())
+        .await
+        .unwrap();
+    drop(movement);
+    let listener = tokio::time::timeout(INPUT_TIMEOUT, server)
+        .await
+        .unwrap()
+        .unwrap();
+    input_tasks_finished(&device.inputs).await;
+    assert_eq!(*reports.lock().unwrap(), Vec::<String>::new());
+    assert_no_waiting_connection(listener, "a movement was sent after its state read failed");
 }
 
 #[tokio::test]
