@@ -1,8 +1,16 @@
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
+mod connection;
+mod identity;
 mod status;
 mod terminal;
+
+pub use connection::{
+    AuthScheme, Authenticate, CallerIdentity, Connected, Connection, Connector, Credentials,
+    Endpoint, LoginState, Secret, ServerTrust,
+};
+pub use identity::{DeviceId, DeviceIdentity};
 
 pub use status::{
     AtxStatus, DeviceStatus, GpioInput, GpioOutput, GpioStatus, HidOutputs, HidStatus,
@@ -21,12 +29,12 @@ pub use terminal::{escape_json_for_terminal, is_terminal_unsafe};
 pub enum Error {
     /// The device refused the credentials or the session: an HTTP 401 or 403 response, or a login, approval or authentication check whose response did not report success.
     ///
-    /// Authenticate again before retrying (in `kvm-kvmd`, `login`, or `login_with_totp` with a fresh code, followed by `complete_approval` while approval is pending). A refused login does not say whether a TOTP code is required. `kvm-kvmd`'s `login` discards the previous session before sending its request, once its local checks and the held-input check pass, so a login that then fails with any variant leaves the adapter unauthenticated. A session the device has expired or revoked also ends here. A refusal of an input or control request that was already submitted is reported as `AmbiguousInput` or `AmbiguousControl` instead, since the adapter cannot tell whether the device acted first.
+    /// Authenticate again before retrying ([`Authenticate::login`], with a fresh one-time code where one is required, followed by [`Authenticate::complete_approval`] while approval is pending). A refused login does not say whether a TOTP code is required. `kvm-kvmd`'s `login` discards the previous session before sending its request, once its local checks and the held-input check pass, so a login that then fails with any variant leaves the adapter unauthenticated. A session the device has expired or revoked also ends here. A refusal of an input or control request that was already submitted is reported as `AmbiguousInput` or `AmbiguousControl` instead, since the adapter cannot tell whether the device acted first.
     #[error("authentication failed or requires a challenge")]
     Authentication,
     /// The operation is not available on this connection, and the requested input or control was not submitted.
     ///
-    /// `kvm-kvmd` returns it for a control operation whose capability discovery did not report support (an `Unknown` capability included), a switch port absent from the device's port inventory or an inventory that could not be confirmed, absolute mouse movement without an online absolute-mode mouse, device approval on a profile without an approval flow, and live video when the stream route answers successfully with a content type other than `multipart/x-mixed-replace`, such as an HTML page a proxy serves with a 2xx status, while an unsuccessful status is reported as `Http` or `Authentication` instead (see `docs/video-transports.md` for the transports that are not implemented). It does not prove that the device lacks the feature, because unconfirmed support is reported the same way. Do not retry unchanged: read `Device::capabilities`, and check the selected profile and the device configuration.
+    /// `kvm-kvmd` returns it for a control operation whose capability discovery did not report support (an `Unknown` capability included), a switch port absent from the device's port inventory or an inventory that could not be confirmed, absolute mouse movement without an online absolute-mode mouse, device approval on a profile or authentication scheme without an approval flow, and live video when the stream route answers successfully with a content type other than `multipart/x-mixed-replace`, such as an HTML page a proxy serves with a 2xx status, while an unsuccessful status is reported as `Http` or `Authentication` instead (see `docs/video-transports.md` for the transports that are not implemented). It does not prove that the device lacks the feature, because unconfirmed support is reported the same way. Do not retry unchanged: read `Device::capabilities`, and check the selected profile and the device configuration.
     #[error("operation is unsupported: {0}")]
     Unsupported(String),
     /// A request failed in transport before the requested input or control was submitted, or a read-only transfer stopped.
@@ -41,7 +49,7 @@ pub enum Error {
     Http(u16),
     /// A device response was not one the adapter accepts, or the caller's own configuration or arguments were rejected.
     ///
-    /// From the device, `kvm-kvmd` returns it for malformed or oversized JSON, a read that did not report success or lacked its result, a login or approval response missing a field the flow needs, an invalid or oversized JPEG, a malformed or oversized multipart stream, and a stream lease that was not upgraded to a WebSocket. Such a response points at firmware or a proxy the adapter does not support; retrying unchanged is unlikely to help. Locally it returns it, before contacting the device, for an endpoint that is not HTTPS or that contains credentials, a query or a fragment, an invalid CA certificate, credentials that cannot be sent as headers, Basic credentials containing a colon, a TOTP code that is not six ASCII digits, a GLKVM password and code longer than 63 bytes together, cookie login on an adapter built with header or Basic credentials, and `complete_approval` with no approval pending (checked after any owed input releases have been sent). Correct the configuration or call before trying again. A login answered with a two-step approval request under the PiKVM profile is also reported as this variant, but only after the credentials reached the device, which may have started an approval; select the GLKVM profile for a device that asks for approval.
+    /// From the device, `kvm-kvmd` returns it for malformed or oversized JSON, a read that did not report success or lacked its result, a login or approval response missing a field the flow needs, an invalid or oversized JPEG, a malformed or oversized multipart stream, and a stream lease that was not upgraded to a WebSocket. Such a response points at firmware or a proxy the adapter does not support; retrying unchanged is unlikely to help. Locally it returns it, before contacting the device, for an endpoint that is not HTTPS or that contains credentials, a query or a fragment, an invalid CA certificate, credentials that cannot be sent as headers, Basic credentials containing a colon, a TOTP code that is not six ASCII digits, a GLKVM password and code longer than 63 bytes together, a one-time code under the `Header` or `Basic` authentication scheme, and `complete_approval` with no approval pending (checked after any owed input releases have been sent). Correct the configuration or call before trying again. A login answered with a two-step approval request under the PiKVM profile is also reported as this variant, but only after the credentials reached the device, which may have started an approval; select the GLKVM profile for a device that asks for approval.
     #[error("invalid device response: {0}")]
     InvalidResponse(String),
     /// A keyboard, mouse-button or mouse-movement request was, or may have been, submitted and its outcome was not confirmed; never replay it automatically.
@@ -58,7 +66,8 @@ pub enum Error {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+/// The device family whose API an implementation speaks, chosen explicitly by the caller.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub enum DeviceProfile {
     PiKvm,
     GlKvm,

@@ -813,6 +813,8 @@ dependencies = [
  "async-trait",
  "serde",
  "thiserror",
+ "url",
+ "zeroize",
 ]
 
 [[package]]
@@ -1791,6 +1793,7 @@ dependencies = [
  "idna",
  "percent-encoding",
  "serde",
+ "serde_derive",
 ]
 
 [[package]]
