@@ -17,6 +17,7 @@ use std::{
 
 #[cfg(test)]
 mod proptests;
+mod status;
 mod video;
 #[cfg(test)]
 mod video_tests;
@@ -1329,11 +1330,7 @@ impl Device for Kvmd {
     }
 
     async fn status(&self) -> Result<DeviceStatus> {
-        Ok(DeviceStatus {
-            info: self.json("info").await?,
-            hid: self.json("hid").await?,
-            streamer: self.json("streamer").await?,
-        })
+        self.read_status().await
     }
 
     async fn capabilities(&self) -> Result<Capabilities> {

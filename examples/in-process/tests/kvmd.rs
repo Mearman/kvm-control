@@ -50,6 +50,8 @@ async fn state(State(calls): State<Calls>, uri: Uri) -> impl IntoResponse {
     calls.lock().unwrap().push(uri.path().into());
     let result = if uri.path().ends_with("/hid") {
         json!({"enabled": true, "online": true, "keyboard": {"online": true}, "mouse": {"online": true, "absolute": true}})
+    } else if uri.path().ends_with("/info") {
+        json!({"system": {"kvmd": {"version": "0.0.0-synthetic"}}})
     } else {
         json!({"online": true})
     };
@@ -133,7 +135,14 @@ async fn downstream_uses_real_adapter_against_synthetic_https_device() {
         kvm_kvmd::LoginState::Authenticated
     ));
     let device: &dyn Device = &adapter;
-    assert_eq!(device.status().await.unwrap().info["online"], true);
+    let status = device.status().await.unwrap();
+    assert_eq!(
+        status.info.value().unwrap().kvmd_version,
+        kvm_core::Reported::Supported("0.0.0-synthetic".into())
+    );
+    // The synthetic device has no ATX, switch, GPIO or media routes.
+    assert_eq!(status.atx, kvm_core::Reported::Unsupported);
+    assert_eq!(status.media, kvm_core::Reported::Unsupported);
     assert_eq!(device.snapshot().await.unwrap().jpeg, JPEG);
     device.key("KeyA", true).await.unwrap();
     device.release_inputs().await.unwrap();

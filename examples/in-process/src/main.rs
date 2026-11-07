@@ -5,9 +5,8 @@
 use async_trait::async_trait;
 use kvm_core::{
     Capabilities, Capability, Confirmation, Control, ControlOutcome, Device, DeviceStatus, Error,
-    MouseMode, Result, Snapshot, VideoStream,
+    MouseMode, Reported, Result, Snapshot, SwitchPort, SwitchStatus, VideoStream,
 };
-use serde_json::json;
 use std::sync::Mutex;
 
 #[derive(Default)]
@@ -37,10 +36,25 @@ impl Device for FakeDevice {
         Ok(Box::new(FakeVideo(true)))
     }
     async fn status(&self) -> Result<DeviceStatus> {
+        let port = |port| SwitchPort {
+            port,
+            unit: Reported::Supported(0),
+            channel: Reported::Supported(port),
+            id: Reported::Supported((port + 1).to_string()),
+            name: Reported::Unknown,
+        };
         Ok(DeviceStatus {
-            info: json!({"device": "synthetic"}),
-            hid: json!({}),
-            streamer: json!({}),
+            info: Reported::Unknown,
+            hid: Reported::Unknown,
+            streamer: Reported::Unknown,
+            atx: Reported::Unsupported,
+            switch: Reported::Supported(SwitchStatus {
+                ports: Reported::Supported(vec![port(0), port(1)]),
+                active_port: Reported::Supported(Some(0)),
+                synced: Reported::Supported(true),
+            }),
+            gpio: Reported::Unsupported,
+            media: Reported::Unsupported,
         })
     }
     async fn capabilities(&self) -> Result<Capabilities> {
@@ -93,9 +107,23 @@ impl Device for FakeDevice {
 // A consumer depends on the public contract, not on a particular device implementation.
 async fn consume(device: &dyn Device) -> Result<ControlOutcome> {
     let capabilities = device.capabilities().await?;
-    if capabilities.status == Capability::Supported {
-        println!("Status: {}", device.status().await?.info);
+    if capabilities.status != Capability::Supported {
+        return Err(Error::Unsupported("status".into()));
     }
+    // Status reports which switch ports exist, so the consumer picks one the device has rather than guessing.
+    let status = device.status().await?;
+    let switch = status
+        .switch
+        .value()
+        .ok_or_else(|| Error::Unsupported("switch status".into()))?;
+    let active = switch.active_port.value().copied().flatten();
+    let target = switch
+        .ports
+        .value()
+        .and_then(|ports| ports.iter().find(|port| Some(port.port) != active))
+        .ok_or_else(|| Error::Unsupported("no other switch port".into()))?
+        .port;
+    println!("Switch ports: {:?}, active {active:?}", switch.ports);
     if capabilities.snapshot == Capability::Supported {
         println!("Snapshot: {} bytes", device.snapshot().await?.jpeg.len());
     }
@@ -113,7 +141,7 @@ async fn consume(device: &dyn Device) -> Result<ControlOutcome> {
         release?;
     }
     device
-        .control(Control::Switch { port: 1 }, Confirmation::new())
+        .control(Control::Switch { port: target }, Confirmation::new())
         .await
 }
 

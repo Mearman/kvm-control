@@ -1,6 +1,15 @@
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
+mod status;
+
+pub use status::{
+    AtxStatus, DeviceStatus, GpioInput, GpioOutput, GpioStatus, HidOutputs, HidStatus,
+    JigglerStatus, KernelInfo, KeyboardLeds, KeyboardStatus, Limits, MediaDrive, MediaImage,
+    MediaStatus, MouseStatus, PlatformInfo, Reported, Resolution, StoragePartition,
+    StreamerFeatures, StreamerStatus, SwitchPort, SwitchStatus, SystemInfo, VideoSource,
+};
+
 /// Failure of a [`Device`] or [`VideoStream`] operation.
 ///
 /// The variants divide by whether the device may have acted. When an input or control method (`key`, `mouse_button`, `mouse_move`, `release_inputs` or `control`) returns `Authentication`, `Unsupported`, `Transport`, `Http` or `InvalidResponse`, the input or control that call asked for was not submitted, so the caller may decide whether to try again; `kvm-kvmd` may still have sent releases owed to earlier interrupted or abandoned presses before failing. `AmbiguousInput` and `AmbiguousControl` returned by those methods mean the requested input or control was, or may have been, submitted and its effect is unknown: never replay either automatically, and observe the device and the controlled host before deciding what to do. `login` and `complete_approval` return `AmbiguousInput` without sending their own login or approval request in two cases: tracked inputs are still held, and owed releases sent first may then have reached the device; or the task sending those owed releases failed, in which case releases may be in flight and the outcome is ambiguous like any other.
@@ -51,13 +60,6 @@ pub type Result<T> = std::result::Result<T, Error>;
 pub enum DeviceProfile {
     PiKvm,
     GlKvm,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DeviceStatus {
-    pub info: serde_json::Value,
-    pub hid: serde_json::Value,
-    pub streamer: serde_json::Value,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -142,6 +144,7 @@ pub trait VideoStream: Send {
 pub trait Device: Send + Sync {
     /// Opens a continuous video stream when supported by the device.
     async fn video(&self) -> Result<Box<dyn VideoStream>>;
+    /// Reads typed device state. It sends no input or control request.
     async fn status(&self) -> Result<DeviceStatus>;
     async fn capabilities(&self) -> Result<Capabilities>;
     async fn snapshot(&self) -> Result<Snapshot>;

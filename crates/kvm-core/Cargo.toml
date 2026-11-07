@@ -7,8 +7,8 @@ license.workspace = true
 [dependencies]
 async-trait.workspace = true
 serde.workspace = true
-serde_json.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
 proptest = "1.12.0"
+serde_json.workspace = true

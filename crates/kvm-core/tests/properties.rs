@@ -1,10 +1,14 @@
 //! Property tests for the contract types that cross process boundaries: their serialised forms and the error messages that callers and logs receive.
 
 use kvm_core::{
-    Capabilities, Capability, Control, DeviceProfile, DeviceStatus, Error, MouseMode, PowerAction,
+    AtxStatus, Capabilities, Capability, Control, DeviceProfile, DeviceStatus, Error, GpioInput,
+    GpioOutput, GpioStatus, HidOutputs, HidStatus, JigglerStatus, KernelInfo, KeyboardLeds,
+    KeyboardStatus, Limits, MediaDrive, MediaImage, MediaStatus, MouseMode, MouseStatus,
+    PlatformInfo, PowerAction, Reported, Resolution, StoragePartition, StreamerFeatures,
+    StreamerStatus, SwitchPort, SwitchStatus, SystemInfo, VideoSource,
 };
-use proptest::{collection::vec, prelude::*};
-use serde_json::Value;
+use proptest::{collection::vec, option, prelude::*};
+use serde_json::json;
 
 fn capability() -> impl Strategy<Value = Capability> {
     proptest::sample::select(vec![
@@ -22,20 +26,312 @@ fn mouse_mode() -> impl Strategy<Value = MouseMode> {
     ])
 }
 
-fn json() -> impl Strategy<Value = Value> {
-    let leaf = prop_oneof![
-        Just(Value::Null),
-        any::<bool>().prop_map(Value::from),
-        any::<i64>().prop_map(Value::from),
-        any::<String>().prop_map(Value::from),
-    ];
-    leaf.prop_recursive(3, 24, 4, |inner| {
-        prop_oneof![
-            vec(inner.clone(), 0..4).prop_map(Value::Array),
-            proptest::collection::hash_map(any::<String>(), inner, 0..4)
-                .prop_map(|entries| Value::Object(entries.into_iter().collect())),
-        ]
-    })
+fn reported<T: Clone + std::fmt::Debug>(
+    inner: impl Strategy<Value = T>,
+) -> impl Strategy<Value = Reported<T>> {
+    prop_oneof![
+        inner.prop_map(Reported::Supported),
+        Just(Reported::Unsupported),
+        Just(Reported::Unknown),
+    ]
+}
+
+fn flag() -> impl Strategy<Value = Reported<bool>> {
+    reported(any::<bool>())
+}
+
+fn text() -> impl Strategy<Value = Reported<String>> {
+    reported(any::<String>())
+}
+
+fn number() -> impl Strategy<Value = Reported<u32>> {
+    reported(any::<u32>())
+}
+
+fn system_info() -> impl Strategy<Value = SystemInfo> {
+    let kernel =
+        (text(), text(), text(), text()).prop_map(|(system, release, version, machine)| {
+            KernelInfo {
+                system,
+                release,
+                version,
+                machine,
+            }
+        });
+    let platform = (text(), text(), text(), text(), text(), text()).prop_map(
+        |(kind, base, serial, model, video, board)| PlatformInfo {
+            kind,
+            base,
+            serial,
+            model,
+            video,
+            board,
+        },
+    );
+    (
+        text(),
+        text(),
+        text(),
+        reported(kernel),
+        reported(platform),
+        text(),
+    )
+        .prop_map(
+            |(kvmd_version, streamer_app, streamer_version, kernel, platform, host)| SystemInfo {
+                kvmd_version,
+                streamer_app,
+                streamer_version,
+                kernel,
+                platform,
+                host,
+            },
+        )
+}
+
+fn hid_outputs() -> impl Strategy<Value = Reported<HidOutputs>> {
+    reported(
+        (vec(any::<String>(), 0..3), option::of(any::<String>()))
+            .prop_map(|(available, active)| HidOutputs { available, active }),
+    )
+}
+
+fn hid_status() -> impl Strategy<Value = HidStatus> {
+    let leds =
+        (flag(), flag(), flag()).prop_map(|(caps, scroll, num)| KeyboardLeds { caps, scroll, num });
+    let keyboard = (flag(), reported(leds), hid_outputs()).prop_map(|(online, leds, outputs)| {
+        KeyboardStatus {
+            online,
+            leds,
+            outputs,
+        }
+    });
+    let mouse =
+        (flag(), mouse_mode(), hid_outputs()).prop_map(|(online, mode, outputs)| MouseStatus {
+            online,
+            mode,
+            outputs,
+        });
+    let jiggler =
+        (flag(), flag(), reported(any::<u64>())).prop_map(|(enabled, active, interval_seconds)| {
+            JigglerStatus {
+                enabled,
+                active,
+                interval_seconds,
+            }
+        });
+    (
+        flag(),
+        flag(),
+        flag(),
+        reported(keyboard),
+        reported(mouse),
+        reported(jiggler),
+    )
+        .prop_map(
+            |(online, busy, connected, keyboard, mouse, jiggler)| HidStatus {
+                online,
+                busy,
+                connected,
+                keyboard,
+                mouse,
+                jiggler,
+            },
+        )
+}
+
+fn streamer_status() -> impl Strategy<Value = StreamerStatus> {
+    let features = (flag(), flag(), flag(), flag(), flag(), flag()).prop_map(
+        |(quality, resolution, h264, h265, zero_delay, venc_mode)| StreamerFeatures {
+            quality,
+            resolution,
+            h264,
+            h265,
+            zero_delay,
+            venc_mode,
+        },
+    );
+    let limits = (any::<u32>(), any::<u32>()).prop_map(|(min, max)| Limits { min, max });
+    let resolution =
+        (any::<u32>(), any::<u32>()).prop_map(|(width, height)| Resolution { width, height });
+    let source =
+        (flag(), reported(resolution), number()).prop_map(|(online, resolution, captured_fps)| {
+            VideoSource {
+                online,
+                resolution,
+                captured_fps,
+            }
+        });
+    (
+        features,
+        number(),
+        reported(limits),
+        number(),
+        text(),
+        reported(vec(any::<String>(), 0..3)),
+        number(),
+        number(),
+        text(),
+        reported(source),
+        number(),
+    )
+        .prop_map(
+            |(
+                features,
+                desired_fps,
+                desired_fps_limits,
+                quality,
+                resolution,
+                available_resolutions,
+                h264_bitrate,
+                h264_gop,
+                encoder,
+                source,
+                clients,
+            )| StreamerStatus {
+                features,
+                desired_fps,
+                desired_fps_limits,
+                quality,
+                resolution,
+                available_resolutions,
+                h264_bitrate,
+                h264_gop,
+                encoder,
+                source,
+                clients,
+            },
+        )
+}
+
+fn atx_status() -> impl Strategy<Value = AtxStatus> {
+    (flag(), flag(), flag(), flag(), flag()).prop_map(
+        |(busy, power_led, hdd_led, power_busy, reset_busy)| AtxStatus {
+            busy,
+            power_led,
+            hdd_led,
+            power_busy,
+            reset_busy,
+        },
+    )
+}
+
+fn switch_status() -> impl Strategy<Value = SwitchStatus> {
+    let port = (any::<u32>(), number(), number(), text(), text()).prop_map(
+        |(port, unit, channel, id, name)| SwitchPort {
+            port,
+            unit,
+            channel,
+            id,
+            name,
+        },
+    );
+    (
+        reported(vec(port, 0..3)),
+        reported(option::of(any::<u32>())),
+        flag(),
+    )
+        .prop_map(|(ports, active_port, synced)| SwitchStatus {
+            ports,
+            active_port,
+            synced,
+        })
+}
+
+fn gpio_status() -> impl Strategy<Value = GpioStatus> {
+    let input = (any::<String>(), flag(), flag()).prop_map(|(channel, online, state)| GpioInput {
+        channel,
+        online,
+        state,
+    });
+    let output = (any::<String>(), flag(), flag(), flag(), flag()).prop_map(
+        |(channel, online, busy, state, switchable)| GpioOutput {
+            channel,
+            online,
+            busy,
+            state,
+            switchable,
+        },
+    );
+    (reported(vec(input, 0..3)), reported(vec(output, 0..3)))
+        .prop_map(|(inputs, outputs)| GpioStatus { inputs, outputs })
+}
+
+fn media_image() -> impl Strategy<Value = MediaImage> {
+    (any::<String>(), reported(any::<u64>()), flag(), flag()).prop_map(
+        |(name, size, complete, removable)| MediaImage {
+            name,
+            size,
+            complete,
+            removable,
+        },
+    )
+}
+
+fn media_drive() -> impl Strategy<Value = MediaDrive> {
+    (flag(), flag(), flag(), reported(option::of(media_image()))).prop_map(
+        |(connected, cdrom, rw, image)| MediaDrive {
+            connected,
+            cdrom,
+            rw,
+            image,
+        },
+    )
+}
+
+fn media_status() -> impl Strategy<Value = MediaStatus> {
+    let partition = (
+        any::<String>(),
+        reported(any::<u64>()),
+        reported(any::<u64>()),
+        flag(),
+    )
+        .prop_map(|(name, size, free, writable)| StoragePartition {
+            name,
+            size,
+            free,
+            writable,
+        });
+    (
+        flag(),
+        flag(),
+        reported(media_drive()),
+        reported(media_drive()),
+        reported(vec(media_image(), 0..3)),
+        reported(vec(partition, 0..3)),
+    )
+        .prop_map(
+            |(online, busy, drive, partition_drive, images, partitions)| MediaStatus {
+                online,
+                busy,
+                drive,
+                partition_drive,
+                images,
+                partitions,
+            },
+        )
+}
+
+fn device_status() -> impl Strategy<Value = DeviceStatus> {
+    (
+        reported(system_info()),
+        reported(hid_status()),
+        reported(streamer_status()),
+        reported(atx_status()),
+        reported(switch_status()),
+        reported(gpio_status()),
+        reported(media_status()),
+    )
+        .prop_map(
+            |(info, hid, streamer, atx, switch, gpio, media)| DeviceStatus {
+                info,
+                hid,
+                streamer,
+                atx,
+                switch,
+                gpio,
+                media,
+            },
+        )
 }
 
 fn control() -> impl Strategy<Value = Control> {
@@ -89,14 +385,27 @@ proptest! {
         prop_assert_eq!(serde_json::to_value(&decoded).unwrap(), encoded);
     }
 
-    // Breaks if device-reported JSON is reshaped when carried in a status.
+    // Breaks if a status field is renamed or skipped on one side of the round trip, or if a support state is spelt differently on encoding and decoding.
     #[test]
-    fn status_carries_arbitrary_device_json_unchanged(info in json(), hid in json(), streamer in json()) {
-        let status = DeviceStatus { info, hid, streamer };
-        let decoded: DeviceStatus = serde_json::from_str(&serde_json::to_string(&status).unwrap()).unwrap();
-        prop_assert_eq!(decoded.info, status.info);
-        prop_assert_eq!(decoded.hid, status.hid);
-        prop_assert_eq!(decoded.streamer, status.streamer);
+    fn statuses_survive_a_round_trip_through_json(status in device_status()) {
+        let encoded = serde_json::to_value(&status).unwrap();
+        let decoded: DeviceStatus = serde_json::from_value(encoded.clone()).unwrap();
+        prop_assert_eq!(serde_json::to_value(&decoded).unwrap(), encoded);
+        prop_assert_eq!(decoded, status);
+    }
+
+    // Breaks if the machine-readable spelling of a reported value changes, or if its capability disagrees with whether it carries a value.
+    #[test]
+    fn reported_values_have_a_stable_tagged_spelling(value in reported(any::<u32>())) {
+        let expected = match &value {
+            Reported::Supported(inner) => json!({"support": "Supported", "value": inner}),
+            Reported::Unsupported => json!({"support": "Unsupported"}),
+            Reported::Unknown => json!({"support": "Unknown"}),
+        };
+        prop_assert_eq!(serde_json::to_value(&value).unwrap(), expected);
+        let capability = value.capability();
+        prop_assert_eq!(value.value().is_some(), capability == Capability::Supported);
+        prop_assert_eq!(serde_json::to_value(capability).unwrap(), serde_json::to_value(&value).unwrap()["support"].clone());
     }
 
     // Breaks if a control operation loses a payload field or decodes as another variant.
