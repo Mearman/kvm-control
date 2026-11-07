@@ -4197,9 +4197,13 @@ mod tests {
                 "width {width}: {row:?}"
             );
         }
+        // The warning, then the earlier message (here the notice that input mode ended), then the release error.
         assert!(
+            app.message.starts_with(&format!(
+                "{CLEANUP_UNCERTAIN}. {INPUT_MODE_ENDED}. Release error: "
+            )),
+            "{}",
             app.message
-                .starts_with("Cleanup uncertain. Release error: ")
         );
         // A later refresh outcome, failed or successful, leaves the warning in front.
         app.finish_refresh(&device, failed_read()).await;
