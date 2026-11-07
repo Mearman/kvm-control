@@ -378,6 +378,12 @@ impl Default for Reporter {
     }
 }
 
+/// The outcome of a movement request and whether the movement itself was submitted.
+enum Moved {
+    Sent(Result<()>),
+    NotSent(Result<()>),
+}
+
 /// An input that stays held until released: a keyboard key or a mouse button.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum Held {
@@ -1083,17 +1089,17 @@ impl Kvmd {
         }
     }
 
-    /// Sends owed releases, then the movement, the caller having handed over the input lock. A movement whose caller is gone (`caller` closed) once settlement finishes, or by the time it would be submitted, is not sent; the HID state read between them is skipped too in the first case.
+    /// Sends owed releases, then the movement, the caller having handed over the input lock, and says whether the movement was submitted. A movement whose caller is gone (`caller` closed) once settlement finishes, or by the time it would be submitted, is not sent; the HID state read between them is skipped too in the first case.
     async fn settled_move(
         &self,
         mut inputs: tokio::sync::OwnedMutexGuard<Inputs>,
         x: i16,
         y: i16,
         caller: &tokio::sync::oneshot::Sender<Result<()>>,
-    ) -> Result<()> {
+    ) -> Moved {
         self.settle_owed(&mut inputs).await;
         if caller.is_closed() {
-            return Ok(());
+            return Moved::NotSent(Ok(()));
         }
         let active = self.client.read().await;
         let checked = match self.json_with(&active.client, "hid").await {
@@ -1110,9 +1116,11 @@ impl Kvmd {
         };
         // Nothing has been submitted yet, so an abandoned caller needs neither the movement nor a report of why it would not have been sent.
         if caller.is_closed() {
-            return Ok(());
+            return Moved::NotSent(Ok(()));
         }
-        checked?;
+        if let Err(error) = checked {
+            return Moved::NotSent(Err(error));
+        }
         // Marked before submission so a task dropped mid-request (runtime shutdown) leaves the session indeterminate.
         let indeterminate = inputs.indeterminate;
         inputs.indeterminate = true;
@@ -1126,7 +1134,7 @@ impl Kvmd {
         if result.is_ok() {
             inputs.indeterminate = indeterminate;
         }
-        result
+        Moved::Sent(result)
     }
 
     /// Takes the input lock and sends owed releases on a task that hands the lock back, so a caller cancelled during settlement cannot interrupt a release: the task finishes it and then unlocks.
@@ -1334,8 +1342,14 @@ impl Device for Kvmd {
         let worker = self.input_worker();
         let (result_tx, result_rx) = tokio::sync::oneshot::channel();
         tokio::spawn(async move {
-            let result = worker.settled_move(inputs, x, y, &result_tx).await;
-            if let Err(Err(error)) = result_tx.send(result) {
+            // Only a submitted movement has an outcome the device may still apply; a failed state read or capability check sent nothing, so an abandoned caller needs no report of it.
+            let (result, submitted) = match worker.settled_move(inputs, x, y, &result_tx).await {
+                Moved::Sent(result) => (result, true),
+                Moved::NotSent(result) => (result, false),
+            };
+            if let Err(Err(error)) = result_tx.send(result)
+                && submitted
+            {
                 worker.report_abandoned(&error);
             }
         });
