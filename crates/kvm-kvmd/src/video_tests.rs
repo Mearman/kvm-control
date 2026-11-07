@@ -98,6 +98,8 @@ async fn device(body: impl Into<Vec<u8>>) -> (Kvmd, Arc<Notify>, tokio::task::Jo
         video_proven: Default::default(),
         cleanup_on_drop: false,
         input_runtime: Default::default(),
+        stream_storage: Arc::new(tokio::sync::Semaphore::new(crate::MAX_JPEG_VALIDATIONS)),
+        snapshot_storage: Arc::new(tokio::sync::Semaphore::new(crate::MAX_JPEG_VALIDATIONS)),
     };
     (device, closed, task)
 }
@@ -599,7 +601,7 @@ async fn cancelling_snapshot_read_releases_capacity() {
         assert!(
             std::str::from_utf8(&request[..n])
                 .unwrap()
-                .starts_with("GET /proxy/streamer/snapshot ")
+                .starts_with("GET /proxy/api/streamer/snapshot")
         );
         first
             .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 999\r\n\r\n")
@@ -607,13 +609,17 @@ async fn cancelling_snapshot_read_releases_capacity() {
             .unwrap();
         arrived.send(()).unwrap();
         let mut byte = [0; 1];
-        assert_eq!(first.read(&mut byte).await.unwrap(), 0);
+        match first.read(&mut byte).await {
+            Ok(0) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => {}
+            result => panic!("expected connection closure after cancellation: {result:?}"),
+        }
         let (mut second, _) = listener.accept().await.unwrap();
         let n = second.read(&mut request).await.unwrap();
         assert!(
             std::str::from_utf8(&request[..n])
                 .unwrap()
-                .starts_with("GET /proxy/streamer/snapshot ")
+                .starts_with("GET /proxy/api/streamer/snapshot")
         );
         let frame = jpeg();
         second
@@ -648,6 +654,8 @@ async fn cancelling_snapshot_read_releases_capacity() {
         inputs: Default::default(),
         auth_headers: Default::default(),
         approval_token: Default::default(),
+        stream_storage: Arc::new(tokio::sync::Semaphore::new(crate::MAX_JPEG_VALIDATIONS)),
+        snapshot_storage: Arc::new(tokio::sync::Semaphore::new(crate::MAX_JPEG_VALIDATIONS)),
     };
     let mut snapshot = Box::pin(device.snapshot());
     tokio::select! {
@@ -705,7 +713,7 @@ async fn stream_validation_survives_cancelled_next_frame() {
         assert!(
             std::str::from_utf8(&request[..n])
                 .unwrap()
-                .starts_with("GET /proxy/streamer/snapshot ")
+                .starts_with("GET /proxy/api/streamer/snapshot")
         );
         socket
             .write_all(
@@ -739,6 +747,8 @@ async fn stream_validation_survives_cancelled_next_frame() {
         inputs: Default::default(),
         auth_headers: Default::default(),
         approval_token: Default::default(),
+        stream_storage: Arc::new(tokio::sync::Semaphore::new(crate::MAX_JPEG_VALIDATIONS)),
+        snapshot_storage: Arc::new(tokio::sync::Semaphore::new(crate::MAX_JPEG_VALIDATIONS)),
     };
     let mut snapshot = Box::pin(device.snapshot());
     tokio::select! {
@@ -764,7 +774,7 @@ async fn concurrent_snapshots_exhaust_and_recover_storage() {
             assert!(
                 std::str::from_utf8(&request[..n])
                     .unwrap()
-                    .starts_with("GET /proxy/streamer/snapshot ")
+                    .starts_with("GET /proxy/api/streamer/snapshot")
             );
             socket
                 .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 999\r\n\r\n")
@@ -798,6 +808,8 @@ async fn concurrent_snapshots_exhaust_and_recover_storage() {
         inputs: Default::default(),
         auth_headers: Default::default(),
         approval_token: Default::default(),
+        stream_storage: Arc::new(tokio::sync::Semaphore::new(crate::MAX_JPEG_VALIDATIONS)),
+        snapshot_storage: Arc::new(tokio::sync::Semaphore::new(crate::MAX_JPEG_VALIDATIONS)),
     });
     let mut tasks = Vec::new();
     for _ in 0..crate::MAX_JPEG_VALIDATIONS {
@@ -822,10 +834,12 @@ async fn concurrent_snapshots_exhaust_and_recover_storage() {
 async fn concurrent_streams_exhaust_and_recover_storage() {
     let mut streams = Vec::new();
     let mut servers = Vec::new();
+    let slots = Arc::new(tokio::sync::Semaphore::new(crate::MAX_JPEG_VALIDATIONS));
     for _ in 0..crate::MAX_JPEG_VALIDATIONS {
         let mut body = part(&jpeg(), true, false);
         body.extend_from_slice(b"--frame\r\n");
-        let (device, closed, server) = device(body).await;
+        let (mut device, closed, server) = device(body).await;
+        device.stream_storage = slots.clone();
         let mut stream = device.video().await.unwrap();
         assert_eq!(stream.next_frame().await.unwrap().unwrap().jpeg, jpeg());
         streams.push(stream);
@@ -833,11 +847,17 @@ async fn concurrent_streams_exhaust_and_recover_storage() {
     }
     let mut body = part(&jpeg(), true, false);
     body.extend_from_slice(b"--frame\r\n");
-    let (extra, closed, server) = device(body).await;
+    let (mut extra, closed, server) = device(body).await;
+    extra.stream_storage = slots.clone();
     assert!(
         matches!(extra.video().await, Err(kvm_core::Error::Transport(message)) if message == "video stream capacity exhausted")
     );
     drop(streams.pop());
+    let (released, completed) = servers.pop().unwrap();
+    tokio::time::timeout(Duration::from_secs(3), released.notified())
+        .await
+        .unwrap();
+    completed.await.unwrap();
     let mut replacement = extra.video().await.unwrap();
     assert_eq!(
         replacement.next_frame().await.unwrap().unwrap().jpeg,
@@ -1120,6 +1140,8 @@ async fn cancelled_partial_frame_can_resume() {
         video_proven: Default::default(),
         cleanup_on_drop: false,
         input_runtime: Default::default(),
+        stream_storage: Arc::new(tokio::sync::Semaphore::new(crate::MAX_JPEG_VALIDATIONS)),
+        snapshot_storage: Arc::new(tokio::sync::Semaphore::new(crate::MAX_JPEG_VALIDATIONS)),
     };
     let mut video = device.video().await.unwrap();
     assert!(
@@ -1191,6 +1213,8 @@ async fn relogin_waits_for_video_establishment() {
         video_proven: Default::default(),
         cleanup_on_drop: false,
         input_runtime: Default::default(),
+        stream_storage: Arc::new(tokio::sync::Semaphore::new(crate::MAX_JPEG_VALIDATIONS)),
+        snapshot_storage: Arc::new(tokio::sync::Semaphore::new(crate::MAX_JPEG_VALIDATIONS)),
     });
     let video_device = device.clone();
     let video_task = tokio::spawn(async move { video_device.video().await });
@@ -1262,6 +1286,8 @@ async fn coalesced_http_response_delivers_multiple_frames() {
         video_proven: Default::default(),
         cleanup_on_drop: false,
         input_runtime: Default::default(),
+        stream_storage: Arc::new(tokio::sync::Semaphore::new(crate::MAX_JPEG_VALIDATIONS)),
+        snapshot_storage: Arc::new(tokio::sync::Semaphore::new(crate::MAX_JPEG_VALIDATIONS)),
     };
     let mut video = device.video().await.unwrap();
     assert_eq!(video.next_frame().await.unwrap().unwrap().jpeg, jpeg());
@@ -1344,6 +1370,8 @@ async fn maximum_frame_with_maximum_headers_and_boundary() {
         video_proven: Default::default(),
         cleanup_on_drop: false,
         input_runtime: Default::default(),
+        stream_storage: Arc::new(tokio::sync::Semaphore::new(crate::MAX_JPEG_VALIDATIONS)),
+        snapshot_storage: Arc::new(tokio::sync::Semaphore::new(crate::MAX_JPEG_VALIDATIONS)),
     };
     let mut video = device.video().await.unwrap();
     assert_eq!(video.next_frame().await.unwrap().unwrap().jpeg.len(), FRAME);

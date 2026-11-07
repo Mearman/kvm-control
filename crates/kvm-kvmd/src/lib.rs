@@ -7,8 +7,8 @@
 use std::{
     collections::BTreeSet,
     sync::{
-        atomic::{AtomicBool, Ordering},
         Arc,
+        atomic::{AtomicBool, Ordering},
     },
     time::Duration,
 };
@@ -327,6 +327,10 @@ pub struct Kvmd {
     video_proven: Arc<AtomicBool>,
     cleanup_on_drop: bool,
     input_runtime: Arc<std::sync::Mutex<Option<tokio::runtime::Handle>>>,
+    #[cfg(test)]
+    stream_storage: Arc<tokio::sync::Semaphore>,
+    #[cfg(test)]
+    snapshot_storage: Arc<tokio::sync::Semaphore>,
 }
 
 impl std::ops::Deref for Session {
@@ -412,6 +416,10 @@ impl Kvmd {
             video_proven: Arc::new(AtomicBool::new(false)),
             cleanup_on_drop: true,
             input_runtime: Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(test)]
+            stream_storage: Arc::new(tokio::sync::Semaphore::new(MAX_JPEG_VALIDATIONS)),
+            #[cfg(test)]
+            snapshot_storage: Arc::new(tokio::sync::Semaphore::new(MAX_JPEG_VALIDATIONS)),
         })
     }
 
@@ -856,11 +864,15 @@ impl Device for Kvmd {
     }
 
     async fn snapshot(&self) -> Result<Snapshot> {
+        #[cfg(not(test))]
         static STORAGE: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> =
             std::sync::OnceLock::new();
+        #[cfg(not(test))]
         let slots = STORAGE
             .get_or_init(|| Arc::new(tokio::sync::Semaphore::new(MAX_JPEG_VALIDATIONS)))
             .clone();
+        #[cfg(test)]
+        let slots = self.snapshot_storage.clone();
         self.snapshot_with_storage(slots).await
     }
 
@@ -1258,11 +1270,13 @@ mod tests {
             .await
             .is_err()
         );
-        assert!(run_jpeg_validation(slots.clone(), || -> Result<()> {
-            panic!("synthetic panic")
-        })
-        .await
-        .is_err());
+        assert!(
+            run_jpeg_validation(slots.clone(), || -> Result<()> {
+                panic!("synthetic panic")
+            })
+            .await
+            .is_err()
+        );
         assert!(slots.try_acquire_owned().is_ok());
     }
 
@@ -1430,6 +1444,8 @@ mod tests {
             video_proven: Default::default(),
             cleanup_on_drop: false,
             input_runtime: Default::default(),
+            stream_storage: Arc::new(tokio::sync::Semaphore::new(MAX_JPEG_VALIDATIONS)),
+            snapshot_storage: Arc::new(tokio::sync::Semaphore::new(MAX_JPEG_VALIDATIONS)),
         };
         assert!(matches!(
             device.snapshot().await,
@@ -1471,6 +1487,8 @@ mod tests {
             inputs: Default::default(),
             auth_headers: Default::default(),
             approval_token: Default::default(),
+            stream_storage: Arc::new(tokio::sync::Semaphore::new(MAX_JPEG_VALIDATIONS)),
+            snapshot_storage: Arc::new(tokio::sync::Semaphore::new(MAX_JPEG_VALIDATIONS)),
         };
         let slots = Arc::new(tokio::sync::Semaphore::new(1));
         let first = device.snapshot_with_storage(slots.clone());
