@@ -22,7 +22,7 @@ git -C "$tmp/repo" -c tag.gpgsign=false tag v1.1.0
 first=$(git -C "$tmp/repo" rev-parse HEAD)
 git -C "$tmp/repo" -c user.name=test -c user.email=test@example.com commit --allow-empty -qm 'feat: later release'
 second=$(git -C "$tmp/repo" rev-parse HEAD)
-printf '%s\n' '#!/usr/bin/env bash' 'set -e' 'if [[ "$1" == api ]]; then' '  if [[ "$*" == *--slurp* ]]; then cat "$MOCK_RELEASES"; elif [[ "$*" == *releases/tags/* ]]; then cat "$MOCK_ASSETS"; else if [[ ${MOCK_PUBLISHED:-} ]]; then printf "published\n"; else printf "draft\n"; fi; fi' 'elif [[ "$1 $2" == "release download" ]]; then cp "$MOCK_REMOTE"/* "$5"/; else printf "%s %s\n" "$(git rev-parse HEAD)" "$*" >> "$MOCK_LOG"; fi' > "$tmp/bin/gh"
+printf '%s\n' '#!/usr/bin/env bash' 'set -e' 'if [[ "$1" == api ]]; then' '  if [[ "$*" == *--slurp* ]]; then cat "$MOCK_RELEASES"; elif [[ "$*" == *.assets* ]]; then cat "$MOCK_ASSETS"; else if [[ ${MOCK_PUBLISHED:-} ]]; then printf "published\n"; else printf "draft\n"; fi; fi' 'elif [[ "$1 $2" == "release download" ]]; then cp "$MOCK_REMOTE"/* "$5"/; else printf "%s %s\n" "$(git rev-parse HEAD)" "$*" >> "$MOCK_LOG"; fi' > "$tmp/bin/gh"
 printf '%s\n' '#!/usr/bin/env bash' 'if [[ "$1" == changelog ]]; then printf "notes from %s\n" "$(git describe --tags --abbrev=0)" > release-notes.md; else printf "%s\n" "$MOCK_NEXT"; fi' > "$tmp/bin/convco"
 chmod +x "$tmp/bin/gh" "$tmp/bin/convco"
 cd "$tmp/repo"

@@ -45,7 +45,8 @@ fi
 remote_dir=$(mktemp -d)
 trap 'rm -rf "$remote_dir"' EXIT
 gh release download "$TAG" --dir "$remote_dir" --pattern "kvm-control-${TAG}-*.tar.gz" --pattern "kvm-control-${TAG}-*.tar.gz.sha256"
-assets=$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases/tags/$TAG" --jq '.assets[] | [.name, .state, .digest] | @tsv')
+# The releases/tags endpoint does not return a draft, so the assets are read from the release listing.
+assets=$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases" --jq ".[] | select(.tag_name == \"$TAG\") | .assets[] | [.name, .state, .digest] | @tsv")
 for target in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu x86_64-apple-darwin aarch64-apple-darwin; do
   archive="kvm-control-${TAG}-${target}.tar.gz"
   test -s "$remote_dir/$archive"
