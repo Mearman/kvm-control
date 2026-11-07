@@ -1,3 +1,9 @@
+//! KVMD adapter and continuous MJPEG transport.
+//!
+//! PiKVM's [stream client](https://github.com/pikvm/kvmd/blob/fcb903eb3be70d8eee4aee99e5fcc1c743e3ccef/web/share/js/kvm/stream_mjpeg.js) and [WebSocket handler](https://github.com/pikvm/kvmd/blob/fcb903eb3be70d8eee4aee99e5fcc1c743e3ccef/kvmd/apps/kvmd/server.py), and GLKVM's [stream client](https://github.com/gl-inet/glkvm/blob/3e8dd23c4bd638a4650433664cc3b0f3b4d29395/web/share/js/kvm/stream_mjpeg.js) and [WebSocket handler](https://github.com/gl-inet/glkvm/blob/3e8dd23c4bd638a4650433664cc3b0f3b4d29395/kvmd/apps/kvmd/server.py), use these routes. [uStreamer](https://github.com/pikvm/ustreamer/blob/11fd828ab00c01a39bd0843ef442ef0b6d3cac41/src/ustreamer/http/server.c) emits multipart JPEG with or without Content-Length.
+//!
+//! These sources do not establish compatibility with every firmware version. Only synthetic server tests have been run; no physical device has been verified. The video API supports MJPEG only, does not change encoder settings, and validates JPEG envelope markers rather than decoding images. Capabilities remain unknown until callers attempt the transport.
+
 use std::{
     collections::BTreeSet,
     sync::{
@@ -7,6 +13,10 @@ use std::{
     time::Duration,
 };
 
+mod video;
+#[cfg(test)]
+mod video_tests;
+
 use async_trait::async_trait;
 use kvm_core::{
     Capabilities, Capability, Confirmation, Control, ControlOutcome, Device, DeviceProfile,
@@ -15,6 +25,17 @@ use kvm_core::{
 use reqwest::{Client, Method, StatusCode};
 use tokio::sync::{Mutex, RwLock};
 use url::Url;
+
+fn request_error(context: &'static str, error: &reqwest::Error) -> Error {
+    let kind = if error.is_timeout() {
+        "timeout"
+    } else if error.is_connect() {
+        "connection failure"
+    } else {
+        "request failure"
+    };
+    Error::Transport(format!("{context}: {kind}"))
+}
 
 /// Connection parameters. Credentials are supplied separately and are never formatted for logs.
 #[derive(Clone)]
@@ -65,6 +86,7 @@ async fn bounded_json(mut response: reqwest::Response) -> Result<serde_json::Val
 
 struct Session {
     client: Client,
+    video: Client,
     cookies: Arc<SessionCookies>,
 }
 
@@ -103,6 +125,13 @@ pub struct Kvmd {
     approval_token: Mutex<Option<String>>,
 }
 
+impl std::ops::Deref for Session {
+    type Target = Client;
+    fn deref(&self) -> &Client {
+        &self.client
+    }
+}
+
 #[derive(Default)]
 struct Inputs {
     keys: BTreeSet<String>,
@@ -138,21 +167,31 @@ impl Kvmd {
 
     fn build_client(config: &Config) -> Result<Session> {
         let cookies = Arc::new(SessionCookies::default());
-        let mut builder = Client::builder()
-            .timeout(config.timeout)
-            .cookie_provider(cookies.clone())
-            .retry(reqwest::retry::never())
-            .redirect(reqwest::redirect::Policy::none())
-            .danger_accept_invalid_certs(config.insecure_tls);
-        if let Some(pem) = &config.trusted_ca_pem {
-            let ca = reqwest::Certificate::from_pem(pem)
-                .map_err(|_| Error::InvalidResponse("invalid CA certificate".into()))?;
-            builder = builder.add_root_certificate(ca);
-        }
-        let client = builder
-            .build()
-            .map_err(|_| Error::Transport("could not build HTTP client".into()))?;
-        Ok(Session { client, cookies })
+        let build = |limited: bool| -> Result<Client> {
+            let mut builder = Client::builder()
+                .connect_timeout(config.timeout)
+                .cookie_provider(cookies.clone())
+                .http1_only()
+                .retry(reqwest::retry::never())
+                .redirect(reqwest::redirect::Policy::none())
+                .danger_accept_invalid_certs(config.insecure_tls);
+            if limited {
+                builder = builder.timeout(config.timeout);
+            }
+            if let Some(pem) = &config.trusted_ca_pem {
+                let ca = reqwest::Certificate::from_pem(pem)
+                    .map_err(|_| Error::InvalidResponse("invalid CA certificate".into()))?;
+                builder = builder.add_root_certificate(ca);
+            }
+            builder
+                .build()
+                .map_err(|_| Error::Transport("could not build HTTP client".into()))
+        };
+        Ok(Session {
+            client: build(true)?,
+            video: build(false)?,
+            cookies,
+        })
     }
 
     /// Builds a client with credentials sent in KVMD's authentication headers.
@@ -222,7 +261,7 @@ impl Kvmd {
             .form(&[("user", username), ("passwd", password)])
             .send()
             .await
-            .map_err(|_| Error::Transport("login request failed".into()))?;
+            .map_err(|error| request_error("login", &error))?;
         Self::check(response.status())?;
         let body = bounded_json(response).await?;
         if body.get("ok").and_then(serde_json::Value::as_bool) != Some(true) {
@@ -270,7 +309,7 @@ impl Kvmd {
             .form(&[("two_step_token", token)])
             .send()
             .await
-            .map_err(|_| Error::Transport("approval request failed".into()))?;
+            .map_err(|error| request_error("approval", &error))?;
         Self::check(response.status())?;
         let body = bounded_json(response).await?;
         if body.get("ok").and_then(serde_json::Value::as_bool) != Some(true) {
@@ -303,7 +342,7 @@ impl Kvmd {
             .get(self.url("auth/check")?)
             .send()
             .await
-            .map_err(|_| Error::Transport("authentication check failed".into()))?;
+            .map_err(|error| request_error("authentication check", &error))?;
         Self::check(response.status())?;
         let body = bounded_json(response).await?;
         if body.get("ok").and_then(serde_json::Value::as_bool) != Some(true) {
@@ -342,7 +381,7 @@ impl Kvmd {
             .headers(self.auth_headers.clone())
             .send()
             .await
-            .map_err(|_| Error::Transport("request failed".into()))?;
+            .map_err(|error| request_error("device request", &error))?;
         Self::check(response.status())?;
         Ok(response)
     }
@@ -453,6 +492,10 @@ fn mouse_mode(state: &serde_json::Value) -> MouseMode {
 
 #[async_trait]
 impl Device for Kvmd {
+    async fn video(&self) -> Result<Box<dyn kvm_core::VideoStream>> {
+        video::open(self).await
+    }
+
     async fn status(&self) -> Result<DeviceStatus> {
         Ok(DeviceStatus {
             info: self.json("info").await?,
@@ -469,7 +512,7 @@ impl Device for Kvmd {
             keyboard: hid_capability(&status.hid, "keyboard"),
             mouse: hid_capability(&status.hid, "mouse"),
             mouse_mode: mouse_mode(&status.hid),
-            live_video: Capability::Unsupported,
+            live_video: Capability::Unknown,
             power: self.discover_endpoint("atx").await?,
             switch: self.discover_endpoint("switch").await?,
             gpio: self.discover_endpoint("gpio").await?,
@@ -493,7 +536,7 @@ impl Device for Kvmd {
         while let Some(chunk) = response
             .chunk()
             .await
-            .map_err(|_| Error::Transport("snapshot read failed".into()))?
+            .map_err(|error| request_error("snapshot read", &error))?
         {
             if chunk.len() > MAX_SNAPSHOT_BYTES - bytes.len() {
                 return Err(Error::InvalidResponse(
