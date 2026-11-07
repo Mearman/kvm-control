@@ -1110,6 +1110,50 @@ mod tests {
     }
 
     #[test]
+    fn every_http_status_preserves_authentication_and_error_classification() {
+        for code in 100..=999 {
+            let status = StatusCode::from_u16(code).unwrap();
+            let result = Kvmd::check(status);
+            if status.is_success() {
+                assert!(result.is_ok(), "status {code}");
+            } else if code == 401 || code == 403 {
+                assert!(
+                    matches!(result, Err(Error::Authentication)),
+                    "status {code}"
+                );
+            } else {
+                assert!(
+                    matches!(result, Err(Error::Http(actual)) if actual == code),
+                    "status {code}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn hid_capability_is_only_supported_for_enabled_online_devices() {
+        for enabled in [None, Some(false), Some(true)] {
+            for online in [None, Some(false), Some(true)] {
+                for device in ["keyboard", "mouse"] {
+                    let mut state = serde_json::json!({});
+                    if let Some(value) = enabled {
+                        state["enabled"] = value.into();
+                    }
+                    if let Some(value) = online {
+                        state[device] = serde_json::json!({"online": value});
+                    }
+                    let expected = match (enabled, online) {
+                        (Some(false), _) => Capability::Unsupported,
+                        (Some(true), Some(true)) => Capability::Supported,
+                        _ => Capability::Unknown,
+                    };
+                    assert_eq!(hid_capability(&state, device), expected, "{state}");
+                }
+            }
+        }
+    }
+
+    #[test]
     fn auth_statuses_are_distinguished() {
         assert!(matches!(
             Kvmd::check(StatusCode::UNAUTHORIZED),

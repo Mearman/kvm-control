@@ -202,6 +202,7 @@ async fn locked_control(State(calls): State<Calls>, headers: HeaderMap) -> impl 
     }
 }
 
+// Synthetic HTTPS responses model the authentication and API shapes inspected in the PiKVM kvmd fcb903eb3be70d8eee4aee99e5fcc1c743e3ccef and GLKVM glkvm 3e8dd23c4bd638a4650433664cc3b0f3b4d29395 source revisions. These are not firmware release identifiers or hardware captures.
 async fn fixture() -> (Url, Vec<u8>, Calls, tokio::task::JoinHandle<()>) {
     let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
     let pem = certified.cert.pem().into_bytes();
