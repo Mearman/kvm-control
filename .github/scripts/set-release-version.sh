@@ -9,7 +9,7 @@ fi
 
 metadata=$(cargo metadata --locked --format-version 1 --no-deps)
 VERSION=${TAG#v} perl -0777 -i -pe '
-  $count = s/(\[workspace\.package\][^\[]*?^version\s*=\s*)"[^"]+"/${1}"$ENV{VERSION}"/m;
+  $count = s/(\[workspace\.package\][^\[]*?^version\s*=\s*)(?:"[^"]+"|\x27[^\x27]+\x27)/${1}"$ENV{VERSION}"/m;
   die "Expected one workspace package version\n" unless $count == 1;
 ' Cargo.toml
 printf '%s' "$metadata" | python3 -c '
