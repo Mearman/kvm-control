@@ -274,18 +274,15 @@ fn hid_status(state: &Value) -> HidStatus {
                 outputs: hid_outputs(keyboard),
             }
         }),
-        mouse: nested(state, "/mouse", |mouse| {
-            let online = boolean(mouse, "/online");
-            MouseStatus {
-                // PiKVM's MCU HID reports `absolute: true` whenever it is offline, so the mode is only an observation while the mouse is online. Capability discovery reads the mode on its own, so this does not change the absolute-move check.
-                mode: if online == Reported::Supported(true) {
-                    mouse_mode(state)
-                } else {
-                    MouseMode::Unknown
-                },
-                online,
-                outputs: hid_outputs(mouse),
-            }
+        mouse: nested(state, "/mouse", |mouse| MouseStatus {
+            online: boolean(mouse, "/online"),
+            // PiKVM's MCU HID reports `absolute: true` while the whole HID is offline, so the mode is an observation only while the HID reports itself online. The OTG plugins always report themselves online and report the configured gadget mode whatever the attached host does, so their mode is kept. Capability discovery reads the mode on its own, so this does not change the absolute-move check.
+            mode: if boolean(state, "/online") == Reported::Supported(true) {
+                mouse_mode(state)
+            } else {
+                MouseMode::Unknown
+            },
+            outputs: hid_outputs(mouse),
         }),
         jiggler: nested(state, "/jiggler", |jiggler| JigglerStatus {
             enabled: boolean(jiggler, "/enabled"),
@@ -690,8 +687,8 @@ mod tests {
         assert_eq!(hid.connected, Reported::Supported(true));
         let mouse = supported(&hid.mouse);
         assert_eq!(mouse.online, Reported::Supported(false));
-        // An offline mouse's mode is a placeholder (PiKVM's MCU HID reports absolute while offline), so it is not reported.
-        assert_eq!(mouse.mode, MouseMode::Unknown);
+        // An OTG HID reports itself online and its configured gadget mode whatever the attached host does, so the mode is kept.
+        assert_eq!(mouse.mode, MouseMode::Relative);
         assert_eq!(supported(&hid.jiggler).active, Reported::Supported(true));
 
         let streamer = supported(&status.streamer);
@@ -946,15 +943,22 @@ mod tests {
     }
 
     #[test]
-    fn mouse_mode_is_reported_only_while_the_mouse_is_online() {
-        for (online, absolute, expected) in [
-            (json!(true), json!(true), MouseMode::Absolute),
-            (json!(true), json!(false), MouseMode::Relative),
-            // PiKVM's MCU HID reports absolute whenever it is offline.
-            (json!(false), json!(true), MouseMode::Unknown),
-            (Value::Null, json!(false), MouseMode::Unknown),
+    fn mouse_mode_is_reported_only_while_the_hid_is_online() {
+        // (HID online, mouse online, absolute, expected mode)
+        for (hid_online, mouse_online, absolute, expected) in [
+            (json!(true), json!(true), json!(true), MouseMode::Absolute),
+            (json!(true), json!(true), json!(false), MouseMode::Relative),
+            // An OTG HID with no host attached: the gadget mode is still configured.
+            (json!(true), json!(false), json!(false), MouseMode::Relative),
+            (json!(true), json!(false), json!(true), MouseMode::Absolute),
+            // PiKVM's MCU HID while offline reports absolute as a placeholder.
+            (json!(false), json!(false), json!(true), MouseMode::Unknown),
+            (Value::Null, json!(true), json!(false), MouseMode::Unknown),
         ] {
-            let hid = hid_status(&json!({"mouse": {"online": online, "absolute": absolute}}));
+            let hid = hid_status(&json!({
+                "online": hid_online,
+                "mouse": {"online": mouse_online, "absolute": absolute},
+            }));
             assert_eq!(supported(&hid.mouse).mode, expected);
         }
     }
