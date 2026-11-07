@@ -1586,6 +1586,33 @@ fn owner_dropped_outside_a_runtime_uses_the_runtime_a_login_last_locked_on() {
 }
 
 #[tokio::test]
+async fn approval_that_changes_nothing_keeps_the_record_of_cleaned_releases() {
+    let (mut endpoint, ca, calls, server) = fixture().await;
+    endpoint.set_path("/glgated/");
+    let device = Arc::new(profile_client(endpoint, Some(ca), DeviceProfile::GlKvm));
+    let sender = device.clone();
+    let press = tokio::spawn(async move { sender.key("KeyA", true).await });
+    arrival(&calls).await;
+    press.abort();
+    assert!(press.await.unwrap_err().is_cancelled());
+    calls.4.notify_one();
+    // With no approval pending the session is unchanged, so the release cleanup already sent is still not resent.
+    drive(&calls, async {
+        assert!(matches!(
+            device.complete_approval().await,
+            Err(Error::InvalidResponse(_))
+        ));
+        device.key("KeyA", false).await.unwrap();
+    })
+    .await;
+    assert_eq!(
+        input_events(&calls),
+        ["key=KeyA&state=true", "key=KeyA&state=false"]
+    );
+    server.abort();
+}
+
+#[tokio::test]
 async fn expired_session_requires_explicit_reauthentication() {
     let (endpoint, ca, calls, server) = fixture().await;
     let device = client(endpoint, Some(ca));

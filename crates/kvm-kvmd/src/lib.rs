@@ -350,7 +350,7 @@ struct Inputs {
     uncertain_keys: BTreeSet<String>,
     uncertain_buttons: BTreeSet<String>,
     indeterminate: bool,
-    // Inputs whose owed release cleanup confirmed since the last key or button request, login or approval, so the next key or button request does not resend one; a login or approval clears it because a release in the new session is a different request.
+    // Inputs whose owed release cleanup confirmed since the last key or button request, login or approval, so the next key or button request does not resend one; a login or approval clears it once it has replaced the session, because a release in the new session is a different request.
     cleaned: Vec<(Held, String)>,
     // Sequence number of the last key or button request sent for each tracked input, so an owed release is skipped once a later request pressed or released that input. An entry is removed when its input is released, so the map never outgrows the tracked inputs.
     last: BTreeMap<(Held, String), u64>,
@@ -720,14 +720,14 @@ impl Kvmd {
                 "release tracked inputs before changing authentication".into(),
             ));
         }
-        // A release skipped because cleanup already sent it belongs to the session being replaced.
-        inputs.cleaned.clear();
         let mut pending = self.approval_token.lock().await;
         *pending = None;
         let mut active = self.client.write().await;
         let empty = Self::build_client(&self.config)?;
         empty.cookies.sealed.store(true, Ordering::Release);
         *active = empty;
+        // A release skipped because cleanup already sent it belongs to the session just replaced.
+        inputs.cleaned.clear();
         let candidate = Self::build_client(&self.config)?;
         let url = self.url("auth/login")?;
         let response = candidate
@@ -788,8 +788,6 @@ impl Kvmd {
                 "release tracked inputs before changing authentication".into(),
             ));
         }
-        // A release skipped because cleanup already sent it belongs to the session being replaced.
-        inputs.cleaned.clear();
         let mut pending = self.approval_token.lock().await;
         let token = pending
             .as_ref()
@@ -827,6 +825,8 @@ impl Kvmd {
         self.verify_client(&candidate.client).await?;
         *active = candidate;
         *pending = None;
+        // A release skipped because cleanup already sent it belongs to the session just replaced.
+        inputs.cleaned.clear();
         Ok(LoginState::Authenticated)
     }
 
