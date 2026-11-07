@@ -595,6 +595,79 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn signal_during_release_is_reported_after_the_press() {
+        for (press, outcome) in [
+            (Ok(()), "press completed"),
+            (
+                Err(kvm_core::Error::AmbiguousInput("synthetic failure".into())),
+                "press: ",
+            ),
+        ] {
+            let device = Fake(Default::default());
+            // Resolves only once the release has been requested, so the signal arrives after the press has finished.
+            let interrupt = std::future::poll_fn(|_| {
+                if device
+                    .0
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|event| event == "release")
+                {
+                    std::task::Poll::Ready(Ok(()))
+                } else {
+                    std::task::Poll::Pending
+                }
+            });
+            let error = press_and_release(&device, std::future::ready(press), interrupt)
+                .await
+                .unwrap_err();
+            assert!(error.starts_with("interrupted; "), "{error}");
+            assert!(error.contains(outcome), "{error}");
+            assert!(error.ends_with("; cleanup: confirmed"), "{error}");
+            assert_eq!(*device.0.lock().unwrap(), ["release"]);
+        }
+    }
+
+    /// Signals this process after the handlers are registered but before their future is first polled: a handler registered only on first poll leaves the signal its default disposition, which kills the child, so its exit status shows the ordering.
+    #[cfg(unix)]
+    #[test]
+    fn termination_signals_are_handled_from_registration() {
+        const CHILD: &str = "KVM_SIGNAL_REGISTRATION_TEST_CHILD";
+        let Some(signal) = std::env::var_os(CHILD) else {
+            for signal in ["TERM", "INT"] {
+                let result = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "tests::termination_signals_are_handled_from_registration",
+                    ])
+                    .env(CHILD, signal)
+                    .status()
+                    .unwrap();
+                assert!(result.success(), "SIG{signal}: {result}");
+            }
+            return;
+        };
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let interrupt = termination_signal();
+            let mut flag = std::ffi::OsString::from("-");
+            flag.push(&signal);
+            assert!(
+                std::process::Command::new("kill")
+                    .arg(flag)
+                    .arg(std::process::id().to_string())
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+            interrupt.await.unwrap();
+        });
+    }
+
+    #[tokio::test]
     async fn ambiguous_key_is_not_replayed_and_cleanup_runs() {
         let device = Fake(Default::default());
         let error = execute(&device, Command::Key { key: "KeyA".into() })
