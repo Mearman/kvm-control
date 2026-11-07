@@ -5,7 +5,8 @@ use kvm_core::{
     GpioOutput, GpioStatus, HidOutputs, HidStatus, JigglerStatus, KernelInfo, KeyboardLeds,
     KeyboardStatus, Limits, MediaDrive, MediaImage, MediaStatus, MouseMode, MouseStatus,
     PlatformInfo, PowerAction, Reported, Resolution, StoragePartition, StreamerFeatures,
-    StreamerStatus, SwitchPort, SwitchStatus, SystemInfo, VideoSource,
+    StreamerStatus, SwitchPort, SwitchStatus, SystemInfo, VideoSource, escape_json_for_terminal,
+    is_terminal_unsafe,
 };
 use proptest::{collection::vec, option, prelude::*};
 use serde_json::json;
@@ -416,6 +417,26 @@ proptest! {
         let capability = value.capability();
         prop_assert_eq!(value.value().is_some(), capability == Capability::Supported);
         prop_assert_eq!(serde_json::to_value(capability).unwrap(), serde_json::to_value(&value).unwrap()["support"].clone());
+    }
+
+    // Breaks if escaping changes the decoded JSON, or leaves a character that can drive a terminal (C1 controls such as U+009B, DEL, bidirectional controls) in the output.
+    #[test]
+    fn terminal_escaping_preserves_json_and_removes_unsafe_characters(
+        text in proptest::collection::vec(
+            prop_oneof![
+                any::<char>(),
+                proptest::sample::select(vec!['\u{1b}', '\u{7f}', '\u{9b}', '\u{202e}', '\u{2066}', '\n', '\t']),
+            ],
+            0..24,
+        )
+        .prop_map(String::from_iter),
+    ) {
+        let value = json!({"name": text, "list": [text.clone()]});
+        for serialised in [serde_json::to_string(&value).unwrap(), serde_json::to_string_pretty(&value).unwrap()] {
+            let escaped = escape_json_for_terminal(&serialised);
+            prop_assert!(!escaped.chars().any(|c| is_terminal_unsafe(c) && !matches!(c, '\n' | '\t' | '\r')), "{}", escaped);
+            prop_assert_eq!(serde_json::from_str::<serde_json::Value>(&escaped).unwrap(), value.clone());
+        }
     }
 
     // Breaks if a control operation loses a payload field or decodes as another variant.

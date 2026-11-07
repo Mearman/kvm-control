@@ -2,6 +2,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 mod status;
+mod terminal;
 
 pub use status::{
     AtxStatus, DeviceStatus, GpioInput, GpioOutput, GpioStatus, HidOutputs, HidStatus,
@@ -9,6 +10,7 @@ pub use status::{
     MediaStatus, MouseStatus, PlatformInfo, Reported, Resolution, StoragePartition,
     StreamerFeatures, StreamerStatus, SwitchPort, SwitchStatus, SystemInfo, VideoSource,
 };
+pub use terminal::{escape_json_for_terminal, is_terminal_unsafe};
 
 /// Failure of a [`Device`] or [`VideoStream`] operation.
 ///

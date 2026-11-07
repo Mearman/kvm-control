@@ -466,7 +466,9 @@ async fn main() {
                 && let Err(error) = writeln!(
                     io::stdout().lock(),
                     "{}",
-                    json!({"ok": true, "result": value})
+                    kvm_core::escape_json_for_terminal(
+                        &json!({"ok": true, "result": value}).to_string()
+                    )
                 )
             {
                 eprintln!("cannot write output: {error}");
@@ -474,7 +476,12 @@ async fn main() {
             }
         }
         Err(error) => {
-            eprintln!("{}", json!({"ok": false, "error": error}));
+            eprintln!(
+                "{}",
+                kvm_core::escape_json_for_terminal(
+                    &json!({"ok": false, "error": error}).to_string()
+                )
+            );
             std::process::exit(1);
         }
     }

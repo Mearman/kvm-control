@@ -839,12 +839,12 @@ fn key_name(code: KeyCode) -> Option<String> {
     }
 }
 
-/// Device-reported text with control characters escaped, so a device cannot send terminal control sequences through the status display.
+/// Device-reported text with control and bidirectional formatting characters escaped, so a device cannot send terminal control sequences or reorder the status display.
 fn untrusted(text: &str) -> String {
     text.chars()
         .flat_map(|c| {
-            if c.is_control() {
-                c.escape_default().collect::<Vec<_>>()
+            if kvm_core::is_terminal_unsafe(c) {
+                c.escape_unicode().collect::<Vec<_>>()
             } else {
                 vec![c]
             }
@@ -3262,7 +3262,7 @@ mod tests {
             gpio: Reported::Supported(GpioStatus {
                 inputs: Reported::Supported(Vec::new()),
                 outputs: Reported::Supported(vec![GpioOutput {
-                    channel: "lamp\u{1b}[2J".into(),
+                    channel: "lamp\u{1b}[2J\u{9b}\u{202e}".into(),
                     online: Reported::Supported(true),
                     busy: Reported::Supported(false),
                     state: Reported::Supported(true),
@@ -3276,8 +3276,8 @@ mod tests {
         assert!(summary.contains("HID: unsupported"));
         assert!(summary.contains("Power: power LED on, HDD LED unknown, idle"));
         assert!(summary.contains("Switch: active port 1, ports 0 1, unknown"));
-        assert!(summary.contains("GPIO: lamp\\u{1b}[2J on"));
-        assert!(!summary.contains('\u{1b}'));
+        assert!(summary.contains("GPIO: lamp\\u{1b}[2J\\u{9b}\\u{202e} on"));
+        assert!(!summary.contains(['\u{1b}', '\u{9b}', '\u{202e}']));
         assert!(summary.contains("Media: unsupported"));
         let mut terminal = Terminal::new(TestBackend::new(100, 20)).unwrap();
         let app = App {
