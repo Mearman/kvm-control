@@ -1817,18 +1817,6 @@ mod tests {
         assert!(stream.next_frame().await.unwrap().is_none());
     }
 
-    /// A parser for `response` charging `storage`, with its own read and storage timeout.
-    fn parser_with_timeout(
-        response: reqwest::Response,
-        storage: Arc<StreamStorage>,
-        timeout: Duration,
-    ) -> (Parser, watch::Sender<bool>) {
-        let (mut parser, lease) = parser(response, storage);
-        parser.timeout = timeout;
-        (parser, lease)
-    }
-
-    /// Holds all but `free` bytes of `storage` until dropped.
     /// Holds every byte of `storage` now free until dropped.
     fn held_available(storage: &Arc<StreamStorage>) -> OwnedSemaphorePermit {
         storage
