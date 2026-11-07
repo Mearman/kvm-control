@@ -514,6 +514,8 @@ impl Drop for TaskLock {
 /// Owns an explicit release's or a movement's outcome for the caller, and whether a failed outcome needs reporting if no caller sees it: for a release, a failure no one has seen (a failed release, or a request interrupted by runtime shutdown); for a movement, a submitted movement. Dropped before collecting, it reports that failure, since no caller will see it; an outcome not yet delivered is reported by the task that produces the outcome when delivery fails.
 struct Handover<'a> {
     device: &'a Kvmd,
+    // What the caller is told failed if the task producing the outcome ends without delivering it.
+    task: &'static str,
     outcome: Option<tokio::sync::oneshot::Receiver<(Result<()>, bool)>>,
 }
 
@@ -526,7 +528,7 @@ impl Handover<'_> {
             .await;
         self.outcome = None;
         outcome
-            .map_err(|_| Error::AmbiguousInput("release task failed".into()))?
+            .map_err(|_| Error::AmbiguousInput(format!("{} failed", self.task)))?
             .0
     }
 }
@@ -1381,6 +1383,7 @@ impl Device for Kvmd {
         // A delivered failure of a submitted movement that the caller never reads is reported when it drops the outcome, as for a key or button request; a failed state read or capability check sent nothing and is not reported.
         let handover = Handover {
             device: self,
+            task: "movement task",
             outcome: Some(result_rx),
         };
         tokio::spawn(async move {
@@ -1566,6 +1569,7 @@ impl Device for Kvmd {
         let (result_tx, result_rx) = tokio::sync::oneshot::channel();
         let handover = Handover {
             device: self,
+            task: "release task",
             outcome: Some(result_rx),
         };
         tokio::spawn(async move {
