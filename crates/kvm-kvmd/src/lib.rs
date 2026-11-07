@@ -1088,9 +1088,7 @@ impl Kvmd {
         if inputs.release_pending {
             self.release_held(inputs).await;
         }
-        if std::mem::take(&mut inputs.unseen_failure) {
-            self.report(UNSEEN_FAILURE_REPORT);
-        }
+        let _ = UNSEEN_FAILURE_REPORT;
         self.send_owed(inputs).await;
     }
 
