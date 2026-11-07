@@ -1458,6 +1458,66 @@ async fn release_after_cleanup_is_sent_again_after_approval() {
     server.abort();
 }
 
+/// Leaves a delivered press of `KeyA` uncollected, so it owes a release that cleanup scheduled on the current-thread test runtime has not yet started.
+async fn owe_key_a_release(calls: &Calls, device: &Kvmd) {
+    let woken = Arc::new(Woken(tokio::sync::Notify::new()));
+    let mut press = Box::pin(device.key("KeyA", true));
+    poll_once(press.as_mut(), &woken);
+    arrival(calls).await;
+    calls.4.notify_one();
+    within("the outcome to be delivered", woken.0.notified()).await;
+}
+
+// Pinned to the current-thread runtime: the cleanup scheduled by the drop cannot take the input lock before the login does, so only the login's settlement can send the owed release.
+#[tokio::test(flavor = "current_thread")]
+async fn login_cancelled_during_settlement_still_sends_the_owed_release() {
+    let (mut endpoint, ca, calls, server) = fixture().await;
+    endpoint.set_path("/gated/");
+    let device = client(endpoint, Some(ca));
+    owe_key_a_release(&calls, &device).await;
+    let woken = Arc::new(Woken(tokio::sync::Notify::new()));
+    let mut login = Box::pin(device.login_with_totp("test-user", "test-password", None));
+    poll_once(login.as_mut(), &woken);
+    drop(login);
+    drive(&calls, device.key("KeyC", true)).await.unwrap();
+    assert_eq!(
+        input_events(&calls),
+        [
+            "key=KeyA&state=true",
+            "key=KeyA&state=false",
+            "key=KeyC&state=true",
+        ]
+    );
+    server.abort();
+}
+
+// Pinned to the current-thread runtime for the same reason as the login case.
+#[tokio::test(flavor = "current_thread")]
+async fn approval_cancelled_during_settlement_still_sends_the_owed_release() {
+    let (mut endpoint, ca, calls, server) = fixture().await;
+    endpoint.set_path("/glgated/");
+    let device = profile_client(endpoint, Some(ca), DeviceProfile::GlKvm);
+    assert!(matches!(
+        device.login("test-user", "test-password").await.unwrap(),
+        LoginState::ApprovalPending { .. }
+    ));
+    owe_key_a_release(&calls, &device).await;
+    let woken = Arc::new(Woken(tokio::sync::Notify::new()));
+    let mut approval = Box::pin(device.complete_approval());
+    poll_once(approval.as_mut(), &woken);
+    drop(approval);
+    drive(&calls, device.key("KeyC", true)).await.unwrap();
+    assert_eq!(
+        input_events(&calls),
+        [
+            "key=KeyA&state=true",
+            "key=KeyA&state=false",
+            "key=KeyC&state=true",
+        ]
+    );
+    server.abort();
+}
+
 #[tokio::test]
 async fn expired_session_requires_explicit_reauthentication() {
     let (endpoint, ca, calls, server) = fixture().await;
