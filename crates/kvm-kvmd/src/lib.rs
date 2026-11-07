@@ -487,9 +487,11 @@ impl Drop for TaskLock {
     }
 }
 
-/// Owns an input request's outcome channel for the caller. Dropped before collecting, it closes the channel so delivery and abandonment cannot race: an outcome not yet delivered makes the input task send its own owed release before unlocking, and a delivered press queues its owed release and schedules it on the captured runtime. Needs no current runtime, so dropping outside one is safe.
+/// Owns an input request's outcome channel for the caller. Dropped before collecting, it closes the channel so delivery and abandonment cannot race: an outcome not yet delivered makes the input task send its own owed release before unlocking, and a delivered press queues its owed release and schedules it on the runtime the request ran on. A runtime that has since shut down never runs the scheduled task, and the queued release then goes to the next lock holder. Needs no current runtime, so dropping outside one is safe.
 struct Collect<'a> {
     device: &'a Kvmd,
+    // The runtime the request ran on, which held the input lock for it, rather than whichever runtime last took the lock.
+    runtime: tokio::runtime::Handle,
     outcome: Option<tokio::sync::oneshot::Receiver<(Result<()>, Option<Owed>)>>,
 }
 
@@ -522,19 +524,11 @@ impl Drop for Collect<'_> {
             .lock()
             .expect("owed releases lock poisoned")
             .push_back(owed);
-        if let Some(runtime) = self
-            .device
-            .input_runtime
-            .lock()
-            .expect("input runtime lock poisoned")
-            .clone()
-        {
-            let worker = self.device.input_worker();
-            runtime.spawn(async move {
-                let mut inputs = worker.inputs.lock().await;
-                worker.settle_owed(&mut inputs).await;
-            });
-        }
+        let worker = self.device.input_worker();
+        self.runtime.spawn(async move {
+            let mut inputs = worker.inputs.lock().await;
+            worker.settle_owed(&mut inputs).await;
+        });
     }
 }
 
@@ -1053,6 +1047,7 @@ impl Kvmd {
         let name = name.to_owned();
         let collect = Collect {
             device: self,
+            runtime: tokio::runtime::Handle::current(),
             outcome: Some(result_rx),
         };
         tokio::spawn(async move {
@@ -1423,12 +1418,14 @@ impl Device for Kvmd {
 
 impl Drop for Kvmd {
     fn drop(&mut self) {
+        // The runtime the owner is dropped on is running; outside one, the runtime that last took the input lock is the best remaining choice.
         if self.cleanup_on_drop
-            && let Some(runtime) = self
-                .input_runtime
-                .lock()
-                .expect("input runtime lock poisoned")
-                .clone()
+            && let Some(runtime) = tokio::runtime::Handle::try_current().ok().or_else(|| {
+                self.input_runtime
+                    .lock()
+                    .expect("input runtime lock poisoned")
+                    .clone()
+            })
         {
             let worker = self.input_worker();
             runtime.spawn(async move {

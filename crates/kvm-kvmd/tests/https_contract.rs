@@ -1319,6 +1319,83 @@ async fn abandoned_repeat_press_keeps_the_earlier_acknowledged_press() {
     server.abort();
 }
 
+#[test]
+fn uncollected_press_is_released_on_its_own_runtime() {
+    let server_runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let (mut endpoint, ca, calls, server) = server_runtime.block_on(fixture());
+    endpoint.set_path("/gated/");
+    let device = client(endpoint, Some(ca));
+    let woken = Arc::new(Woken(tokio::sync::Notify::new()));
+    let mut press = Box::pin(device.key("KeyA", true));
+    server_runtime.block_on(async {
+        poll_once(press.as_mut(), &woken);
+        arrival(&calls).await;
+        calls.4.notify_one();
+        within("the outcome to be delivered", woken.0.notified()).await;
+    });
+    // A later request on a short-lived runtime takes the input lock, and that runtime then shuts down.
+    let other_runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    other_runtime.block_on(drive(&calls, async {
+        device.key("KeyB", true).await.unwrap();
+        device.key("KeyB", false).await.unwrap();
+    }));
+    drop(other_runtime);
+    // With no later lock holder, only cleanup scheduled on the press's own runtime can send the owed release.
+    drop(press);
+    server_runtime.block_on(arrival(&calls));
+    calls.4.notify_one();
+    server_runtime
+        .block_on(drive(&calls, device.key("KeyC", true)))
+        .unwrap();
+    assert_eq!(
+        input_events(&calls),
+        [
+            "key=KeyA&state=true",
+            "key=KeyB&state=true",
+            "key=KeyB&state=false",
+            "key=KeyA&state=false",
+            "key=KeyC&state=true",
+        ]
+    );
+    server.abort();
+}
+
+#[test]
+fn owner_dropped_in_a_runtime_releases_inputs_there() {
+    let server_runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let (mut endpoint, ca, calls, server) = server_runtime.block_on(fixture());
+    endpoint.set_path("/gated/");
+    let device = client(endpoint, Some(ca));
+    // The press runs on a short-lived runtime, which is the last to take the input lock and then shuts down.
+    let input_runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    input_runtime
+        .block_on(drive(&calls, device.key("KeyA", true)))
+        .unwrap();
+    drop(input_runtime);
+    server_runtime.block_on(async {
+        drop(device);
+        arrival(&calls).await;
+        calls.4.notify_one();
+    });
+    assert_eq!(
+        input_events(&calls),
+        ["key=KeyA&state=true", "key=KeyA&state=false"]
+    );
+    server.abort();
+}
+
 #[tokio::test]
 async fn expired_session_requires_explicit_reauthentication() {
     let (endpoint, ca, calls, server) = fixture().await;
