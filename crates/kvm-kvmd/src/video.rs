@@ -753,7 +753,6 @@ impl Parser {
     fn discard(&mut self) {
         if let Some(validation) = self.validation.take() {
             validation.abort();
-            self.lost = true;
             if self.ended {
                 self.final_reclaimed = true;
             }
