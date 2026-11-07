@@ -2296,19 +2296,27 @@ mod tests {
         let hold = hold_all_but(&storage, 2 * MAX_HEADER);
         assert!(part_end(&frame) > 2 * MAX_HEADER);
         let (response, mut socket) = multipart().await;
-        // The headers and the start of the body: the part is reserved once body bytes arrive.
-        socket
-            .write_all(&body[..headers + b"\xff\xd8".len()])
-            .await
-            .unwrap();
-        let (video, _lease) = parser(response, storage.clone());
+        socket.write_all(&body[..headers]).await.unwrap();
+        let (mut video, _lease) = parser(response, storage.clone());
         let id = video.ledger.id;
+        let (copied_tx, mut copied) = tokio::sync::mpsc::unbounded_channel();
+        video.copied = Some(copied_tx);
         // The read and storage timeout is the bound, so only the consumer deadline, half of it, can end the second read within the bound.
         let mut stream = Mjpeg::start(video, BOUND / 2);
         let mut waiting = storage.waiting.subscribe();
         {
             let read = stream.next_frame();
             tokio::pin!(read);
+            let headers_copied = async { while copied.recv().await.unwrap() < headers {} };
+            tokio::select! {
+                result = &mut read => panic!("read finished before its headers: {result:?}"),
+                result = tokio::time::timeout(BOUND, headers_copied) => result.unwrap(),
+            }
+            // Body bytes arriving after the headers are parsed, more than the header buffer can hold, make the buffer grow to the part, which is what the reservation waits for.
+            socket
+                .write_all(&body[headers..headers + MAX_HEADER + 1])
+                .await
+                .unwrap();
             tokio::select! {
                 result = &mut read => panic!("read finished without storage: {result:?}"),
                 result = tokio::time::timeout(BOUND, waiting.wait_for(|waiting| waiting.contains(&id))) => {
