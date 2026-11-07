@@ -728,11 +728,17 @@ async fn owed_release_interrupted_by_runtime_shutdown_is_reported() {
             .unwrap();
         runtime.block_on(async move {
             let press = tokio::spawn(async move { pressing.key("KeyA", true).await });
-            pressed_rx.await.unwrap();
+            tokio::time::timeout(INPUT_TIMEOUT, pressed_rx)
+                .await
+                .unwrap()
+                .unwrap();
             press.abort();
             assert!(press.await.unwrap_err().is_cancelled());
             answer_tx.send(()).unwrap();
-            releasing_rx.await.unwrap();
+            tokio::time::timeout(INPUT_TIMEOUT, releasing_rx)
+                .await
+                .unwrap()
+                .unwrap();
         });
         // Shutdown drops the press's task with its owed release in flight. Its lock guard queues the owed release again, but the interrupted release took KeyA out of the tracked inputs and its last-request record, so the next lock holder skips it; no release is pending, so only the interrupted request marks the failure.
     })
@@ -1162,7 +1168,10 @@ async fn cancelled_waiter_cannot_replace_cleanup_runtime() {
     });
     let pressing = device.clone();
     let press = tokio::spawn(async move { pressing.key("KeyA", true).await });
-    accepted_rx.await.unwrap();
+    tokio::time::timeout(INPUT_TIMEOUT, accepted_rx)
+        .await
+        .unwrap()
+        .unwrap();
     let waiting = device.clone();
     std::thread::spawn(move || {
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -1182,7 +1191,7 @@ async fn cancelled_waiter_cannot_replace_cleanup_runtime() {
     finish_tx.send(()).unwrap();
     press.await.unwrap().unwrap();
     std::thread::spawn(move || drop(device)).join().unwrap();
-    tokio::time::timeout(Duration::from_secs(3), server)
+    tokio::time::timeout(INPUT_TIMEOUT, server)
         .await
         .unwrap()
         .unwrap();
@@ -1220,7 +1229,10 @@ async fn ambiguous_release_is_not_replayed_on_drop() {
     ));
     let inputs = device.inputs.clone();
     drop(device);
-    let listener = server.await.unwrap();
+    let listener = tokio::time::timeout(INPUT_TIMEOUT, server)
+        .await
+        .unwrap()
+        .unwrap();
     input_tasks_finished(&inputs).await;
     assert_no_waiting_connection(listener, "the ambiguous release was replayed");
 }
@@ -1249,7 +1261,7 @@ async fn drop_on_ordinary_thread_uses_captured_runtime() {
     });
     device.key("KeyA", true).await.unwrap();
     std::thread::spawn(move || drop(device)).join().unwrap();
-    tokio::time::timeout(Duration::from_secs(3), server)
+    tokio::time::timeout(INPUT_TIMEOUT, server)
         .await
         .unwrap()
         .unwrap();
