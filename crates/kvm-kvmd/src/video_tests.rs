@@ -590,8 +590,8 @@ async fn respond(stream: &mut tokio::net::TcpStream, status: &str, body: &[u8]) 
 }
 
 #[tokio::test]
-async fn movement_abandoned_during_its_state_read_is_not_sent_or_reported() {
-    // An answer that allows the movement, one that rejects the mouse mode, and a failed read: none sends a movement or reports anything once the caller has gone.
+async fn movement_abandoned_during_its_state_read_is_not_sent_and_its_read_failure_not_reported() {
+    // An answer that allows the movement, one that rejects the mouse mode, and a failed read: once the caller has gone during the read, none sends a movement or reports anything. Not covered: a caller leaving after the last abandonment check but before the outcome is delivered, where only the check that the movement was submitted keeps a read failure unreported; that needs a drop from another thread at an exact moment, which no signal here can order.
     for (status, body) in [
         (
             "200 OK",
