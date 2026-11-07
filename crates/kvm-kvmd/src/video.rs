@@ -1940,11 +1940,18 @@ mod tests {
         })
         .await;
         drop(waiter);
-        socket.write_all(&body[sent..]).await.unwrap();
+        // The rest is larger than the socket buffers can hold while the stream is not reading, so it is written while the next read drops it.
+        let rest = body[sent..].to_vec();
+        let writer = tokio::spawn(async move { socket.write_all(&rest).await });
         assert!(matches!(
-            idle.next_frame().await,
+            tokio::time::timeout(BOUND, idle.next_frame()).await.unwrap(),
             Err(Error::Transport(message)) if message == "video frame storage reclaimed for a waiting stream"
         ));
+        tokio::time::timeout(BOUND, writer)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
     }
 
     #[tokio::test]
