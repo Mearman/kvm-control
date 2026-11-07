@@ -549,7 +549,11 @@ fn assert_clean_run(run: &VideoRun) {
         "{}",
         String::from_utf8_lossy(&run.output.stderr)
     );
-    assert!(run.output.stderr.is_empty());
+    // The only diagnostic a successful video run may emit is the warning for the test's --insecure-tls.
+    assert_eq!(
+        String::from_utf8_lossy(&run.output.stderr),
+        "warning: TLS certificate verification is disabled\n"
+    );
     for secret in ["synthetic-password", SESSION_COOKIE] {
         assert!(!String::from_utf8_lossy(&run.output.stdout).contains(secret));
     }
