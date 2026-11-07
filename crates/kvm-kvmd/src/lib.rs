@@ -1016,7 +1016,7 @@ impl Kvmd {
         let (result, released) = self.release_owed(inputs).await;
         let released: Vec<_> = released
             .into_iter()
-            .filter(|(kind, name)| !inputs.uncertain(*kind).contains(name))
+            .filter(|(kind, _)| !inputs.uncertain(*kind).contains(&String::new()))
             .collect();
         inputs.cleaned.extend(released);
         if let Err(error) = result {
