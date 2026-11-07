@@ -40,7 +40,7 @@ jobs:
         run: cargo test --locked --manifest-path examples/in-process/Cargo.toml
 
   release-archives:
-    if: github.base_ref == 'main'
+    if: github.base_ref == 'main' || github.base_ref == 'implementation'
     strategy:
       fail-fast: false
       matrix:
