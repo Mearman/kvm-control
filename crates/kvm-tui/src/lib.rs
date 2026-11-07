@@ -1040,6 +1040,17 @@ struct ImagePicker {
     tmux: bool,
 }
 
+fn tmux_passthrough_warning(
+    tmux: bool,
+    protocol: ratatui_image::picker::ProtocolType,
+) -> Option<&'static str> {
+    if tmux && protocol != ratatui_image::picker::ProtocolType::Halfblocks {
+        Some("Native images in tmux require allow-passthrough to be enabled externally")
+    } else {
+        None
+    }
+}
+
 impl ImagePicker {
     #[cfg(test)]
     fn halfblocks() -> Self {
@@ -1296,6 +1307,16 @@ where
         terminal
             .draw(|frame| {
                 draw(frame, &app);
+                if let Some(warning) = tmux_passthrough_warning(picker.tmux, picker.protocol) {
+                    let area = frame.area();
+                    let row = ratatui::layout::Rect::new(
+                        area.x,
+                        area.y,
+                        area.width,
+                        u16::from(area.height > 0),
+                    );
+                    frame.render_widget(Paragraph::new(warning), row);
+                }
                 if let Some(image) = &app.video {
                     let areas = Layout::vertical([
                         Constraint::Length(3),
@@ -3043,6 +3064,24 @@ mod tests {
             self.calls.borrow_mut().push("mouse_off");
             Ok(())
         }
+    }
+
+    #[test]
+    fn tmux_native_protocols_warn_about_passthrough() {
+        use ratatui_image::picker::ProtocolType;
+        for protocol in [
+            ProtocolType::Kitty,
+            ProtocolType::Sixel,
+            ProtocolType::Iterm2,
+        ] {
+            assert!(
+                tmux_passthrough_warning(true, protocol)
+                    .unwrap()
+                    .contains("allow-passthrough")
+            );
+            assert!(tmux_passthrough_warning(false, protocol).is_none());
+        }
+        assert!(tmux_passthrough_warning(true, ProtocolType::Halfblocks).is_none());
     }
 
     #[test]

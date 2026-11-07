@@ -11,7 +11,7 @@ use url::Url;
 #[derive(Parser)]
 #[command(
     about = "Interactive KVMD terminal client",
-    after_help = "Set KVM_TUI_IMAGE_PROTOCOL to halfblocks, kitty, sixel or iterm2 to select an image protocol explicitly."
+    after_help = "Set KVM_TUI_IMAGE_PROTOCOL to halfblocks, kitty, sixel or iterm2 to select an image protocol explicitly. Native protocols in tmux require allow-passthrough to be enabled externally; the application does not change tmux settings."
 )]
 struct Args {
     /// Device base HTTPS URL, without credentials
