@@ -513,7 +513,6 @@ impl Drop for Collect<'_> {
         let Some(mut outcome) = self.outcome.take() else {
             return;
         };
-        outcome.close();
         // Empty or closed: the task sees the failed delivery under the lock and cleans up itself, or it was dropped mid-request and recorded the request as ambiguous.
         if outcome.try_recv().is_err() {
             return;
