@@ -686,3 +686,63 @@ fn video_ends_when_the_device_stops_streaming() {
     assert_clean_run(&run);
     assert_eq!(decoded_frames(&frame_records(&run.output)), sent);
 }
+
+// Breaks if header authentication logs in with a form, sends its credentials anywhere but the KVMD headers, or reads status before the device has confirmed them.
+#[test]
+fn header_authentication_is_checked_before_status() {
+    let ok = b"{\"ok\":true,\"result\":{}}";
+    let (output, requests) = invoke(
+        &["--auth", "header", "status"],
+        vec![ok, ok, ok, ok, ok, ok, ok, ok],
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        requests[0].starts_with("GET /api/auth/check "),
+        "{}",
+        requests[0]
+    );
+    for (request, route) in requests[1..]
+        .iter()
+        .zip(["info", "hid", "streamer", "atx", "switch", "gpio", "msd"])
+    {
+        assert!(
+            request.starts_with(&format!("GET /api/{route} ")),
+            "{request}"
+        );
+    }
+    assert_eq!(requests.len(), 8);
+    for request in &requests {
+        assert_eq!(header_value(request, "x-kvmd-user"), Some("synthetic"));
+        assert_eq!(
+            header_value(request, "x-kvmd-passwd"),
+            Some("synthetic-password")
+        );
+        assert!(!request.contains("/api/auth/login"));
+    }
+}
+
+// Breaks if the endpoint is validated only after the password is read: with nothing on standard input, reading first would report an empty password instead.
+#[test]
+fn an_invalid_endpoint_is_reported_before_the_password_is_read() {
+    let output = Command::new(env!("CARGO_BIN_EXE_kvm-cli"))
+        .args([
+            "--endpoint",
+            "http://localhost:1",
+            "--profile",
+            "pikvm",
+            "--username",
+            "synthetic",
+            "--password-stdin",
+            "status",
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("endpoint must be an HTTPS URL"), "{stderr}");
+}

@@ -35,7 +35,7 @@ struct Cli {
     #[arg(long, value_enum, default_value = "cookie")]
     auth: Auth,
     /// PEM certificate authority to trust
-    #[arg(long)]
+    #[arg(long, conflicts_with = "insecure_tls")]
     ca: Option<PathBuf>,
     /// Disable TLS certificate verification for this connection
     #[arg(long)]
@@ -423,6 +423,11 @@ async fn run(cli: Cli) -> Result<Value, String> {
     if cli.totp && matches!(cli.auth, Auth::Header) {
         return Err("TOTP requires cookie authentication; header authentication would reuse an expiring code".into());
     }
+    // Opening validates the endpoint and the CA without contacting the device, so a mistake there is reported before any secret is read.
+    let connection = KvmdConnector
+        .open(endpoint)
+        .await
+        .map_err(|e| e.to_string())?;
     let mut credentials =
         Credentials::new(cli.username, Zeroizing::new(password(cli.password_stdin)?));
     if cli.totp {
@@ -431,9 +436,8 @@ async fn run(cli: Cli) -> Result<Value, String> {
                 .map_err(|_| "could not read TOTP from terminal")?,
         ));
     }
-    // The credentials are consumed by the login, which drops and so clears them once it has sent them. Under header authentication the connector also checks them with the device.
-    let connection = match KvmdConnector
-        .connect(endpoint, credentials)
+    // The credentials are consumed by the login, which drops and so clears them once it has sent them. Under header authentication they are then checked with the device.
+    let connection = match Connected::authenticate(connection, credentials)
         .await
         .map_err(|e| e.to_string())?
     {
@@ -950,6 +954,24 @@ mod tests {
             "status",
         ];
         assert!(Cli::try_parse_from(args).is_err());
+    }
+
+    // Breaks if a CA file can be given while verification is disabled, where it would be ignored unread.
+    #[test]
+    fn ca_conflicts_with_insecure_tls() {
+        let base = [
+            "kvm",
+            "--endpoint",
+            "https://example.com",
+            "--profile",
+            "pikvm",
+            "--username",
+            "user",
+            "--ca",
+            "ca.pem",
+        ];
+        assert!(Cli::try_parse_from(base.iter().chain(&["status"])).is_ok());
+        assert!(Cli::try_parse_from(base.iter().chain(&["--insecure-tls", "status"])).is_err());
     }
 
     #[test]

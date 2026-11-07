@@ -29,7 +29,7 @@ struct Args {
     #[arg(long)]
     totp: bool,
     /// PEM certificate authority to trust
-    #[arg(long)]
+    #[arg(long, conflicts_with = "insecure_tls")]
     ca: Option<PathBuf>,
     /// Disable TLS verification for this connection
     #[arg(long)]
@@ -59,6 +59,13 @@ mod tests {
             )),
             "{error}"
         );
+    }
+
+    // Breaks if a CA file can be given while verification is disabled, where it would be ignored unread.
+    #[test]
+    fn ca_conflicts_with_insecure_tls() {
+        assert!(Args::try_parse_from(["kvm-tui", "--ca", "ca.pem", "--insecure-tls"]).is_err());
+        assert!(Args::try_parse_from(["kvm-tui", "--ca", "ca.pem"]).is_ok());
     }
 }
 
@@ -106,11 +113,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             _ => return Err("unknown device profile".into()),
         },
     };
-    let username = match args.username {
-        Some(username) => username,
-        None => prompt("Username")?,
-    };
-    let password = zeroize::Zeroizing::new(rpassword::prompt_password("Password: ")?);
     if args.insecure_tls {
         eprintln!("Warning: TLS certificate verification is disabled");
     }
@@ -131,13 +133,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
         timeout: Duration::from_secs(15),
     };
+    // Opening validates the endpoint and the CA without contacting the device, so a mistake there is reported before any secret is asked for.
+    let connection = KvmdConnector.open(endpoint).await?;
+    let username = match args.username {
+        Some(username) => username,
+        None => prompt("Username")?,
+    };
+    let password = zeroize::Zeroizing::new(rpassword::prompt_password("Password: ")?);
     let mut credentials = Credentials::new(username, password);
     if args.totp {
         credentials = credentials.with_totp(zeroize::Zeroizing::new(rpassword::prompt_password(
             "TOTP code: ",
         )?));
     }
-    let connection = match KvmdConnector.connect(endpoint, credentials).await? {
+    let connection = match Connected::authenticate(connection, credentials).await? {
         Connected::Authenticated(connection) => connection,
         Connected::ApprovalPending {
             connection,
