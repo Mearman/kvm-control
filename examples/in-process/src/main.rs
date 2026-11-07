@@ -107,10 +107,7 @@ impl Device for FakeDevice {
 // A consumer depends on the public contract, not on a particular device implementation.
 async fn consume(device: &dyn Device) -> Result<ControlOutcome> {
     let capabilities = device.capabilities().await?;
-    if capabilities.status != Capability::Supported {
-        return Err(Error::Unsupported("status".into()));
-    }
-    // Status reports which switch ports exist, so the consumer picks one the device has rather than guessing.
+    // Status is read whatever its capability says: each subsystem reports its own support, and the switch subsystem reports which ports exist, so the consumer picks one the device has rather than guessing.
     let status = device.status().await?;
     let switch = status
         .switch
