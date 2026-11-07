@@ -32,12 +32,12 @@ pub(crate) const STREAM_STORAGE_BYTES: usize = (crate::MAX_JPEG_VALIDATIONS + 1)
 
 /// A budget of compressed bytes shared by MJPEG streams, the streams waiting for it, and the decoder slots their frames are validated in.
 ///
-/// A stream charges every byte it holds from the device in a buffer of its own: its parse buffer's allocation, and each frame it has parsed until a consumer takes it, the frame dropped, or its validation ended (a validation that has started decoding cannot be interrupted and releases the frame when it finishes). A chunk the HTTP client has received and the stream has not yet copied is a slice of the connection's own read buffer, which every open connection has whether or not a stream holds a slice of it; it is not charged, and a stream holds one only while it reads into its buffer, as the oldest waiting stream, or after a cancelled read until another stream waits.
+/// A stream charges every byte it holds from the device in a buffer of its own: its parse buffer's allocation, and each frame it has parsed until a consumer takes it, the frame is dropped, or its validation ends (a validation that has started decoding cannot be interrupted and releases the frame when it finishes). A chunk the HTTP client has received and the stream has not yet copied is a slice of the connection's own read buffer, which every open connection has whether or not a stream holds a slice of it, so it is not charged. A stream keeps the rest of such a chunk beyond what it is reading: while it copies the chunk, while it waits for storage, and while it is idle after a read stopped part way through the chunk, most often after an exact-length part, when the rest of the chunk that completed the part holds the start of the next one, or after a cancelled read. It drops the slice only together with charged bytes it gives up, since dropping it alone would free nothing a waiting stream can use.
 ///
 /// A stream that cannot charge what it needs registers as waiting, and other streams yield to waiters so that neither idle nor partly read streams can starve it:
 ///
-/// - a stream with no consumer read outstanding releases everything it holds while any stream waits: its buffered bytes and any received chunk, an unclaimed frame, and a frame waiting for or undergoing validation. It resynchronises on the next delimiter when it is read again, and a final frame given up this way is reported as an error;
-/// - only the oldest waiting stream acquires storage; a younger waiting stream releases its partial part and any received chunk and waits until no older stream is waiting, so waiting streams never hold storage each other need.
+/// - a stream with no consumer read outstanding that holds charged storage releases it while any stream waits: its buffered bytes with any received chunk, an unclaimed frame, and a frame waiting for or undergoing validation. It resynchronises on the next delimiter when it is read again, and a final frame given up this way, or a final part it was reading, is reported as an error;
+/// - only the oldest waiting stream acquires storage; a younger waiting stream stays registered, releases any charged storage it holds (its partial part and any received chunk) and waits, reading nothing further from the device, until no older stream is waiting or its timeout passes. Waiting streams therefore never hold storage each other need.
 ///
 /// The oldest waiter therefore waits only for streams that are reading or validating, which release their storage when their frame is delivered or dropped, the stream ends, or it times out.
 pub(crate) struct StreamStorage {
@@ -46,6 +46,9 @@ pub(crate) struct StreamStorage {
     waiting: watch::Sender<BTreeSet<u64>>,
     next_stream: AtomicU64,
     decoders: Arc<Semaphore>,
+    /// How many times a stream has given up its storage to an older waiting stream.
+    #[cfg(test)]
+    yielded: std::sync::atomic::AtomicUsize,
 }
 
 impl StreamStorage {
@@ -62,6 +65,8 @@ impl StreamStorage {
             waiting: watch::Sender::new(BTreeSet::new()),
             next_stream: AtomicU64::new(0),
             decoders,
+            #[cfg(test)]
+            yielded: std::sync::atomic::AtomicUsize::new(0),
         })
     }
 
@@ -171,6 +176,9 @@ struct Parser {
     scanned: usize,
     #[cfg(test)]
     scan_progress: Option<tokio::sync::mpsc::UnboundedSender<usize>>,
+    /// The capacity of the buffer after each growth.
+    #[cfg(test)]
+    growths: Vec<usize>,
     lease: JoinHandle<()>,
     lease_state: watch::Receiver<bool>,
     timeout: Duration,
@@ -640,6 +648,8 @@ impl Parser {
             scanned: 0,
             #[cfg(test)]
             scan_progress: None,
+            #[cfg(test)]
+            growths: Vec::new(),
             lease,
             lease_state,
             timeout,
@@ -649,9 +659,9 @@ impl Parser {
         }
     }
 
-    /// Whether the stream holds anything a waiting stream could reclaim: charged bytes, a received chunk, or a frame waiting for or undergoing validation.
+    /// Whether the stream holds storage a waiting stream could reclaim: charged bytes, or a frame waiting for or undergoing validation. An uncharged received chunk does not count, since giving it up frees nothing a waiting stream can use.
     fn holds_storage(&self) -> bool {
-        self.ledger.held.num_permits() > 0 || !self.incoming.is_empty() || self.validation.is_some()
+        self.ledger.held.num_permits() > 0 || self.validation.is_some()
     }
 
     /// Releases the charge beyond the buffer's allocation, which is everything the ledger covers.
@@ -667,7 +677,7 @@ impl Parser {
     /// Charges the buffer's whole allocation, including any the allocator granted beyond the request, then releases the rest of the charge.
     async fn settle(&mut self) -> Read<()> {
         let footprint = self.buffer.capacity();
-        self.reserve(footprint, footprint).await?;
+        self.reserve(footprint).await?;
         self.release_excess();
         Ok(())
     }
@@ -690,8 +700,8 @@ impl Parser {
         self.release_excess();
     }
 
-    /// Charges the stream for holding `need` bytes in all, or `prefer` bytes when that many are free at once, waiting at most the read timeout. Only the oldest waiting stream acquires: while an older stream waits, this one releases what it holds, returning `Reclaimed`, or waits until no older stream is waiting.
-    async fn reserve(&mut self, need: usize, prefer: usize) -> Read<()> {
+    /// Charges the stream for holding `need` bytes in all, waiting at most the read timeout. Only the oldest waiting stream acquires: while an older stream waits, this one stays registered as waiting, releases any storage it holds (returning `Reclaimed` once no older stream waits, so the read restarts after the bytes it dropped) and waits until no older stream is waiting, without reading further from the device. A stream still waiting when the timeout passes fails with "video stream storage exhausted".
+    async fn reserve(&mut self, need: usize) -> Read<()> {
         let storage = self.ledger.storage.clone();
         if need > storage.capacity {
             return Err(storage_exceeded().into());
@@ -710,34 +720,33 @@ impl Parser {
             if need <= held {
                 return Ok(());
             }
-            let first = if prefer <= storage.capacity {
-                prefer
-            } else {
-                need
-            };
-            for total in [first, need] {
-                if let Ok(permit) = storage
-                    .bytes
-                    .clone()
-                    .try_acquire_many_owned(permits(total - held)?)
-                {
-                    self.ledger.held.merge(permit);
-                    return Ok(());
-                }
+            if let Ok(permit) = storage
+                .bytes
+                .clone()
+                .try_acquire_many_owned(permits(need - held)?)
+            {
+                self.ledger.held.merge(permit);
+                return Ok(());
             }
             if waiting.is_none() {
                 waiting = Some(Waiting::new(storage.clone(), id));
             }
-            let deferred = older_waiting(&pressure.borrow());
-            if deferred {
-                if held > 0 || !self.incoming.is_empty() {
+            if older_waiting(&pressure.borrow()) {
+                // Charged storage goes to the older stream; an uncharged received chunk frees nothing it can use, so it is kept unless it is part of what is dropped.
+                let reclaimed = held > 0;
+                if reclaimed {
                     self.discard();
-                    return Err(ReadError::Reclaimed);
+                    #[cfg(test)]
+                    storage.yielded.fetch_add(1, Ordering::Release);
                 }
                 tokio::select! {
-                    _ = pressure.wait_for(|waiting| !older_waiting(waiting)) => continue,
+                    _ = pressure.wait_for(|waiting| !older_waiting(waiting)) => {}
                     () = tokio::time::sleep_until(deadline) => return Err(exhausted()),
                 }
+                if reclaimed {
+                    return Err(ReadError::Reclaimed);
+                }
+                continue;
             }
             tokio::select! {
                 permit = storage.bytes.clone().acquire_many_owned(permits(need - held)?) => {
@@ -750,7 +759,7 @@ impl Parser {
         }
     }
 
-    /// Copies received bytes into the buffer, which never holds more than `limit` bytes; bytes beyond it stay in `incoming` for the next read. With `exact`, `limit` is the known end of the part and the buffer grows straight to it; otherwise it doubles while that storage is free, so the copying stays linear in the part's length, and grows only as far as needed when it is not. A buffer grows by copying into a new allocation, and both allocations are charged during the copy.
+    /// Copies received bytes into the buffer, which never holds more than `limit` bytes; bytes beyond it stay in `incoming` for the next read. With `exact`, `limit` is the known end of the part and the buffer grows straight to it. Otherwise each growth at least doubles the buffer's capacity, up to `limit`, waiting for that storage when it is not free, so a part is copied a number of times logarithmic in its length and the bytes copied stay linear in it. A buffer grows by copying into a new allocation, and both allocations are charged during the copy, so a buffer at most `limit` long peaks below twice `limit`.
     async fn fill(&mut self, limit: usize, exact: bool) -> Read<bool> {
         if self.incoming.is_empty() {
             if !*self.lease_state.borrow() {
@@ -781,20 +790,17 @@ impl Parser {
         let len = self.buffer.len() + count;
         let capacity = self.buffer.capacity();
         if len > capacity {
-            let (need, prefer) = if exact {
-                (limit, limit)
+            let target = if exact {
+                limit
             } else {
-                (len, len.max(capacity.saturating_mul(2).min(limit)))
+                len.max(capacity.saturating_mul(2).min(limit))
             };
-            self.reserve(capacity + need, capacity + prefer).await?;
-            let target = if self.ledger.held.num_permits() >= capacity + prefer {
-                prefer
-            } else {
-                need
-            };
+            self.reserve(capacity + target).await?;
             let mut grown = Vec::with_capacity(target);
             grown.extend_from_slice(&self.buffer);
             self.buffer = grown;
+            #[cfg(test)]
+            self.growths.push(self.buffer.capacity());
         }
         let chunk = std::mem::take(&mut self.incoming);
         absorb_chunk(&mut self.buffer, &mut self.incoming, chunk, limit)?;
@@ -854,8 +860,8 @@ impl VideoStream for Parser {
 }
 
 impl Parser {
-    /// Skips to the start of the next part's headers after discarded bytes, keeping only enough of the buffer to find a delimiter split across reads.
-    async fn resynchronise(&mut self) -> Read<Option<()>> {
+    /// Skips to the start of the next part's headers after discarded bytes, keeping only enough of the buffer to find a delimiter split across reads. Bytes are discarded only from inside a part, so a final delimiter found here closes a part that was given up, and the stream ends reporting that its final frame was reclaimed.
+    async fn resynchronise(&mut self) -> Read<()> {
         let delimiter = [b"\r\n".as_slice(), self.boundary.as_slice()].concat();
         loop {
             if let Some(relative) = find(&self.buffer[self.scan_offset..], &delimiter) {
@@ -872,12 +878,12 @@ impl Parser {
                         self.buffer.drain(..end);
                         self.scan_offset = 0;
                         self.resync = false;
-                        return Ok(Some(()));
+                        return Ok(());
                     }
                     b"--" => {
                         self.ended = true;
                         self.lease.abort();
-                        return Ok(None);
+                        return Err(storage_reclaimed().into());
                     }
                     _ => self.scan_offset = pos + 1,
                 }
@@ -912,8 +918,8 @@ impl Parser {
         if !*self.lease_state.borrow() {
             return Err(Error::Transport("stream lease ended".into()).into());
         }
-        if self.resync && self.resynchronise().await?.is_none() {
-            return Ok(None);
+        if self.resync {
+            self.resynchronise().await?;
         }
         if self.first {
             let marker = [self.boundary.as_slice(), b"\r\n"].concat();
@@ -1024,7 +1030,7 @@ impl Parser {
         } else if self.buffer.len() > rest_start {
             // The bytes after this part move to a buffer of their own, so the frame keeps the old allocation without a copy; both are charged while the move is made.
             let total = self.buffer.capacity() + self.buffer.len() - rest_start;
-            self.reserve(total, total).await?;
+            self.reserve(total).await?;
         }
         let rest = self.buffer.split_off(rest_start);
         let mut frame = std::mem::replace(&mut self.buffer, rest);
@@ -1368,31 +1374,37 @@ mod tests {
         ));
     }
 
-    #[tokio::test]
+    // A current-thread runtime, with the steps run in a spawned task, so that `yield_now` deterministically runs every task already woken before this one resumes: tokio documents that a yielding task is re-added at the back of the pending queue and that other pending tasks are scheduled first (https://docs.rs/tokio/1.54.1/tokio/task/fn.yield_now.html). An expiry or reclaim task woken by the waiter's registration would therefore act before the read resumes.
+    #[tokio::test(flavor = "current_thread")]
     async fn final_frame_being_read_is_not_reclaimed() {
-        let storage = StreamStorage::new(1);
-        let (mut stream, ack, release) = final_frame_actor(&storage, Duration::from_secs(60));
-        let mut read = Box::pin(stream.next_frame());
-        tokio::select! {
-            result = &mut read => panic!("read completed before the actor finished: {result:?}"),
-            result = ack => result.unwrap(),
-        }
-        // The read has claimed the final frame and is joining the actor when another stream starts waiting. Yielding runs every task the registration woke, as an expiry or reclaim task would be, before the read resumes.
-        let waiter = Waiting::new(storage.clone(), u64::MAX);
-        tokio::task::yield_now().await;
-        release.send(()).unwrap();
-        assert_eq!(
-            tokio::time::timeout(BOUND, read)
-                .await
-                .unwrap()
-                .unwrap()
-                .unwrap()
-                .jpeg,
-            vec![1, 2, 3]
-        );
-        drop(waiter);
-        assert!(stream.expiry.is_none());
-        assert_eq!(storage.available(), 1);
+        tokio::spawn(async {
+            let storage = StreamStorage::new(1);
+            let (mut stream, ack, release) =
+                final_frame_actor(&storage, Duration::from_secs(60));
+            let mut read = Box::pin(stream.next_frame());
+            tokio::select! {
+                result = &mut read => panic!("read completed before the actor finished: {result:?}"),
+                result = ack => result.unwrap(),
+            }
+            // The read has claimed the final frame and is joining the actor when another stream starts waiting.
+            let waiter = Waiting::new(storage.clone(), u64::MAX);
+            tokio::task::yield_now().await;
+            release.send(()).unwrap();
+            assert_eq!(
+                tokio::time::timeout(BOUND, read)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap()
+                    .jpeg,
+                vec![1, 2, 3]
+            );
+            drop(waiter);
+            assert!(stream.expiry.is_none());
+            assert_eq!(storage.available(), 1);
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
@@ -1552,18 +1564,19 @@ mod tests {
         let (mut older, _older_lease) = parser(older_response, storage.clone());
         let (mut younger, _younger_lease) = parser(younger_response, storage.clone());
         assert!(older.ledger.id < younger.ledger.id);
-        assert!(older.reserve(HOLD, HOLD).await.is_ok());
-        assert!(younger.reserve(HOLD, HOLD).await.is_ok());
+        assert!(older.reserve(HOLD).await.is_ok());
+        assert!(younger.reserve(HOLD).await.is_ok());
         assert!(2 * HOLD + (NEED - HOLD) > storage.capacity());
         let (older_result, younger_result) =
-            tokio::join!(older.reserve(NEED, NEED), younger.reserve(NEED, NEED));
+            tokio::join!(older.reserve(NEED), younger.reserve(NEED));
         assert!(older_result.is_ok());
+        // The younger stream gave up its storage, and reports it only once the older one no longer waits.
         assert!(matches!(younger_result, Err(ReadError::Reclaimed)));
+        assert_eq!(storage.yielded.load(Ordering::Acquire), 1);
         assert_eq!(older.ledger.held.num_permits(), NEED);
         assert_eq!(younger.ledger.held.num_permits(), 0);
-        // The younger stream acquires once the older one no longer waits.
         drop(older);
-        assert!(younger.reserve(NEED, NEED).await.is_ok());
+        assert!(younger.reserve(NEED).await.is_ok());
     }
 
     #[tokio::test]
@@ -1635,6 +1648,248 @@ mod tests {
         decoders.add_permits(1);
         assert_eq!(stream.next_frame().await.unwrap().unwrap().jpeg, later);
         assert!(stream.next_frame().await.unwrap().is_none());
+    }
+
+    /// A parser for `response` charging `storage`, with its own read and storage timeout.
+    fn parser_with_timeout(
+        response: reqwest::Response,
+        storage: Arc<StreamStorage>,
+        timeout: Duration,
+    ) -> (Parser, watch::Sender<bool>) {
+        let (mut parser, lease) = parser(response, storage);
+        parser.timeout = timeout;
+        (parser, lease)
+    }
+
+    /// Holds all but `free` bytes of `storage` until dropped.
+    fn hold_all_but(storage: &Arc<StreamStorage>, free: usize) -> OwnedSemaphorePermit {
+        storage
+            .bytes
+            .clone()
+            .try_acquire_many_owned(u32::try_from(storage.capacity() - free).unwrap())
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn younger_waiting_stream_keeps_uncharged_chunk() {
+        let storage = StreamStorage::new(100);
+        let older = Ledger::new(storage.clone());
+        let (response, _socket) = multipart().await;
+        let (mut younger, _lease) = parser(response, storage.clone());
+        younger.incoming = bytes::Bytes::from_static(b"start of the next part");
+        // An uncharged chunk alone is nothing an idle stream gives up.
+        assert!(!younger.holds_storage());
+        let hold = hold_all_but(&storage, 0);
+        let waiter = Waiting::new(storage.clone(), older.id);
+        let mut registered = storage.waiting.subscribe();
+        {
+            let reserve = younger.reserve(10);
+            tokio::pin!(reserve);
+            tokio::select! {
+                result = &mut reserve => panic!("acquired while an older stream waited: {:?}", result.is_ok()),
+                _ = registered.wait_for(|waiting| waiting.len() == 2) => {}
+            }
+            drop((waiter, hold));
+            assert!(tokio::time::timeout(BOUND, reserve).await.unwrap().is_ok());
+        }
+        assert_eq!(&younger.incoming[..], b"start of the next part");
+        assert_eq!(storage.yielded.load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test]
+    async fn unlengthed_part_grows_geometrically_under_contention() {
+        const CHUNK: usize = 1000;
+        const LIMIT: usize = 64 * CHUNK;
+        // Free storage fits every doubling copy up to a buffer of `LIMIT / 2` (`3 * LIMIT / 4` with both allocations) and an exact-fit copy just past it, but not the doubling copy from `LIMIT / 2` to `LIMIT` (`3 * LIMIT / 2`). Growing to fit would succeed there, one chunk at a time.
+        const FREE: usize = 5 * LIMIT / 4;
+        let storage = StreamStorage::new(STREAM_STORAGE_BYTES);
+        let (response, _socket) = multipart().await;
+        let (mut video, _lease) = parser(response, storage.clone());
+        let mut hold = Some(hold_all_but(&storage, FREE));
+        let mut waiting = storage.waiting.subscribe();
+        for _ in 0..LIMIT / CHUNK {
+            video.incoming = bytes::Bytes::from(vec![b'a'; CHUNK]);
+            let fill = video.fill(LIMIT, false);
+            tokio::pin!(fill);
+            loop {
+                tokio::select! {
+                    result = &mut fill => {
+                        assert!(matches!(result, Ok(true)));
+                        break;
+                    }
+                    // The doubling copy waits for storage; the other holder then gives it up.
+                    _ = waiting.wait_for(|waiting| !waiting.is_empty()), if hold.is_some() => hold = None,
+                }
+            }
+        }
+        assert!(hold.is_none(), "the doubling copy did not wait for storage");
+        assert_eq!(video.buffer.len(), LIMIT);
+        assert_eq!(video.growths.first(), Some(&CHUNK));
+        for step in video.growths.windows(2) {
+            assert!(
+                step[1] >= (2 * step[0]).min(LIMIT),
+                "growth from {} to {} copies the buffer again within a doubling",
+                step[0],
+                step[1]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn idle_stream_reports_its_reclaimed_final_part() {
+        const FRAME: usize = 1024 * 1024;
+        let last = padded_jpeg([64, 128, 192], FRAME);
+        let body = part(&last, true, true);
+        let storage = StreamStorage::new(STREAM_STORAGE_BYTES);
+        let sent = part(&last, true, false).len() - last.len() + FRAME / 2;
+        const { assert!(FRAME / 2 > MAX_HEADER) };
+        let (response, mut socket) = multipart().await;
+        socket.write_all(&body[..sent]).await.unwrap();
+        let (idle_parser, _lease) = parser(response, storage.clone());
+        let mut idle = Mjpeg::start(idle_parser, BOUND);
+        {
+            let mut read = Box::pin(idle.next_frame());
+            let charged_part = async {
+                while storage.capacity() - storage.available() < part_end(&last) {
+                    tokio::task::yield_now().await;
+                }
+            };
+            tokio::select! {
+                result = &mut read => panic!("final frame completed before its body: {result:?}"),
+                result = tokio::time::timeout(BOUND, charged_part) => result.expect("final part was not charged"),
+            }
+        }
+        let waiter = Waiting::new(storage.clone(), u64::MAX);
+        eventually("idle stream kept its final part", || {
+            storage.available() == storage.capacity()
+        })
+        .await;
+        drop(waiter);
+        socket.write_all(&body[sent..]).await.unwrap();
+        assert!(matches!(
+            idle.next_frame().await,
+            Err(Error::Transport(message)) if message == "video frame storage reclaimed for a waiting stream"
+        ));
+    }
+
+    #[tokio::test]
+    async fn younger_waiting_stream_reports_its_reclaimed_final_part() {
+        let last = padded_jpeg([64, 128, 192], 64 * 1024);
+        let storage = StreamStorage::new(STREAM_STORAGE_BYTES);
+        let older = Ledger::new(storage.clone());
+        let (response, mut socket) = multipart().await;
+        socket.write_all(&part(&last, true, true)).await.unwrap();
+        let (mut younger, _lease) = parser(response, storage.clone());
+        // Room for the headers but not the part, so the younger stream waits behind the older one.
+        let hold = hold_all_but(&storage, MAX_HEADER);
+        let waiter = Waiting::new(storage.clone(), older.id);
+        let read = younger.next_charged();
+        tokio::pin!(read);
+        let yielded = async {
+            while storage.yielded.load(Ordering::Acquire) == 0 {
+                tokio::task::yield_now().await;
+            }
+        };
+        tokio::select! {
+            result = &mut read => panic!("read finished while an older stream waited: {:?}", result.is_ok()),
+            result = tokio::time::timeout(BOUND, yielded) => result.expect("younger stream did not yield"),
+        }
+        drop((waiter, hold));
+        assert!(matches!(
+            tokio::time::timeout(BOUND, read).await.unwrap(),
+            Err(Error::Transport(message)) if message == "video frame storage reclaimed for a waiting stream"
+        ));
+    }
+
+    #[tokio::test]
+    async fn younger_waiting_stream_reads_nothing_until_its_timeout() {
+        let first = padded_jpeg([64, 128, 192], 64 * 1024);
+        let next = jpeg_colour([200, 20, 50]);
+        let storage = StreamStorage::new(STREAM_STORAGE_BYTES);
+        // An older stream waits throughout.
+        let older = Ledger::new(storage.clone());
+        let _waiter = Waiting::new(storage.clone(), older.id);
+        let mut body = part(&first, true, false);
+        body.extend_from_slice(&part(&next, true, true));
+        let (response, mut socket) = multipart().await;
+        socket.write_all(&body).await.unwrap();
+        // The headers and the small next part fit, the first part does not. A stream that kept reading after giving up the first part would deliver the next one.
+        let _hold = hold_all_but(&storage, MAX_HEADER + part_end(&next));
+        assert!(part_end(&first) > MAX_HEADER + part_end(&next));
+        let timeout = Duration::from_millis(200);
+        assert!(timeout < BOUND);
+        let (mut younger, _lease) = parser_with_timeout(response, storage.clone(), timeout);
+        assert!(matches!(
+            tokio::time::timeout(BOUND, younger.next_charged()).await.unwrap(),
+            Err(Error::Transport(message)) if message == "video stream storage exhausted"
+        ));
+        assert_eq!(storage.yielded.load(Ordering::Acquire), 1);
+    }
+
+    #[tokio::test]
+    async fn older_waiting_stream_wins_and_younger_resumes() {
+        let older_frame = padded_jpeg([64, 128, 192], 64 * 1024);
+        let younger_first = padded_jpeg([20, 200, 50], 64 * 1024);
+        let younger_next = jpeg_colour([200, 20, 50]);
+        // Room for both header buffers but for neither part, until the other holder gives way.
+        let storage = StreamStorage::new(STREAM_STORAGE_BYTES);
+        let hold = hold_all_but(&storage, 2 * MAX_HEADER);
+        assert!(part_end(&older_frame) > 2 * MAX_HEADER);
+
+        let (older_response, mut older_socket) = multipart().await;
+        let (younger_response, mut younger_socket) = multipart().await;
+        let (older_parser, _older_lease) = parser(older_response, storage.clone());
+        let (younger_parser, _younger_lease) = parser(younger_response, storage.clone());
+        let (older_id, younger_id) = (older_parser.ledger.id, younger_parser.ledger.id);
+        assert!(older_id < younger_id);
+        let mut older = Mjpeg::start(older_parser, BOUND);
+        let mut younger = Mjpeg::start(younger_parser, BOUND);
+        let mut waiting = storage.waiting.subscribe();
+
+        // The younger stream reads first and waits for its part.
+        let mut younger_body = part(&younger_first, true, false);
+        younger_body.extend_from_slice(&part(&younger_next, true, true));
+        younger_socket.write_all(&younger_body).await.unwrap();
+        let younger_read = tokio::spawn(async move {
+            let first = younger.next_frame().await;
+            let second = younger.next_frame().await;
+            (first, second)
+        });
+        tokio::time::timeout(
+            BOUND,
+            waiting.wait_for(|waiting| waiting.contains(&younger_id)),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        // Then the older one does, and the younger gives up its storage to it.
+        older_socket
+            .write_all(&part(&older_frame, true, true))
+            .await
+            .unwrap();
+        let older_read = tokio::spawn(async move {
+            let frame = older.next_frame().await;
+            (older, frame)
+        });
+        eventually("younger stream did not yield", || {
+            storage.yielded.load(Ordering::Acquire) == 1
+        })
+        .await;
+        drop(hold);
+        let (mut older, frame) = tokio::time::timeout(BOUND, older_read)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(frame.unwrap().unwrap().jpeg, older_frame);
+        assert!(older.next_frame().await.unwrap().is_none());
+        // The younger stream lost the part it gave up and continues with the next one.
+        let (first, second) = tokio::time::timeout(BOUND, younger_read)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.unwrap().unwrap().jpeg, younger_next);
+        assert!(second.unwrap().is_none());
+        assert_eq!(storage.available(), storage.capacity());
     }
 
     struct BlockedSink;
