@@ -19,6 +19,9 @@ struct Mjpeg {
     boundary: Vec<u8>,
     buffer: Vec<u8>,
     pending: bytes::Bytes,
+    scan_offset: usize,
+    #[cfg(test)]
+    scanned: usize,
     lease: JoinHandle<()>,
     lease_state: watch::Receiver<bool>,
     timeout: Duration,
@@ -136,6 +139,9 @@ pub(crate) async fn open(device: &Kvmd) -> Result<Box<dyn VideoStream>> {
         boundary,
         buffer: Vec::new(),
         pending: bytes::Bytes::new(),
+        scan_offset: 0,
+        #[cfg(test)]
+        scanned: 0,
         lease: guard.0.take().expect("lease exists"),
         lease_state,
         timeout: device.config.timeout,
@@ -311,10 +317,15 @@ impl VideoStream for Mjpeg {
             }
             length
         } else {
-            let mut offset = body_start;
+            self.scan_offset = self.scan_offset.max(body_start);
             loop {
-                if let Some(relative) = find(&self.buffer[offset..], &delimiter) {
-                    let pos = offset + relative;
+                #[cfg(test)]
+                {
+                    self.scanned += self.buffer.len() - self.scan_offset;
+                }
+                if let Some(relative) = find(&self.buffer[self.scan_offset..], &delimiter) {
+                    let pos = self.scan_offset + relative;
+                    self.scan_offset = pos;
                     while self.buffer.len() < pos + delimiter.len() + 2 {
                         if !self.fill(frame_limit).await? {
                             return Err(Error::InvalidResponse("truncated boundary".into()));
@@ -324,12 +335,13 @@ impl VideoStream for Mjpeg {
                     if suffix == b"\r\n" || suffix == b"--" {
                         break pos - body_start;
                     }
-                    offset = pos + 1;
+                    self.scan_offset = pos + 1;
                 } else {
                     if self.buffer.len() >= frame_limit {
                         return Err(Error::InvalidResponse("frame exceeds limit".into()));
                     }
-                    offset = next_scan_offset(self.buffer.len(), delimiter.len(), body_start);
+                    self.scan_offset =
+                        next_scan_offset(self.buffer.len(), delimiter.len(), body_start);
                     if !self.fill(frame_limit).await? {
                         return Err(Error::InvalidResponse("truncated frame".into()));
                     }
@@ -352,6 +364,7 @@ impl VideoStream for Mjpeg {
             return Err(Error::InvalidResponse("invalid boundary suffix".into()));
         }
         self.buffer.drain(..suffix_start + 2);
+        self.scan_offset = 0;
         Ok(Some(Snapshot { jpeg: frame }))
     }
 }
@@ -363,6 +376,65 @@ mod tests {
         pin::Pin,
         task::{Context, Poll},
     };
+
+    #[tokio::test]
+    async fn repeated_cancellation_keeps_fragment_scan_linear() {
+        use tokio::{
+            io::{AsyncReadExt, AsyncWriteExt},
+            net::TcpListener,
+            sync::mpsc,
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (send, mut receive) = mpsc::channel::<bool>(1);
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0; 1024];
+            assert!(socket.read(&mut request).await.unwrap() > 0);
+            socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: multipart/x-mixed-replace; boundary=frame\r\n\r\n--frame\r\nContent-Type: image/jpeg\r\n\r\n\xff\xd8").await.unwrap();
+            while let Some(last) = receive.recv().await {
+                if last {
+                    socket
+                        .write_all(b"\xff\xd9\r\n--frame--\r\n")
+                        .await
+                        .unwrap();
+                    break;
+                }
+                socket.write_all(&[b'a'; 256]).await.unwrap();
+            }
+        });
+        let response = reqwest::get(format!("http://{address}/")).await.unwrap();
+        let (_tx, lease_state) = watch::channel(true);
+        let lease = tokio::spawn(std::future::pending());
+        let mut video = Mjpeg {
+            response,
+            boundary: b"--frame".to_vec(),
+            buffer: Vec::new(),
+            pending: bytes::Bytes::new(),
+            scan_offset: 0,
+            scanned: 0,
+            lease,
+            lease_state,
+            timeout: Duration::from_secs(60),
+            first: true,
+            ended: false,
+        };
+        for _ in 0..64 {
+            send.send(false).await.unwrap();
+            assert!(
+                tokio::time::timeout(Duration::from_millis(5), video.next_frame())
+                    .await
+                    .is_err()
+            );
+        }
+        send.send(true).await.unwrap();
+        assert_eq!(
+            video.next_frame().await.unwrap().unwrap().jpeg.len(),
+            64 * 256 + 4
+        );
+        assert!(video.scanned < 64 * (256 + b"\r\n--frame".len() * 2));
+        server.await.unwrap();
+    }
 
     struct BlockedSink;
     impl futures_util::Sink<Message> for BlockedSink {
