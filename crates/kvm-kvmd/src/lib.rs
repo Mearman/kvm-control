@@ -604,14 +604,17 @@ impl Device for Kvmd {
 
     async fn capabilities(&self) -> Result<Capabilities> {
         let active = self.client.read().await;
-        let hid = self.json_with(&active.client, "hid").await?;
         let mut status = Capability::Supported;
-        for path in ["info", "streamer"] {
-            match self.json_with(&active.client, path).await {
-                Ok(_) => {}
-                Err(Error::Authentication | Error::Http(404)) => status = Capability::Unknown,
-                Err(error) => return Err(error),
-            }
+        match self.json_with(&active.client, "info").await {
+            Ok(_) => {}
+            Err(Error::Authentication | Error::Http(404)) => status = Capability::Unknown,
+            Err(error) => return Err(error),
+        }
+        let hid = self.json_with(&active.client, "hid").await?;
+        match self.json_with(&active.client, "streamer").await {
+            Ok(_) => {}
+            Err(Error::Authentication | Error::Http(404)) => status = Capability::Unknown,
+            Err(error) => return Err(error),
         }
         Ok(Capabilities {
             status,

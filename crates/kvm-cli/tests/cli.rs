@@ -159,7 +159,10 @@ fn status_is_json_and_authentication_is_not_leaked() {
 fn capabilities_include_mouse_mode() {
     let ok = b"{\"ok\":true,\"result\":{}}";
     let hid = b"{\"ok\":true,\"result\":{\"mouse\":{\"absolute\":false}}}";
-    let (output, _) = invoke(&["capabilities"], vec![ok, ok, ok, hid, ok, ok, ok, ok, ok]);
+    let (output, requests) = invoke(&["capabilities"], vec![ok, ok, ok, hid, ok, ok, ok, ok, ok]);
+    assert!(requests[2].starts_with("GET /api/info "));
+    assert!(requests[3].starts_with("GET /api/hid "));
+    assert!(requests[4].starts_with("GET /api/streamer "));
     assert!(
         output.status.success(),
         "{}",
