@@ -18,7 +18,7 @@ use std::{
 // Compiles the README's Rust examples as documentation tests, so the published usage cannot drift from the API.
 #[cfg(doctest)]
 #[doc = include_str!("../../../README.md")]
-struct ReadmeExamples;
+pub struct ReadmeExamples;
 
 #[cfg(test)]
 mod proptests;
