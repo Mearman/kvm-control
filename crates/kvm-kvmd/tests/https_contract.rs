@@ -158,7 +158,7 @@ async fn capability(uri: Uri) -> impl IntoResponse {
             json!({"state": {"outputs": {"lamp": {"online": true, "busy": false, "state": true}, "offline": {"online": false, "busy": false, "state": false}, "busy": {"online": true, "busy": true, "state": false}}}})
         }
         "/api/switch" => {
-            json!({"model": {"ports": [{}, {}]}, "summary": {"active_port": 0, "synced": false}})
+            json!({"model": {"ports": [{"unit": 0, "channel": 0}, {"unit": 0, "channel": 1}]}, "summary": {"active_port": 0, "synced": false}})
         }
         "/api/atx" => json!({"enabled": true, "leds": {"power": false}}),
         _ => json!({"enabled": true, "drive": {"connected": true, "image": {"name": "disk.iso"}}}),
@@ -722,14 +722,7 @@ async fn switch_observation_uses_profile_semantics_and_rejects_unknown_ports() {
             .control(Control::Switch { port: 0 }, Confirmation::new())
             .await
             .unwrap();
-        assert_eq!(
-            outcome,
-            if profile == DeviceProfile::GlKvm {
-                ControlOutcome::ObservedMatching
-            } else {
-                ControlOutcome::Unverified
-            }
-        );
+        assert_eq!(outcome, ControlOutcome::Unverified);
         assert!(matches!(
             device
                 .control(Control::Switch { port: 2 }, Confirmation::new())

@@ -835,10 +835,14 @@ impl Device for Kvmd {
                 .pointer("/model/ports")
                 .and_then(serde_json::Value::as_array)
                 .ok_or_else(|| Error::Unsupported("switch port inventory not confirmed".into()))?;
-            if usize::try_from(*port)
+            let entry = usize::try_from(*port)
                 .ok()
-                .is_none_or(|index| index >= ports.len())
-            {
+                .and_then(|index| ports.get(index));
+            if !entry.is_some_and(|entry| {
+                entry.get("unit").and_then(serde_json::Value::as_u64) == Some(u64::from(*port / 4))
+                    && entry.get("channel").and_then(serde_json::Value::as_u64)
+                        == Some(u64::from(*port % 4))
+            }) {
                 return Err(Error::Unsupported(
                     "switch port is not in the device inventory".into(),
                 ));
@@ -851,12 +855,39 @@ impl Device for Kvmd {
         self.input_with(&active.client, path, &params)
             .await
             .map_err(|error| Error::AmbiguousControl(error.to_string()))?;
-        let state = self
+        let mut state = self
             .json_with(&active.client, capability)
             .await
             .map_err(|_| {
                 Error::AmbiguousControl("request acknowledged but observation failed".into())
             })?;
+        if let Control::Switch { port } = &observed {
+            if self.profile == DeviceProfile::PiKvm {
+                // The PiKVM handler queues the switch; poll read-only state without replaying the request.
+                for _ in 0..4 {
+                    if state
+                        .pointer("/summary/synced")
+                        .and_then(serde_json::Value::as_bool)
+                        == Some(true)
+                        && state
+                            .pointer("/summary/active_port")
+                            .and_then(serde_json::Value::as_u64)
+                            == Some(u64::from(*port))
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    state = self
+                        .json_with(&active.client, capability)
+                        .await
+                        .map_err(|_| {
+                            Error::AmbiguousControl(
+                                "request acknowledged but observation failed".into(),
+                            )
+                        })?;
+                }
+            }
+        }
         let verified = match observed {
             Control::Power(PowerAction::On) => {
                 state
@@ -872,12 +903,12 @@ impl Device for Kvmd {
             }
             Control::Power(PowerAction::ResetHard) => false,
             Control::Switch { port } => {
-                // GL reads the active channel from sysfs but its synced flag is a constant.
-                (self.profile == DeviceProfile::GlKvm
-                    || state
+                // GL's reported channel does not prove that USB switching completed.
+                self.profile == DeviceProfile::PiKvm
+                    && state
                         .pointer("/summary/synced")
                         .and_then(serde_json::Value::as_bool)
-                        == Some(true))
+                        == Some(true)
                     && state
                         .pointer("/summary/active_port")
                         .and_then(serde_json::Value::as_u64)
