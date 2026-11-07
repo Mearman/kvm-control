@@ -168,7 +168,7 @@ async fn status(State(calls): State<Calls>, uri: Uri, headers: HeaderMap) -> imp
 /// - `corestatus` serves only the info, HID and streamer routes;
 /// - `failstatus` fails its media route with HTTP 500 and answers `ok: false` on ATX;
 /// - `badstatus` answers HID with invalid JSON, the streamer without a result and media with an oversized chunked body;
-/// - `slowstatus` answers ATX after the short-timeout client has given up, which loses the connection partway through a status read;
+/// - `slowstatus` never answers ATX, so the client's own request timeout ends that one request;
 /// - `downstatus` answers every route with HTTP 502, as a proxy does when its daemon is stopped;
 /// - `htmlstatus` answers every route with an HTML page, as a single-page application's catch-all does.
 async fn typed_status(
@@ -213,7 +213,7 @@ async fn typed_status(
         ("badstatus", "hid") => return "{\"ok\": true, \"result\": {".into_response(),
         ("badstatus", "streamer") => return Json(json!({"ok": true})).into_response(),
         ("badstatus", "msd") => return oversized_chunked().await.into_response(),
-        ("slowstatus", "atx") => tokio::time::sleep(SLOW_RESPONSE).await,
+        ("slowstatus", "atx") => std::future::pending::<()>().await,
         _ => {}
     }
     match fixture.get(route) {
@@ -227,10 +227,6 @@ async fn typed_status(
             .into_response(),
     }
 }
-
-/// The timeout of the client that reads `slowstatus`, and the delay of that device's ATX route, which outlasts it by a wide margin so the client always gives up first.
-const SHORT_TIMEOUT: Duration = Duration::from_secs(1);
-const SLOW_RESPONSE: Duration = Duration::from_secs(4);
 
 async fn oversized_length() -> impl IntoResponse {
     vec![b' '; 4 * 1024 * 1024 + 1]
@@ -2503,28 +2499,55 @@ async fn unreadable_routes_are_unknown_and_an_unreadable_device_fails() {
 }
 
 #[tokio::test]
-async fn a_connection_lost_partway_through_fails_the_whole_status() {
-    let (mut endpoint, ca, calls, server) = fixture().await;
-    endpoint.set_path("/slowstatus/");
+async fn a_timed_out_route_is_unknown_and_the_others_are_kept() {
+    let (endpoint, ca, calls, server) = fixture().await;
+    // The ATX route never answers; only the client's request timeout, `REQUEST_TIMEOUT`, ends that request, and every other route answers at once.
+    let status = status_client(&endpoint, &ca, "slowstatus", DeviceProfile::PiKvm)
+        .status()
+        .await
+        .unwrap();
+    assert_eq!(status.atx, Reported::Unknown);
+    for capability in [
+        status.info.capability(),
+        status.hid.capability(),
+        status.streamer.capability(),
+        status.switch.capability(),
+        status.gpio.capability(),
+        status.media.capability(),
+    ] {
+        assert_eq!(capability, Capability::Supported);
+    }
+    // The routes after the timed-out one were still read.
+    let expected: Vec<String> = STATUS_ROUTES
+        .iter()
+        .map(|route| format!("GET /slowstatus/api/{route}"))
+        .collect();
+    assert_eq!(*calls.0.lock().unwrap(), expected);
+    server.abort();
+}
+
+#[tokio::test]
+async fn a_connection_failure_fails_the_whole_status() {
+    let (mut endpoint, _, calls, server) = fixture().await;
+    endpoint.set_path("/pikvmstatus/");
+    // Without the fixture's CA no TLS session can be established, which is a failure of the connection, not of one route.
     let device = Kvmd::with_header_auth(
         Config {
             endpoint,
             profile: DeviceProfile::PiKvm,
-            trusted_ca_pem: Some(ca),
+            trusted_ca_pem: None,
             insecure_tls: false,
-            timeout: SHORT_TIMEOUT,
+            timeout: REQUEST_TIMEOUT,
         },
         "test-user",
         "test-password",
     )
     .unwrap();
-    assert!(matches!(device.status().await, Err(Error::Transport(_))));
-    // The reads before the lost one succeeded, and no route was read after it.
-    let paths: Vec<String> = calls.0.lock().unwrap().clone();
-    let expected: Vec<String> = STATUS_ROUTES[..4]
-        .iter()
-        .map(|route| format!("GET /slowstatus/api/{route}"))
-        .collect();
-    assert_eq!(paths, expected);
+    assert!(matches!(
+        device.status().await,
+        Err(Error::Transport(message)) if message.contains("connection failure")
+    ));
+    // The first failed connection ended the read: no route reached the device.
+    assert!(calls.0.lock().unwrap().is_empty());
     server.abort();
 }

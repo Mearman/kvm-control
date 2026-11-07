@@ -242,6 +242,29 @@ fn validate_jpeg(bytes: &[u8]) -> Result<Vec<u8>> {
     Ok(stripped)
 }
 
+/// A failed request, with whether the connection itself failed (no connection or no TLS session could be established) rather than this one request (an error status, a timeout after connecting, a body that broke off or could not be parsed).
+pub(crate) struct RequestFailure {
+    pub(crate) error: Error,
+    pub(crate) connection: bool,
+}
+
+impl RequestFailure {
+    /// A failure of this request alone.
+    fn request(error: Error) -> Self {
+        Self {
+            error,
+            connection: false,
+        }
+    }
+
+    fn sending(context: &'static str, error: &reqwest::Error) -> Self {
+        Self {
+            connection: error.is_connect(),
+            error: request_error(context, error),
+        }
+    }
+}
+
 fn request_error(context: &'static str, error: &reqwest::Error) -> Error {
     let kind = if error.is_timeout() {
         "timeout"
@@ -953,13 +976,23 @@ impl Kvmd {
     }
 
     async fn get_with(&self, active: &Client, path: &str) -> Result<reqwest::Response> {
+        self.send_get(active, path)
+            .await
+            .map_err(|failure| failure.error)
+    }
+
+    async fn send_get(
+        &self,
+        active: &Client,
+        path: &str,
+    ) -> std::result::Result<reqwest::Response, RequestFailure> {
         let response = active
-            .get(self.url(path)?)
+            .get(self.url(path).map_err(RequestFailure::request)?)
             .headers(self.auth_headers.clone())
             .send()
             .await
-            .map_err(|error| request_error("device request", &error))?;
-        Self::check(response.status())?;
+            .map_err(|error| RequestFailure::sending("device request", &error))?;
+        Self::check(response.status()).map_err(RequestFailure::request)?;
         Ok(response)
     }
 
@@ -969,16 +1002,29 @@ impl Kvmd {
     }
 
     async fn json_with(&self, active: &Client, path: &str) -> Result<serde_json::Value> {
-        let value = bounded_json(self.get_with(active, path).await?).await?;
+        self.state_with(active, path)
+            .await
+            .map_err(|failure| failure.error)
+    }
+
+    /// A KVMD route's `result`, classifying a failure by whether the connection itself failed.
+    pub(crate) async fn state_with(
+        &self,
+        active: &Client,
+        path: &str,
+    ) -> std::result::Result<serde_json::Value, RequestFailure> {
+        let value = bounded_json(self.send_get(active, path).await?)
+            .await
+            .map_err(RequestFailure::request)?;
         if value.get("ok").and_then(serde_json::Value::as_bool) != Some(true) {
-            return Err(Error::InvalidResponse(
+            return Err(RequestFailure::request(Error::InvalidResponse(
                 "KVMD response was not successful".into(),
-            ));
+            )));
         }
         value
             .get("result")
             .cloned()
-            .ok_or_else(|| Error::InvalidResponse("missing result".into()))
+            .ok_or_else(|| RequestFailure::request(Error::InvalidResponse("missing result".into())))
     }
 
     async fn discover_with(&self, active: &Client, path: &str) -> Result<Capability> {
