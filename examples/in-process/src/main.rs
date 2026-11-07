@@ -12,6 +12,8 @@ use std::sync::Mutex;
 #[derive(Default)]
 struct FakeDevice {
     events: Mutex<Vec<String>>,
+    /// Reports the switch status unknown, as a device whose switch route failed does.
+    switch_unknown: bool,
 }
 
 struct FakeVideo(bool);
@@ -48,11 +50,15 @@ impl Device for FakeDevice {
             hid: Reported::Unknown,
             streamer: Reported::Unknown,
             atx: Reported::Unsupported,
-            switch: Reported::Supported(SwitchStatus {
-                ports: Reported::Supported(vec![port(0), port(1)]),
-                active_port: Reported::Supported(Some(0)),
-                synced: Reported::Supported(true),
-            }),
+            switch: if self.switch_unknown {
+                Reported::Unknown
+            } else {
+                Reported::Supported(SwitchStatus {
+                    ports: Reported::Supported(vec![port(0), port(1)]),
+                    active_port: Reported::Supported(Some(0)),
+                    synced: Reported::Supported(true),
+                })
+            },
             gpio: Reported::Unsupported,
             media: Reported::Unsupported,
         })
@@ -104,21 +110,54 @@ impl Device for FakeDevice {
     }
 }
 
+/// Why the consumer could not choose a switch port, beside the device's own errors.
+#[derive(Debug)]
+enum ConsumeError {
+    Device(Error),
+    /// The device reports that it has no switch.
+    NoSwitch,
+    /// The switch status, or its port list, could not be observed, so no port can be chosen safely.
+    SwitchUnknown,
+    NoOtherPort,
+}
+
+impl From<Error> for ConsumeError {
+    fn from(error: Error) -> Self {
+        Self::Device(error)
+    }
+}
+
+impl std::fmt::Display for ConsumeError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Device(error) => error.fmt(formatter),
+            Self::NoSwitch => formatter.write_str("the device has no switch"),
+            Self::SwitchUnknown => formatter.write_str("the switch status is unknown"),
+            Self::NoOtherPort => formatter.write_str("the switch has no other port"),
+        }
+    }
+}
+
+impl std::error::Error for ConsumeError {}
+
 // A consumer depends on the public contract, not on a particular device implementation.
-async fn consume(device: &dyn Device) -> Result<ControlOutcome> {
+async fn consume(device: &dyn Device) -> std::result::Result<ControlOutcome, ConsumeError> {
     let capabilities = device.capabilities().await?;
     // Status is read whatever its capability says: each subsystem reports its own support, and the switch subsystem reports which ports exist, so the consumer picks one the device has rather than guessing.
     let status = device.status().await?;
-    let switch = status
-        .switch
-        .value()
-        .ok_or_else(|| Error::Unsupported("switch status".into()))?;
+    let switch = match &status.switch {
+        Reported::Supported(switch) => switch,
+        Reported::Unsupported => return Err(ConsumeError::NoSwitch),
+        Reported::Unknown => return Err(ConsumeError::SwitchUnknown),
+    };
     let active = switch.active_port.value().copied().flatten();
     let target = switch
         .ports
         .value()
-        .and_then(|ports| ports.iter().find(|port| Some(port.port) != active))
-        .ok_or_else(|| Error::Unsupported("no other switch port".into()))?
+        .ok_or(ConsumeError::SwitchUnknown)?
+        .iter()
+        .find(|port| Some(port.port) != active)
+        .ok_or(ConsumeError::NoOtherPort)?
         .port;
     println!("Switch ports: {:?}, active {active:?}", switch.ports);
     if capabilities.snapshot == Capability::Supported {
@@ -137,13 +176,13 @@ async fn consume(device: &dyn Device) -> Result<ControlOutcome> {
         result?;
         release?;
     }
-    device
+    Ok(device
         .control(Control::Switch { port: target }, Confirmation::new())
-        .await
+        .await?)
 }
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() -> std::result::Result<(), ConsumeError> {
     let device = FakeDevice::default();
     let outcome = consume(&device).await?;
     println!("Switch outcome: {outcome:?}");
@@ -172,5 +211,25 @@ mod tests {
             device.mouse_move(1, 1).await,
             Err(Error::Unsupported(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn an_unknown_switch_status_is_reported_as_unknown() {
+        let device = FakeDevice {
+            switch_unknown: true,
+            ..FakeDevice::default()
+        };
+        let error = consume(&device).await.unwrap_err();
+        assert!(matches!(error, ConsumeError::SwitchUnknown));
+        assert_eq!(error.to_string(), "the switch status is unknown");
+        // No switch control was sent without a known port.
+        assert!(
+            !device
+                .events
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|event| event.starts_with("switch"))
+        );
     }
 }
