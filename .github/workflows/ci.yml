@@ -66,7 +66,7 @@ jobs:
         run: convco check "$BASE..$HEAD"
 
   validate-release-archives:
-    if: github.event_name == 'pull_request' && github.base_ref == 'ci-release-integration'
+    if: github.event_name == 'pull_request' && github.base_ref == 'ci'
     strategy:
       fail-fast: false
       matrix:
@@ -83,7 +83,7 @@ jobs:
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
-          ref: ef7c2c2b111c50c0f304bc93087baf73ecaddc38
+          ref: 7c0eb187aa5d34036ca6827c5f54ab95b3ba1751
           persist-credentials: false
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
