@@ -242,7 +242,14 @@ async fn fixture() -> (Url, Vec<u8>, Calls, tokio::task::JoinHandle<()>) {
         .route("/api/msd/set_params", post(control))
         .route(
             "/api/streamer/snapshot",
-            get(|| async { vec![0u8; 16 * 1024 * 1024 + 1] }),
+            get(|State(calls): State<Calls>| async move {
+                calls.0.lock().unwrap().push("snapshot".into());
+                if calls.2.load(Ordering::SeqCst) {
+                    vec![0xff, 0xd8, 0xff, 0xd9]
+                } else {
+                    vec![0u8; 16 * 1024 * 1024 + 1]
+                }
+            }),
         )
         .with_state(calls.clone());
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -632,6 +639,42 @@ async fn gl_approval_is_not_reported_as_authenticated() {
         device.complete_approval().await.unwrap(),
         LoginState::Authenticated
     );
+    server.abort();
+}
+
+#[tokio::test]
+async fn video_capabilities_require_successful_operations() {
+    let (endpoint, ca, calls, server) = fixture().await;
+    let device = Kvmd::with_header_auth(
+        Config {
+            endpoint,
+            profile: DeviceProfile::PiKvm,
+            trusted_ca_pem: Some(ca),
+            insecure_tls: false,
+            timeout: Duration::from_secs(3),
+        },
+        "test-user",
+        "test-password",
+    )
+    .unwrap();
+    let initial = device.capabilities().await.unwrap();
+    assert_eq!(initial.snapshot, Capability::Unknown);
+    assert_eq!(initial.live_video, Capability::Unknown);
+    assert!(
+        !calls.0.lock().unwrap().iter().any(|call| call == "snapshot"
+            || call.contains("/ws")
+            || call.contains("/streamer/stream"))
+    );
+    assert!(device.snapshot().await.is_err());
+    assert!(device.video().await.is_err());
+    let failed = device.capabilities().await.unwrap();
+    assert_eq!(failed.snapshot, Capability::Unknown);
+    assert_eq!(failed.live_video, Capability::Unknown);
+    calls.2.store(true, Ordering::SeqCst);
+    device.snapshot().await.unwrap();
+    let observed = device.capabilities().await.unwrap();
+    assert_eq!(observed.snapshot, Capability::Supported);
+    assert_eq!(observed.live_video, Capability::Unknown);
     server.abort();
 }
 

@@ -1,4 +1,10 @@
-use std::time::Duration;
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
 
 use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
@@ -29,6 +35,7 @@ struct Mjpeg {
     timeout: Duration,
     first: bool,
     ended: bool,
+    proven: Arc<AtomicBool>,
 }
 
 impl Drop for Mjpeg {
@@ -151,6 +158,7 @@ pub(crate) async fn open(device: &Kvmd) -> Result<Box<dyn VideoStream>> {
         timeout: device.config.timeout,
         first: true,
         ended: false,
+        proven: device.video_proven.clone(),
     }))
 }
 
@@ -373,6 +381,7 @@ impl VideoStream for Mjpeg {
         }
         self.buffer.drain(..suffix_start + 2);
         self.scan_offset = 0;
+        self.proven.store(true, Ordering::Release);
         Ok(Some(Snapshot { jpeg: frame }))
     }
 }
@@ -428,7 +437,9 @@ mod tests {
             timeout: Duration::from_secs(3),
             first: true,
             ended: false,
+            proven: Arc::new(AtomicBool::new(false)),
         };
+        assert!(!video.proven.load(Ordering::Acquire));
         for index in 1..=64 {
             send.send(false).await.unwrap();
             let frame = video.next_frame();
@@ -447,6 +458,7 @@ mod tests {
             video.next_frame().await.unwrap().unwrap().jpeg.len(),
             64 * 256 + 4
         );
+        assert!(video.proven.load(Ordering::Acquire));
         assert!(video.scanned < 64 * (256 + b"\r\n--frame".len() * 2));
         server.await.unwrap();
     }

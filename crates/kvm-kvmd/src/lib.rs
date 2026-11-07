@@ -2,7 +2,7 @@
 //!
 //! PiKVM's [stream client](https://github.com/pikvm/kvmd/blob/fcb903eb3be70d8eee4aee99e5fcc1c743e3ccef/web/share/js/kvm/stream_mjpeg.js) and [WebSocket handler](https://github.com/pikvm/kvmd/blob/fcb903eb3be70d8eee4aee99e5fcc1c743e3ccef/kvmd/apps/kvmd/server.py), and GLKVM's [stream client](https://github.com/gl-inet/glkvm/blob/3e8dd23c4bd638a4650433664cc3b0f3b4d29395/web/share/js/kvm/stream_mjpeg.js) and [WebSocket handler](https://github.com/gl-inet/glkvm/blob/3e8dd23c4bd638a4650433664cc3b0f3b4d29395/kvmd/apps/kvmd/server.py), use these routes. [uStreamer](https://github.com/pikvm/ustreamer/blob/11fd828ab00c01a39bd0843ef442ef0b6d3cac41/src/ustreamer/http/server.c) emits multipart JPEG with or without Content-Length.
 //!
-//! These sources do not establish compatibility with every firmware version. Only synthetic server tests have been run; no physical device has been verified. The video API supports MJPEG only, does not change encoder settings, and validates JPEG envelope markers rather than decoding images. Capabilities remain unknown until callers attempt the transport.
+//! These sources do not establish compatibility with every firmware version. Only synthetic server tests have been run; no physical device has been verified. The video API supports MJPEG only, does not change encoder settings, and validates JPEG envelope markers rather than decoding images. Video capabilities remain unknown until this connection receives a valid JPEG snapshot or live frame. A successful operation records support for that connection; failures do not prove a capability unsupported.
 
 use std::{
     collections::BTreeSet,
@@ -123,6 +123,8 @@ pub struct Kvmd {
     inputs: Mutex<Inputs>,
     auth_headers: reqwest::header::HeaderMap,
     approval_token: Mutex<Option<String>>,
+    snapshot_proven: AtomicBool,
+    video_proven: Arc<AtomicBool>,
 }
 
 impl std::ops::Deref for Session {
@@ -162,6 +164,8 @@ impl Kvmd {
             inputs: Mutex::new(Inputs::default()),
             auth_headers: reqwest::header::HeaderMap::new(),
             approval_token: Mutex::new(None),
+            snapshot_proven: AtomicBool::new(false),
+            video_proven: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -508,11 +512,19 @@ impl Device for Kvmd {
         let status = self.status().await?;
         Ok(Capabilities {
             status: Capability::Supported,
-            snapshot: Capability::Unknown,
+            snapshot: if self.snapshot_proven.load(Ordering::Acquire) {
+                Capability::Supported
+            } else {
+                Capability::Unknown
+            },
             keyboard: hid_capability(&status.hid, "keyboard"),
             mouse: hid_capability(&status.hid, "mouse"),
             mouse_mode: mouse_mode(&status.hid),
-            live_video: Capability::Unknown,
+            live_video: if self.video_proven.load(Ordering::Acquire) {
+                Capability::Supported
+            } else {
+                Capability::Unknown
+            },
             power: self.discover_endpoint("atx").await?,
             switch: self.discover_endpoint("switch").await?,
             gpio: self.discover_endpoint("gpio").await?,
@@ -550,6 +562,7 @@ impl Device for Kvmd {
                 "snapshot is not a complete JPEG".into(),
             ));
         }
+        self.snapshot_proven.store(true, Ordering::Release);
         Ok(Snapshot {
             jpeg: bytes.to_vec(),
         })
