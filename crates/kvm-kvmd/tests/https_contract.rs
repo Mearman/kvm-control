@@ -654,6 +654,26 @@ async fn drive<F: std::future::Future>(calls: &Calls, future: F) -> F::Output {
     }
 }
 
+/// Replays the recorded key and button events and returns the inputs the fake device still holds.
+fn held_on_device(calls: &Calls) -> Vec<String> {
+    let mut held = std::collections::BTreeSet::new();
+    for call in calls.0.lock().unwrap().iter() {
+        let Some((_, query)) = call
+            .split_once("/hid/events/")
+            .and_then(|(_, rest)| rest.split_once('?'))
+        else {
+            continue;
+        };
+        let name = query.split('&').next().unwrap().to_owned();
+        if query.ends_with("state=true") {
+            held.insert(name);
+        } else {
+            held.remove(&name);
+        }
+    }
+    held.into_iter().collect()
+}
+
 #[tokio::test]
 async fn cancelled_cleanup_precedes_later_input_and_explicit_release() {
     let (mut endpoint, ca, calls, server) = fixture().await;
@@ -847,6 +867,69 @@ async fn cancelled_ambiguous_release_is_not_replayed() {
             .count(),
         2
     );
+    server.abort();
+}
+
+#[tokio::test]
+async fn request_abandoned_during_owed_cleanup_leaves_nothing_held() {
+    let (mut endpoint, ca, calls, server) = fixture().await;
+    endpoint.set_path("/gated/");
+    let device = Arc::new(client(endpoint, Some(ca)));
+    let sender = device.clone();
+    let first = tokio::spawn(async move { sender.key("KeyA", true).await });
+    calls.3.notified().await;
+    let sender = device.clone();
+    let second = queue(async move { sender.key("KeyB", true).await }).await;
+    first.abort();
+    assert!(first.await.unwrap_err().is_cancelled());
+    calls.4.notify_one();
+    // Cleanup owed for the first request is in flight when the second request is abandoned.
+    calls.3.notified().await;
+    assert!(
+        calls
+            .0
+            .lock()
+            .unwrap()
+            .last()
+            .unwrap()
+            .contains("key=KeyA&state=false")
+    );
+    second.abort();
+    assert!(second.await.unwrap_err().is_cancelled());
+    calls.4.notify_one();
+    drive(&calls, async {
+        device.key("KeyC", true).await.unwrap();
+        device.key("KeyC", false).await.unwrap();
+    })
+    .await;
+    assert_eq!(held_on_device(&calls), Vec::<String>::new());
+    server.abort();
+}
+
+#[tokio::test]
+async fn release_after_cleanup_released_the_input_is_not_resent() {
+    let (mut endpoint, ca, calls, server) = fixture().await;
+    endpoint.set_path("/gated/");
+    let device = Arc::new(client(endpoint, Some(ca)));
+    let sender = device.clone();
+    let press = tokio::spawn(async move { sender.key("KeyA", true).await });
+    calls.3.notified().await;
+    press.abort();
+    assert!(press.await.unwrap_err().is_cancelled());
+    calls.4.notify_one();
+    calls.3.notified().await;
+    calls.4.notify_one();
+    drive(&calls, device.key("KeyA", false)).await.unwrap();
+    let events: Vec<_> = calls
+        .0
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|v| v.contains("/hid/events/"))
+        .cloned()
+        .collect();
+    assert_eq!(events.len(), 2, "{events:?}");
+    assert!(events[1].ends_with("key=KeyA&state=false"));
     server.abort();
 }
 
