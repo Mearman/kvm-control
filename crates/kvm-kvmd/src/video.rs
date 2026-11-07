@@ -364,13 +364,11 @@ impl VideoStream for Mjpeg {
                 }
             }
         };
-        if size > MAX_FRAME
-            || !self.buffer[body_start..body_start + size].starts_with(&[0xff, 0xd8])
-            || !self.buffer[body_start..body_start + size].ends_with(&[0xff, 0xd9])
-        {
-            return Err(Error::InvalidResponse("invalid JPEG frame".into()));
+        if size > MAX_FRAME {
+            return Err(Error::InvalidResponse("frame exceeds limit".into()));
         }
         let frame = self.buffer[body_start..body_start + size].to_vec();
+        crate::validate_jpeg(&frame)?;
         let suffix_start = body_start + size + delimiter.len();
         let suffix = &self.buffer[suffix_start..suffix_start + 2];
         if suffix == b"--" {
@@ -404,6 +402,10 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let (send, mut receive) = mpsc::channel::<bool>(1);
+        let mut jpeg = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new(&mut jpeg)
+            .encode(&[64, 128, 192], 1, 1, image::ExtendedColorType::Rgb8)
+            .unwrap();
         let server = tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.unwrap();
             let mut request = [0; 1024];
@@ -411,13 +413,12 @@ mod tests {
             socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: multipart/x-mixed-replace; boundary=frame\r\n\r\n--frame\r\nContent-Type: image/jpeg\r\n\r\n\xff\xd8").await.unwrap();
             while let Some(last) = receive.recv().await {
                 if last {
-                    socket
-                        .write_all(b"\xff\xd9\r\n--frame--\r\n")
-                        .await
-                        .unwrap();
+                    socket.write_all(&jpeg[2..]).await.unwrap();
+                    socket.write_all(b"\r\n--frame--\r\n").await.unwrap();
                     break;
                 }
-                socket.write_all(&[b'a'; 256]).await.unwrap();
+                socket.write_all(&[0xff, 0xfe, 0x01, 0x00]).await.unwrap();
+                socket.write_all(&[b'a'; 254]).await.unwrap();
             }
         });
         let response = reqwest::get(format!("http://{address}/")).await.unwrap();
@@ -448,18 +449,15 @@ mod tests {
                 tokio::select! {
                     result = &mut frame => panic!("frame ended before cancellation: {result:?}"),
                     progress = progress_rx.recv() => {
-                        if progress.unwrap() >= 2 + index * 256 { break; }
+                        if progress.unwrap() >= 2 + index * 258 { break; }
                     }
                 }
             }
         }
         send.send(true).await.unwrap();
-        assert_eq!(
-            video.next_frame().await.unwrap().unwrap().jpeg.len(),
-            64 * 256 + 4
-        );
+        assert!(video.next_frame().await.unwrap().unwrap().jpeg.len() > 64 * 258);
         assert!(video.proven.load(Ordering::Acquire));
-        assert!(video.scanned < 64 * (256 + b"\r\n--frame".len() * 2));
+        assert!(video.scanned < 64 * (258 + b"\r\n--frame".len() * 2));
         server.await.unwrap();
     }
 

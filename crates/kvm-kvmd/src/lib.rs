@@ -2,7 +2,7 @@
 //!
 //! PiKVM's [stream client](https://github.com/pikvm/kvmd/blob/fcb903eb3be70d8eee4aee99e5fcc1c743e3ccef/web/share/js/kvm/stream_mjpeg.js) and [WebSocket handler](https://github.com/pikvm/kvmd/blob/fcb903eb3be70d8eee4aee99e5fcc1c743e3ccef/kvmd/apps/kvmd/server.py), and GLKVM's [stream client](https://github.com/gl-inet/glkvm/blob/3e8dd23c4bd638a4650433664cc3b0f3b4d29395/web/share/js/kvm/stream_mjpeg.js) and [WebSocket handler](https://github.com/gl-inet/glkvm/blob/3e8dd23c4bd638a4650433664cc3b0f3b4d29395/kvmd/apps/kvmd/server.py), use these routes. [uStreamer](https://github.com/pikvm/ustreamer/blob/11fd828ab00c01a39bd0843ef442ef0b6d3cac41/src/ustreamer/http/server.c) emits multipart JPEG with or without Content-Length.
 //!
-//! These sources do not establish compatibility with every firmware version. Only synthetic server tests have been run; no physical device has been verified. The video API supports MJPEG only, does not change encoder settings, and validates JPEG envelope markers rather than decoding images. Video capabilities remain unknown until this connection receives a valid JPEG snapshot or live frame. A successful operation records support for that connection; failures do not prove a capability unsupported.
+//! These sources do not establish compatibility with every firmware version. Only synthetic server tests have been run; no physical device has been verified. The video API supports MJPEG only and does not change encoder settings. JPEG images are decoded under resource limits before delivery. Video capabilities remain unknown until this connection receives a valid JPEG snapshot or live frame. A successful operation records support for that connection; failures do not prove a capability unsupported.
 
 use std::{
     collections::BTreeSet,
@@ -25,6 +25,36 @@ use kvm_core::{
 use reqwest::{Client, Method, StatusCode};
 use tokio::sync::{Mutex, RwLock};
 use url::Url;
+
+// Bound both dimensions and decoded pixels before allocating or decoding untrusted frames.
+const MAX_IMAGE_DIMENSION: u32 = 8192;
+const MAX_IMAGE_PIXELS: u64 = 32 * 1024 * 1024;
+const MAX_DECODED_BYTES: u64 = MAX_IMAGE_PIXELS * 4;
+
+fn validate_jpeg(bytes: &[u8]) -> Result<()> {
+    use image::ImageDecoder;
+    let invalid = || Error::InvalidResponse("invalid or oversized JPEG image".into());
+    if !bytes.starts_with(&[0xff, 0xd8]) || !bytes.ends_with(&[0xff, 0xd9]) {
+        return Err(invalid());
+    }
+    let mut decoder = image::codecs::jpeg::JpegDecoder::new(std::io::Cursor::new(bytes))
+        .map_err(|_| invalid())?;
+    let (width, height) = decoder.dimensions();
+    if u64::from(width) * u64::from(height) > MAX_IMAGE_PIXELS {
+        return Err(invalid());
+    }
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(MAX_IMAGE_DIMENSION);
+    limits.max_image_height = Some(MAX_IMAGE_DIMENSION);
+    limits.max_alloc = Some(MAX_DECODED_BYTES);
+    decoder.set_limits(limits).map_err(|_| invalid())?;
+    let size = usize::try_from(decoder.total_bytes()).map_err(|_| invalid())?;
+    if size as u64 > MAX_DECODED_BYTES {
+        return Err(invalid());
+    }
+    let mut pixels = vec![0; size];
+    decoder.read_image(&mut pixels).map_err(|_| invalid())
+}
 
 fn request_error(context: &'static str, error: &reqwest::Error) -> Error {
     let kind = if error.is_timeout() {
@@ -581,15 +611,9 @@ impl Device for Kvmd {
             }
             bytes.extend_from_slice(&chunk);
         }
-        if !bytes.starts_with(&[0xff, 0xd8]) || !bytes.ends_with(&[0xff, 0xd9]) {
-            return Err(Error::InvalidResponse(
-                "snapshot is not a complete JPEG".into(),
-            ));
-        }
+        validate_jpeg(&bytes)?;
         self.snapshot_proven.store(true, Ordering::Release);
-        Ok(Snapshot {
-            jpeg: bytes.to_vec(),
-        })
+        Ok(Snapshot { jpeg: bytes })
     }
 
     async fn key(&self, key: &str, pressed: bool) -> Result<()> {
@@ -803,6 +827,70 @@ impl Device for Kvmd {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn jpeg_validation_checks_decode_and_dimensions() {
+        let mut valid = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new(&mut valid)
+            .encode(&[42, 84, 126], 1, 1, image::ExtendedColorType::Rgb8)
+            .unwrap();
+        assert!(validate_jpeg(&valid).is_ok());
+        assert!(validate_jpeg(&[0xff, 0xd8, 0xff, 0xd9]).is_err());
+        let mut truncated = valid[..valid.len() / 2].to_vec();
+        truncated.extend_from_slice(&[0xff, 0xd9]);
+        assert!(validate_jpeg(&truncated).is_err());
+        let mut bomb = valid.clone();
+        let sof = bomb
+            .windows(2)
+            .position(|bytes| bytes == [0xff, 0xc0])
+            .unwrap();
+        bomb[sof + 5..sof + 9].copy_from_slice(&[0x7f, 0xff, 0x7f, 0xff]);
+        assert!(validate_jpeg(&bomb).is_err());
+        let mut gray = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new(&mut gray)
+            .encode(&[42], 1, 1, image::ExtendedColorType::L8)
+            .unwrap();
+        assert!(validate_jpeg(&gray).is_ok());
+    }
+
+    #[tokio::test]
+    async fn snapshot_rejects_marker_only_image() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0; 4096];
+            socket.read(&mut request).await.unwrap();
+            socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\n\xff\xd8\xff\xd9").await.unwrap();
+        });
+        let endpoint = Url::parse(&format!("http://{address}/")).unwrap();
+        let client = reqwest::Client::new();
+        let device = Kvmd {
+            client: RwLock::new(Session {
+                client: client.clone(),
+                video: client,
+                cookies: Default::default(),
+            }),
+            config: Config {
+                endpoint: endpoint.clone(),
+                profile: DeviceProfile::PiKvm,
+                trusted_ca_pem: None,
+                insecure_tls: false,
+                timeout: Duration::from_secs(3),
+            },
+            endpoint,
+            profile: DeviceProfile::PiKvm,
+            inputs: Default::default(),
+            auth_headers: Default::default(),
+            approval_token: Default::default(),
+        };
+        assert!(matches!(
+            device.snapshot().await,
+            Err(Error::InvalidResponse(_))
+        ));
+        server.await.unwrap();
+    }
 
     fn config(endpoint: &str) -> Config {
         Config {

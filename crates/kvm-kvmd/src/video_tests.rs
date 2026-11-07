@@ -9,7 +9,27 @@ use tokio::{
 };
 use url::Url;
 
-async fn device(body: &'static [u8]) -> (Kvmd, Arc<Notify>, tokio::task::JoinHandle<()>) {
+fn jpeg() -> Vec<u8> {
+    let mut bytes = Vec::new();
+    image::codecs::jpeg::JpegEncoder::new(&mut bytes)
+        .encode(&[64, 128, 192], 1, 1, image::ExtendedColorType::Rgb8)
+        .unwrap();
+    bytes
+}
+
+fn part(frame: &[u8], length: bool, end: bool) -> Vec<u8> {
+    let mut bytes = b"--frame\r\nContent-Type: image/jpeg\r\n".to_vec();
+    if length {
+        bytes.extend_from_slice(format!("Content-Length: {}\r\n", frame.len()).as_bytes());
+    }
+    bytes.extend_from_slice(b"\r\n");
+    bytes.extend_from_slice(frame);
+    bytes.extend_from_slice(if end { b"\r\n--frame--\r\n" } else { b"\r\n" });
+    bytes
+}
+
+async fn device(body: impl Into<Vec<u8>>) -> (Kvmd, Arc<Notify>, tokio::task::JoinHandle<()>) {
+    let body = body.into();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let closed = Arc::new(Notify::new());
@@ -161,7 +181,8 @@ async fn trusted_tls_login_cookie_reaches_lease_and_stream() {
             .to_ascii_lowercase();
         assert!(request.starts_with("get /proxy/streamer/stream "));
         assert!(request.contains("cookie: auth_token=synthetic"));
-        stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: multipart/x-mixed-replace; boundary=frame\r\nConnection: close\r\n\r\n--frame\r\nContent-Type: image/jpeg\r\nContent-Length: 4\r\n\r\n\xff\xd8\xff\xd9\r\n--frame--\r\n").await.unwrap();
+        stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: multipart/x-mixed-replace; boundary=frame\r\nConnection: close\r\n\r\n" ).await.unwrap();
+        stream.write_all(&part(&jpeg(), true, true)).await.unwrap();
         watcher.await.unwrap();
     });
     let device = Kvmd::new(Config {
@@ -174,10 +195,7 @@ async fn trusted_tls_login_cookie_reaches_lease_and_stream() {
     .unwrap();
     device.login("test", "synthetic").await.unwrap();
     let mut video = device.video().await.unwrap();
-    assert_eq!(
-        video.next_frame().await.unwrap().unwrap().jpeg,
-        b"\xff\xd8\xff\xd9"
-    );
+    assert_eq!(video.next_frame().await.unwrap().unwrap().jpeg, jpeg());
     assert!(video.next_frame().await.unwrap().is_none());
     task.await.unwrap();
 }
@@ -255,7 +273,8 @@ async fn video_auth_headers(basic: bool) {
             assert!(request.contains("x-kvmd-user: user"));
             assert!(request.contains("x-kvmd-passwd: pass"));
         }
-        stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: multipart/x-mixed-replace; boundary=frame\r\n\r\n--frame\r\nContent-Type: image/jpeg\r\nContent-Length: 4\r\n\r\n\xff\xd8\xff\xd9\r\n--frame--\r\n").await.unwrap();
+        stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: multipart/x-mixed-replace; boundary=frame\r\n\r\n" ).await.unwrap();
+        stream.write_all(&part(&jpeg(), true, true)).await.unwrap();
         watcher.await.unwrap();
     });
     let config = Config {
@@ -272,10 +291,7 @@ async fn video_auth_headers(basic: bool) {
     }
     .unwrap();
     let mut video = device.video().await.unwrap();
-    assert_eq!(
-        video.next_frame().await.unwrap().unwrap().jpeg,
-        b"\xff\xd8\xff\xd9"
-    );
+    assert_eq!(video.next_frame().await.unwrap().unwrap().jpeg, jpeg());
     assert!(video.next_frame().await.unwrap().is_none());
     tokio::time::timeout(Duration::from_secs(3), task)
         .await
@@ -312,9 +328,12 @@ async fn cancelled_partial_frame_can_resume() {
         let mut request = [0; 4096];
         let n = http.read(&mut request).await.unwrap();
         assert!(n > 0);
-        http.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: multipart/x-mixed-replace; boundary=frame\r\n\r\n--frame\r\nContent-Type: image/jpeg\r\nContent-Length: 4\r\n\r\n\xff\xd8").await.unwrap();
+        let frame = jpeg();
+        http.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: multipart/x-mixed-replace; boundary=frame\r\n\r\n--frame\r\nContent-Type: image/jpeg\r\nContent-Length: {}\r\n\r\n", frame.len()).as_bytes()).await.unwrap();
+        http.write_all(&frame[..2]).await.unwrap();
         wait.await.unwrap();
-        http.write_all(b"\xff\xd9\r\n--frame--\r\n").await.unwrap();
+        http.write_all(&frame[2..]).await.unwrap();
+        http.write_all(b"\r\n--frame--\r\n").await.unwrap();
         watcher.await.unwrap();
     });
     let client = reqwest::Client::builder().http1_only().build().unwrap();
@@ -346,10 +365,7 @@ async fn cancelled_partial_frame_can_resume() {
             .is_err()
     );
     release.send(()).unwrap();
-    assert_eq!(
-        video.next_frame().await.unwrap().unwrap().jpeg,
-        b"\xff\xd8\xff\xd9"
-    );
+    assert_eq!(video.next_frame().await.unwrap().unwrap().jpeg, jpeg());
     server.await.unwrap();
 }
 
@@ -375,7 +391,8 @@ async fn relogin_waits_for_video_establishment() {
         assert!(stream.read(&mut request).await.unwrap() > 0);
         stream_arrived.send(()).unwrap();
         release_wait.await.unwrap();
-        stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: multipart/x-mixed-replace; boundary=frame\r\n\r\n--frame\r\nContent-Type: image/jpeg\r\nContent-Length: 4\r\n\r\n\xff\xd8\xff\xd9\r\n--frame--\r\n").await.unwrap();
+        stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: multipart/x-mixed-replace; boundary=frame\r\n\r\n" ).await.unwrap();
+        stream.write_all(&part(&jpeg(), true, true)).await.unwrap();
         let (mut login, _) = listener.accept().await.unwrap();
         assert!(login.read(&mut request).await.unwrap() > 0);
         login_arrived.send(()).unwrap();
@@ -449,8 +466,12 @@ async fn coalesced_http_response_delivers_multiple_frames() {
         let (mut http, _) = listener.accept().await.unwrap();
         let mut request = [0; 4096];
         assert!(http.read(&mut request).await.unwrap() > 0);
-        let response = b"HTTP/1.1 200 OK\r\nContent-Type: multipart/x-mixed-replace; boundary=frame\r\n\r\n--frame\r\nContent-Type: image/jpeg\r\nContent-Length: 5\r\n\r\n\xff\xd8a\xff\xd9\r\n--frame\r\nContent-Type: image/jpeg\r\nContent-Length: 5\r\n\r\n\xff\xd8b\xff\xd9\r\n--frame--\r\n";
-        http.write_all(response).await.unwrap();
+        let mut response =
+            b"HTTP/1.1 200 OK\r\nContent-Type: multipart/x-mixed-replace; boundary=frame\r\n\r\n"
+                .to_vec();
+        response.extend(part(&jpeg(), true, false));
+        response.extend(part(&jpeg(), true, true));
+        http.write_all(&response).await.unwrap();
         watcher.await.unwrap();
     });
     let client = reqwest::Client::builder().http1_only().build().unwrap();
@@ -476,14 +497,8 @@ async fn coalesced_http_response_delivers_multiple_frames() {
         video_proven: Default::default(),
     };
     let mut video = device.video().await.unwrap();
-    assert_eq!(
-        video.next_frame().await.unwrap().unwrap().jpeg,
-        b"\xff\xd8a\xff\xd9"
-    );
-    assert_eq!(
-        video.next_frame().await.unwrap().unwrap().jpeg,
-        b"\xff\xd8b\xff\xd9"
-    );
+    assert_eq!(video.next_frame().await.unwrap().unwrap().jpeg, jpeg());
+    assert_eq!(video.next_frame().await.unwrap().unwrap().jpeg, jpeg());
     assert!(video.next_frame().await.unwrap().is_none());
     tokio::time::timeout(Duration::from_secs(3), server)
         .await
@@ -515,9 +530,20 @@ async fn maximum_frame_with_maximum_headers_and_boundary() {
         headers.push_str(&"a".repeat(HEADERS - headers.len() - 4));
         headers.push_str("\r\n\r\n");
         http.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: multipart/x-mixed-replace; boundary={boundary}\r\n\r\n--{boundary}\r\n{headers}").as_bytes()).await.unwrap();
-        let mut frame = vec![0; FRAME];
-        frame[..2].copy_from_slice(&[0xff, 0xd8]);
-        frame[FRAME - 2..].copy_from_slice(&[0xff, 0xd9]);
+        let base = jpeg();
+        let mut frame = base[..2].to_vec();
+        while FRAME - frame.len() - (base.len() - 2) >= 4 {
+            let remaining = FRAME - frame.len() - (base.len() - 2);
+            let mut payload = (remaining - 4).min(65533);
+            if (1..4).contains(&(remaining - payload - 4)) {
+                payload -= 4;
+            }
+            frame.extend_from_slice(&[0xff, 0xfe]);
+            frame.extend_from_slice(&((payload + 2) as u16).to_be_bytes());
+            frame.extend(std::iter::repeat_n(b'a', payload));
+        }
+        assert_eq!(frame.len() + base.len() - 2, FRAME);
+        frame.extend_from_slice(&base[2..]);
         http.write_all(&frame).await.unwrap();
         http.write_all(format!("\r\n--{boundary}--\r\n").as_bytes())
             .await
@@ -555,17 +581,13 @@ async fn maximum_frame_with_maximum_headers_and_boundary() {
 
 #[tokio::test]
 async fn continuous_frames_and_drop_close_lease() {
-    let body = b"--frame\r\nContent-Type: image/jpeg\r\nContent-Length: 5\r\n\r\n\xff\xd8a\xff\xd9\r\n--frame\r\nContent-Type: image/jpeg\r\n\r\n\xff\xd8b\xff\xd9\r\n--frame\r\n";
+    let mut body = part(&jpeg(), true, false);
+    body.extend(part(&jpeg(), false, false));
+    body.extend_from_slice(b"--frame\r\n");
     let (device, closed, server) = device(body).await;
     let mut video = device.video().await.unwrap();
-    assert_eq!(
-        video.next_frame().await.unwrap().unwrap().jpeg,
-        b"\xff\xd8a\xff\xd9"
-    );
-    assert_eq!(
-        video.next_frame().await.unwrap().unwrap().jpeg,
-        b"\xff\xd8b\xff\xd9"
-    );
+    assert_eq!(video.next_frame().await.unwrap().unwrap().jpeg, jpeg());
+    assert_eq!(video.next_frame().await.unwrap().unwrap().jpeg, jpeg());
     drop(video);
     tokio::time::timeout(Duration::from_secs(3), closed.notified())
         .await
@@ -575,12 +597,9 @@ async fn continuous_frames_and_drop_close_lease() {
 
 #[tokio::test]
 async fn final_boundary_ends_stream_and_closes_lease() {
-    let (device, closed, server) = device(b"--frame\r\nContent-Type: image/jpeg\r\nContent-Length: 4\r\n\r\n\xff\xd8\xff\xd9\r\n--frame--\r\n").await;
+    let (device, closed, server) = device(part(&jpeg(), true, true)).await;
     let mut video = device.video().await.unwrap();
-    assert_eq!(
-        video.next_frame().await.unwrap().unwrap().jpeg,
-        b"\xff\xd8\xff\xd9"
-    );
+    assert_eq!(video.next_frame().await.unwrap().unwrap().jpeg, jpeg());
     assert!(video.next_frame().await.unwrap().is_none());
     tokio::time::timeout(Duration::from_secs(3), closed.notified())
         .await
@@ -590,12 +609,15 @@ async fn final_boundary_ends_stream_and_closes_lease() {
 
 #[tokio::test]
 async fn boundary_prefix_inside_frame_is_not_a_delimiter() {
-    let (device, closed, server) = device(b"--frame\r\nContent-Type: image/jpeg\r\n\r\n\xff\xd8\r\n--frame-not-a-boundary\xff\xd9\r\n--frame--\r\n").await;
+    let mut frame = jpeg();
+    let comment = b"\r\n--frame-not-a-boundary";
+    let mut segment = vec![0xff, 0xfe];
+    segment.extend_from_slice(&((comment.len() + 2) as u16).to_be_bytes());
+    segment.extend_from_slice(comment);
+    frame.splice(2..2, segment);
+    let (device, closed, server) = device(part(&frame, false, true)).await;
     let mut video = device.video().await.unwrap();
-    assert_eq!(
-        video.next_frame().await.unwrap().unwrap().jpeg,
-        b"\xff\xd8\r\n--frame-not-a-boundary\xff\xd9"
-    );
+    assert_eq!(video.next_frame().await.unwrap().unwrap().jpeg, frame);
     assert!(video.next_frame().await.unwrap().is_none());
     tokio::time::timeout(Duration::from_secs(3), closed.notified())
         .await
@@ -605,10 +627,7 @@ async fn boundary_prefix_inside_frame_is_not_a_delimiter() {
 
 #[tokio::test]
 async fn invalid_jpeg_is_rejected() {
-    let (device, closed, server) = device(
-        b"--frame\r\nContent-Type: image/jpeg\r\nContent-Length: 4\r\n\r\nnope\r\n--frame\r\n",
-    )
-    .await;
+    let (device, closed, server) = device(part(&[0xff, 0xd8, 0xff, 0xd9], true, true)).await;
     let mut video = device.video().await.unwrap();
     assert!(matches!(
         video.next_frame().await,
@@ -624,7 +643,8 @@ async fn invalid_jpeg_is_rejected() {
 #[tokio::test]
 async fn oversized_claim_is_rejected_and_closes_lease() {
     let (device, closed, server) =
-        device(b"--frame\r\nContent-Type: image/jpeg\r\nContent-Length: 999999999\r\n\r\n").await;
+        device(&b"--frame\r\nContent-Type: image/jpeg\r\nContent-Length: 999999999\r\n\r\n"[..])
+            .await;
     let mut video = device.video().await.unwrap();
     assert!(video.next_frame().await.is_err());
     drop(video);

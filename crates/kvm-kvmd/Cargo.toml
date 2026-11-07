@@ -9,6 +9,7 @@ async-trait.workspace = true
 base64 = "0.22"
 bytes = "1"
 futures-util = { version = "0.3", features = ["sink"] }
+image = { version = "0.25.10", default-features = false, features = ["jpeg"] }
 kvm-core = { path = "../kvm-core" }
 mime = "0.3"
 reqwest.workspace = true
