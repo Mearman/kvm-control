@@ -873,7 +873,7 @@ fn act() -> impl Strategy<Value = Act> {
 proptest! {
     #![proptest_config(cases(24))]
 
-    // The adapter's tracked inputs must equal what the device holds after every completed call, and an abandoned call must cost the adapter nothing beyond releasing its own press before the next input. Breaks if a release leaves a key tracked, if abandonment skips the cleanup, if cleanup runs after the following input, if cleanup releases an input another call pressed, or if a release is sent for an input that was never held.
+    // The adapter's tracked inputs must equal what the device holds after every completed call, and an abandoned call must cost the adapter nothing beyond releasing its own press before the next input. Breaks if a release leaves a key tracked, if abandonment skips the cleanup, if cleanup runs after the following input, if cleanup releases an input another call pressed, if an abandoned repeat press releases the input an earlier acknowledged press holds, or if a release is sent for an input that was never held.
     #[test]
     fn tracked_inputs_match_what_the_device_holds(acts in vec(act(), 1..14)) {
         let fx = fixture!();
@@ -919,8 +919,10 @@ proptest! {
                         });
                         gate.release.notify_one();
                         if press {
-                            held.insert((button, name.clone()));
-                            owed = Some((button, name));
+                            // A repeat press of an input already held owes nothing, so the earlier press keeps it.
+                            if held.insert((button, name.clone())) {
+                                owed = Some((button, name));
+                            }
                         } else {
                             held.remove(&(button, name));
                         }

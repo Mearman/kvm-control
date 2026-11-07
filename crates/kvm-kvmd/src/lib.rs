@@ -1060,7 +1060,8 @@ impl Kvmd {
             inputs.sequence += 1;
             let sequence = inputs.sequence;
             inputs.last.insert((kind, name.clone()), sequence);
-            let owes = pressed.then(|| Owed {
+            // A press of an input already held owes nothing, since releasing it would undo the earlier press that holds it.
+            let owes = (pressed && !inputs.held(kind).contains(&name)).then(|| Owed {
                 kind,
                 name: name.clone(),
                 sequence,

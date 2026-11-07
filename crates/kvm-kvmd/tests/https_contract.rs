@@ -1294,6 +1294,32 @@ fn mouse_movement_interrupted_by_runtime_shutdown_leaves_the_session_indetermina
 }
 
 #[tokio::test]
+async fn abandoned_repeat_press_keeps_the_earlier_acknowledged_press() {
+    let (mut endpoint, ca, calls, server) = fixture().await;
+    endpoint.set_path("/gated/");
+    let device = client(endpoint, Some(ca));
+    drive(&calls, device.key("KeyA", true)).await.unwrap();
+    // A repeat press of the held input is delivered and then abandoned; the earlier press reported success, so the input must stay held.
+    let woken = Arc::new(Woken(tokio::sync::Notify::new()));
+    let mut repeat = Box::pin(device.key("KeyA", true));
+    poll_once(repeat.as_mut(), &woken);
+    arrival(&calls).await;
+    calls.4.notify_one();
+    within("the outcome to be delivered", woken.0.notified()).await;
+    drop(repeat);
+    drive(&calls, device.key("KeyD", true)).await.unwrap();
+    assert_eq!(
+        input_events(&calls),
+        [
+            "key=KeyA&state=true",
+            "key=KeyA&state=true",
+            "key=KeyD&state=true",
+        ]
+    );
+    server.abort();
+}
+
+#[tokio::test]
 async fn expired_session_requires_explicit_reauthentication() {
     let (endpoint, ca, calls, server) = fixture().await;
     let device = client(endpoint, Some(ca));
