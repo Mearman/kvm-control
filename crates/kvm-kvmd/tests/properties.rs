@@ -883,8 +883,8 @@ proptest! {
         let mut cleanup_pending = false;
         for act in acts {
             if cleanup_pending {
-                // A second abandoned call is gated on the device, so the cleanup owed by the first must finish before it starts.
-                if matches!(act, Act::Cancel(..)) {
+                // Only a call that sends an input is ordered behind the cleanup owed by an abandoned call. A second abandoned call is gated on the device, and a release of an input that is no longer held sends nothing, so both wait for the cleanup explicitly.
+                if matches!(act, Act::Cancel(..) | Act::Release(..)) {
                     prop_assert!(fx.run(device.mouse_move(0, 0)).is_ok());
                 }
                 held.clear();
