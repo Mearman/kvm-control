@@ -753,6 +753,163 @@ async fn release_interrupted_by_runtime_shutdown_is_reported_once_by_the_next_lo
 }
 
 #[tokio::test]
+async fn failed_release_whose_caller_has_gone_is_reported_once() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut device = input_device(listener.local_addr().unwrap());
+    let reports = capture_reports(&mut device);
+    let device = Arc::new(device);
+    let (arrived_tx, arrived_rx) = tokio::sync::oneshot::channel();
+    let (answer_tx, answer_rx) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        let (mut press, _) = listener.accept().await.unwrap();
+        assert!(read_input_request(&mut press).await.contains("state=true"));
+        respond(&mut press, "200 OK", b"{\"ok\":true}").await;
+        let (mut release, _) = listener.accept().await.unwrap();
+        assert!(
+            read_input_request(&mut release)
+                .await
+                .contains("state=false")
+        );
+        arrived_tx.send(()).unwrap();
+        answer_rx.await.unwrap();
+        respond(&mut release, "500 Internal Server Error", b"").await;
+        listener
+    });
+    device.key("KeyA", true).await.unwrap();
+    let releasing = device.clone();
+    let release = tokio::spawn(async move { releasing.release_inputs().await });
+    tokio::time::timeout(INPUT_TIMEOUT, arrived_rx)
+        .await
+        .unwrap()
+        .unwrap();
+    release.abort();
+    assert!(release.await.unwrap_err().is_cancelled());
+    answer_tx.send(()).unwrap();
+    let listener = tokio::time::timeout(INPUT_TIMEOUT, server)
+        .await
+        .unwrap()
+        .unwrap();
+    input_tasks_finished(&device.inputs).await;
+    let reports = reports.lock().unwrap().clone();
+    assert_eq!(reports.len(), 1, "{reports:?}");
+    assert!(
+        reports[0].starts_with("Input outcome uncertain for an abandoned request: "),
+        "{reports:?}"
+    );
+    assert_no_waiting_connection(listener, "the failed release was sent again");
+}
+
+/// Presses KeyA and KeyB, then interrupts an explicit release by shutting its runtime down with the KeyA release unanswered. Returns the server task, which next expects the KeyB release that finishes the interrupted one and signals `finishing` when it arrives, then answers it after `answer`.
+async fn interrupt_a_release(
+    device: &Arc<Kvmd>,
+    listener: TcpListener,
+    finishing: tokio::sync::oneshot::Sender<()>,
+    answer: tokio::sync::oneshot::Receiver<()>,
+) -> tokio::task::JoinHandle<TcpListener> {
+    let (arrived_tx, arrived_rx) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        for _ in ["KeyA", "KeyB"] {
+            let (mut press, _) = listener.accept().await.unwrap();
+            assert!(read_input_request(&mut press).await.contains("state=true"));
+            respond(&mut press, "200 OK", b"{\"ok\":true}").await;
+        }
+        let (mut interrupted, _) = listener.accept().await.unwrap();
+        assert!(
+            read_input_request(&mut interrupted)
+                .await
+                .contains("key=KeyA&state=false")
+        );
+        arrived_tx.send(()).unwrap();
+        let (mut release, _) = listener.accept().await.unwrap();
+        assert!(
+            read_input_request(&mut release)
+                .await
+                .contains("key=KeyB&state=false")
+        );
+        finishing.send(()).unwrap();
+        answer.await.unwrap();
+        respond(&mut release, "200 OK", b"{\"ok\":true}").await;
+        drop(interrupted);
+        listener
+    });
+    device.key("KeyA", true).await.unwrap();
+    device.key("KeyB", true).await.unwrap();
+    let releasing = device.clone();
+    tokio::task::spawn_blocking(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async move {
+            tokio::select! {
+                result = releasing.release_inputs() => panic!("release completed unexpectedly: {result:?}"),
+                arrived = arrived_rx => arrived.unwrap(),
+            }
+        });
+    })
+    .await
+    .unwrap();
+    server
+}
+
+#[tokio::test]
+async fn interrupted_release_failure_handed_to_a_waiting_caller_is_not_reported() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut device = input_device(listener.local_addr().unwrap());
+    let reports = capture_reports(&mut device);
+    let device = Arc::new(device);
+    let (finishing_tx, _finishing_rx) = tokio::sync::oneshot::channel();
+    let (answer_tx, answer_rx) = tokio::sync::oneshot::channel();
+    let server = interrupt_a_release(&device, listener, finishing_tx, answer_rx).await;
+    answer_tx.send(()).unwrap();
+    // The explicit release that finishes the interrupted one hands its failure to this caller, which is then informed.
+    assert!(matches!(
+        device.release_inputs().await,
+        Err(kvm_core::Error::AmbiguousInput(_))
+    ));
+    let listener = tokio::time::timeout(INPUT_TIMEOUT, server)
+        .await
+        .unwrap()
+        .unwrap();
+    input_tasks_finished(&device.inputs).await;
+    assert_eq!(*reports.lock().unwrap(), Vec::<String>::new());
+    assert_no_waiting_connection(listener, "the interrupted release was sent again");
+}
+
+#[tokio::test]
+async fn interrupted_release_failure_whose_finishing_caller_has_gone_is_reported_once() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut device = input_device(listener.local_addr().unwrap());
+    let reports = capture_reports(&mut device);
+    let device = Arc::new(device);
+    let (finishing_tx, finishing_rx) = tokio::sync::oneshot::channel();
+    let (answer_tx, answer_rx) = tokio::sync::oneshot::channel();
+    let server = interrupt_a_release(&device, listener, finishing_tx, answer_rx).await;
+    let releasing = device.clone();
+    let release = tokio::spawn(async move { releasing.release_inputs().await });
+    tokio::time::timeout(INPUT_TIMEOUT, finishing_rx)
+        .await
+        .unwrap()
+        .unwrap();
+    // The caller of the finishing release leaves before it can be handed the failure.
+    release.abort();
+    assert!(release.await.unwrap_err().is_cancelled());
+    answer_tx.send(()).unwrap();
+    let listener = tokio::time::timeout(INPUT_TIMEOUT, server)
+        .await
+        .unwrap()
+        .unwrap();
+    input_tasks_finished(&device.inputs).await;
+    let reports = reports.lock().unwrap().clone();
+    assert_eq!(reports.len(), 1, "{reports:?}");
+    assert!(
+        reports[0].starts_with("Input outcome uncertain for an abandoned request: "),
+        "{reports:?}"
+    );
+    assert_no_waiting_connection(listener, "the interrupted release was sent again");
+}
+
+#[tokio::test]
 async fn failed_release_by_an_owner_dropped_on_another_runtime_is_reported_once() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let mut device = input_device(listener.local_addr().unwrap());
