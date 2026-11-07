@@ -87,7 +87,7 @@ async fn device(body: impl Into<Vec<u8>>) -> (Kvmd, Arc<Notify>, tokio::task::Jo
             profile: DeviceProfile::PiKvm,
             trusted_ca_pem: None,
             insecure_tls: false,
-            timeout: Duration::from_secs(3),
+            timeout: VIDEO_TIMEOUT,
         },
         endpoint: Url::parse(&format!("http://{address}/proxy/")).unwrap(),
         profile: DeviceProfile::PiKvm,
@@ -117,8 +117,11 @@ async fn read_request(stream: &mut tokio::net::TcpStream) -> String {
     String::from_utf8(bytes).unwrap()
 }
 
-/// The input test client's request timeout, also used as the bound on each wait in the input tests. A single request finishes within it, by reply or by the client's own timeout, so a wait for one request or its outcome that exceeds it means the awaited event did not happen. A wait that starts before anything is sent, or is blocked on the input lock, has no client timeout behind it and relies on the bound alone; and an input task that sends several requests (settlement, then its own) can legitimately run past it, so such waits cover one request each.
+/// The input test client's request timeout: `input_device` builds its client and its configuration with it. Input-test waits that neither the client timeout nor a `select!` already bounds are bounded by it too. A single request finishes within it, by reply or by the client's own timeout, so a wait for one request or its outcome that exceeds it means the awaited event did not happen. A wait that starts before anything is sent, or is blocked on the input lock, relies on this bound alone, and an input task that sends several requests (settlement, then its own) can legitimately run past it, so each such wait covers one request.
 const INPUT_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// The video test devices' request timeout, set in their configuration and clients, and the bound on video-test waits for one request, stream or watcher to finish; a wait exceeding it means the awaited event did not happen.
+const VIDEO_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Polls an input operation once and returns it spawned. Afterwards the operation is waiting for the input lock that `device` shows as held, so it cannot send a request until the holder finishes.
 async fn queued<F>(device: &Kvmd, future: F) -> tokio::task::JoinHandle<F::Output>
@@ -176,7 +179,7 @@ fn input_device(address: std::net::SocketAddr) -> Kvmd {
             profile: DeviceProfile::PiKvm,
             trusted_ca_pem: None,
             insecure_tls: false,
-            timeout: Duration::from_secs(3),
+            timeout: INPUT_TIMEOUT,
         },
         endpoint,
         profile: DeviceProfile::PiKvm,
@@ -233,39 +236,7 @@ async fn cancelled_press_finishes_before_concurrent_release() {
             .unwrap();
         (first, second, listener)
     });
-    let endpoint = Url::parse(&format!("http://{address}/")).unwrap();
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(3))
-        .http1_only()
-        .build()
-        .unwrap();
-    let device = Arc::new(Kvmd {
-        client: Arc::new(tokio::sync::RwLock::new(crate::Session {
-            client: client.clone(),
-            video: client,
-            cookies: Default::default(),
-        })),
-        config: Config {
-            endpoint: endpoint.clone(),
-            profile: DeviceProfile::PiKvm,
-            trusted_ca_pem: None,
-            insecure_tls: false,
-            timeout: Duration::from_secs(3),
-        },
-        endpoint,
-        profile: DeviceProfile::PiKvm,
-        inputs: Default::default(),
-        owed: Default::default(),
-        auth_headers: Default::default(),
-        approval_token: Default::default(),
-        snapshot_proven: Default::default(),
-        video_proven: Default::default(),
-        cleanup_on_drop: true,
-        input_runtime: Default::default(),
-        reporter: Default::default(),
-        stream_storage: Arc::new(tokio::sync::Semaphore::new(crate::MAX_JPEG_VALIDATIONS)),
-        snapshot_storage: Arc::new(tokio::sync::Semaphore::new(crate::MAX_JPEG_VALIDATIONS)),
-    });
+    let device = Arc::new(input_device(address));
     let pressing = device.clone();
     let task = tokio::spawn(async move { pressing.key("KeyA", true).await });
     tokio::time::timeout(INPUT_TIMEOUT, accepted_rx)
@@ -281,7 +252,11 @@ async fn cancelled_press_finishes_before_concurrent_release() {
         .unwrap()
         .unwrap();
     finish_tx.send(()).unwrap();
-    release.await.unwrap().unwrap();
+    tokio::time::timeout(INPUT_TIMEOUT, release)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
     let (first, second, listener) = tokio::time::timeout(INPUT_TIMEOUT, server)
         .await
         .unwrap()
@@ -345,7 +320,11 @@ async fn concurrent_key_and_button_presses_are_serialised() {
     .await;
     proceed_tx.send(()).unwrap();
     first.await.unwrap().unwrap();
-    second.await.unwrap().unwrap();
+    tokio::time::timeout(INPUT_TIMEOUT, second)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
     tokio::time::timeout(INPUT_TIMEOUT, server)
         .await
         .unwrap()
@@ -557,7 +536,11 @@ async fn cancelled_move_finishes_before_button_press() {
         .unwrap()
         .unwrap();
     finish_tx.send(()).unwrap();
-    button.await.unwrap().unwrap();
+    tokio::time::timeout(INPUT_TIMEOUT, button)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
     tokio::time::timeout(INPUT_TIMEOUT, server)
         .await
         .unwrap()
@@ -1325,7 +1308,7 @@ async fn cancelling_snapshot_read_releases_capacity() {
             profile: DeviceProfile::PiKvm,
             trusted_ca_pem: None,
             insecure_tls: false,
-            timeout: Duration::from_secs(3),
+            timeout: VIDEO_TIMEOUT,
         },
         endpoint,
         profile: DeviceProfile::PiKvm,
@@ -1347,7 +1330,14 @@ async fn cancelling_snapshot_read_releases_capacity() {
         result = ready => result.unwrap(),
     }
     drop(snapshot);
-    assert_eq!(device.snapshot().await.unwrap().jpeg, jpeg());
+    assert_eq!(
+        tokio::time::timeout(VIDEO_TIMEOUT, device.snapshot())
+            .await
+            .unwrap()
+            .unwrap()
+            .jpeg,
+        jpeg()
+    );
     server.await.unwrap();
 }
 
@@ -1378,7 +1368,7 @@ async fn stream_validation_survives_cancelled_next_frame() {
     release_tx.send(()).unwrap();
     assert_eq!(video.next_frame().await.unwrap().unwrap().jpeg, frame);
     assert!(video.next_frame().await.unwrap().is_none());
-    tokio::time::timeout(Duration::from_secs(3), closed.notified())
+    tokio::time::timeout(VIDEO_TIMEOUT, closed.notified())
         .await
         .unwrap();
     server.await.unwrap();
@@ -1424,7 +1414,7 @@ async fn stream_validation_survives_cancelled_next_frame() {
             profile: DeviceProfile::PiKvm,
             trusted_ca_pem: None,
             insecure_tls: false,
-            timeout: Duration::from_secs(3),
+            timeout: VIDEO_TIMEOUT,
         },
         endpoint,
         profile: DeviceProfile::PiKvm,
@@ -1491,7 +1481,7 @@ async fn concurrent_snapshots_exhaust_and_recover_storage() {
             profile: DeviceProfile::PiKvm,
             trusted_ca_pem: None,
             insecure_tls: false,
-            timeout: Duration::from_secs(3),
+            timeout: VIDEO_TIMEOUT,
         },
         endpoint,
         profile: DeviceProfile::PiKvm,
@@ -1511,7 +1501,7 @@ async fn concurrent_snapshots_exhaust_and_recover_storage() {
     for _ in 0..crate::MAX_JPEG_VALIDATIONS {
         let device = device.clone();
         tasks.push(tokio::spawn(async move { device.snapshot().await }));
-        tokio::time::timeout(Duration::from_secs(3), arrived_rx.recv())
+        tokio::time::timeout(VIDEO_TIMEOUT, arrived_rx.recv())
             .await
             .unwrap()
             .unwrap();
@@ -1523,7 +1513,10 @@ async fn concurrent_snapshots_exhaust_and_recover_storage() {
         task.abort();
         assert!(task.await.unwrap_err().is_cancelled());
     }
-    server.await.unwrap();
+    tokio::time::timeout(VIDEO_TIMEOUT, server)
+        .await
+        .unwrap()
+        .unwrap();
 }
 
 #[tokio::test]
@@ -1550,7 +1543,7 @@ async fn concurrent_streams_exhaust_and_recover_storage() {
     );
     drop(streams.pop());
     let (released, completed) = servers.pop().unwrap();
-    tokio::time::timeout(Duration::from_secs(3), released.notified())
+    tokio::time::timeout(VIDEO_TIMEOUT, released.notified())
         .await
         .unwrap();
     completed.await.unwrap();
@@ -1562,12 +1555,12 @@ async fn concurrent_streams_exhaust_and_recover_storage() {
     drop(replacement);
     drop(streams);
     for (closed, server) in servers {
-        tokio::time::timeout(Duration::from_secs(3), closed.notified())
+        tokio::time::timeout(VIDEO_TIMEOUT, closed.notified())
             .await
             .unwrap();
         server.await.unwrap();
     }
-    tokio::time::timeout(Duration::from_secs(3), closed.notified())
+    tokio::time::timeout(VIDEO_TIMEOUT, closed.notified())
         .await
         .unwrap();
     server.await.unwrap();
@@ -1667,14 +1660,17 @@ async fn trusted_tls_login_cookie_reaches_lease_and_stream() {
         profile: DeviceProfile::PiKvm,
         trusted_ca_pem: Some(cert.pem().into_bytes()),
         insecure_tls: false,
-        timeout: Duration::from_secs(3),
+        timeout: VIDEO_TIMEOUT,
     })
     .unwrap();
     device.login("test", "synthetic").await.unwrap();
     let mut video = device.video().await.unwrap();
     assert_eq!(video.next_frame().await.unwrap().unwrap().jpeg, jpeg());
     assert!(video.next_frame().await.unwrap().is_none());
-    task.await.unwrap();
+    tokio::time::timeout(VIDEO_TIMEOUT, task)
+        .await
+        .unwrap()
+        .unwrap();
 }
 
 async fn video_auth_headers(basic: bool) {
@@ -1759,7 +1755,7 @@ async fn video_auth_headers(basic: bool) {
         profile: DeviceProfile::PiKvm,
         trusted_ca_pem: Some(cert.pem().into_bytes()),
         insecure_tls: false,
-        timeout: Duration::from_secs(3),
+        timeout: VIDEO_TIMEOUT,
     };
     let device = if basic {
         Kvmd::with_basic_auth(config, "user", "pass")
@@ -1770,7 +1766,7 @@ async fn video_auth_headers(basic: bool) {
     let mut video = device.video().await.unwrap();
     assert_eq!(video.next_frame().await.unwrap().unwrap().jpeg, jpeg());
     assert!(video.next_frame().await.unwrap().is_none());
-    tokio::time::timeout(Duration::from_secs(3), task)
+    tokio::time::timeout(VIDEO_TIMEOUT, task)
         .await
         .unwrap()
         .unwrap();
@@ -1825,7 +1821,7 @@ async fn cancelled_partial_frame_can_resume() {
             profile: DeviceProfile::PiKvm,
             trusted_ca_pem: None,
             insecure_tls: false,
-            timeout: Duration::from_secs(3),
+            timeout: VIDEO_TIMEOUT,
         },
         endpoint: Url::parse(&format!("http://{address}/proxy/")).unwrap(),
         profile: DeviceProfile::PiKvm,
@@ -1849,7 +1845,10 @@ async fn cancelled_partial_frame_can_resume() {
     );
     release.send(()).unwrap();
     assert_eq!(video.next_frame().await.unwrap().unwrap().jpeg, jpeg());
-    server.await.unwrap();
+    tokio::time::timeout(VIDEO_TIMEOUT, server)
+        .await
+        .unwrap()
+        .unwrap();
 }
 
 #[tokio::test]
@@ -1900,7 +1899,7 @@ async fn relogin_waits_for_video_establishment() {
             profile: DeviceProfile::PiKvm,
             trusted_ca_pem: None,
             insecure_tls: false,
-            timeout: Duration::from_secs(3),
+            timeout: VIDEO_TIMEOUT,
         },
         endpoint,
         profile: DeviceProfile::PiKvm,
@@ -1918,7 +1917,10 @@ async fn relogin_waits_for_video_establishment() {
     });
     let video_device = device.clone();
     let video_task = tokio::spawn(async move { video_device.video().await });
-    stream_wait.await.unwrap();
+    tokio::time::timeout(VIDEO_TIMEOUT, stream_wait)
+        .await
+        .unwrap()
+        .unwrap();
     let login_device = device.clone();
     let login_task = tokio::spawn(async move { login_device.login("user", "pass").await });
     tokio::task::yield_now().await;
@@ -1932,7 +1934,7 @@ async fn relogin_waits_for_video_establishment() {
     assert!(login_task.await.unwrap().is_err());
     assert!(video.next_frame().await.unwrap().is_some());
     drop(video);
-    tokio::time::timeout(Duration::from_secs(3), server)
+    tokio::time::timeout(VIDEO_TIMEOUT, server)
         .await
         .unwrap()
         .unwrap();
@@ -1975,7 +1977,7 @@ async fn coalesced_http_response_delivers_multiple_frames() {
             profile: DeviceProfile::PiKvm,
             trusted_ca_pem: None,
             insecure_tls: false,
-            timeout: Duration::from_secs(3),
+            timeout: VIDEO_TIMEOUT,
         },
         endpoint: Url::parse(&format!("http://{address}/proxy/")).unwrap(),
         profile: DeviceProfile::PiKvm,
@@ -1998,7 +2000,7 @@ async fn coalesced_http_response_delivers_multiple_frames() {
         jpeg_colour([200, 20, 50])
     );
     assert!(video.next_frame().await.unwrap().is_none());
-    tokio::time::timeout(Duration::from_secs(3), server)
+    tokio::time::timeout(VIDEO_TIMEOUT, server)
         .await
         .unwrap()
         .unwrap();
@@ -2080,7 +2082,10 @@ async fn maximum_frame_with_maximum_headers_and_boundary() {
     let mut video = device.video().await.unwrap();
     assert_eq!(video.next_frame().await.unwrap().unwrap().jpeg.len(), FRAME);
     assert!(video.next_frame().await.unwrap().is_none());
-    server.await.unwrap();
+    tokio::time::timeout(VIDEO_TIMEOUT, server)
+        .await
+        .unwrap()
+        .unwrap();
 }
 
 // This shared synthetic fixture uses the routes documented for PiKVM kvmd fcb903eb3be70d8eee4aee99e5fcc1c743e3ccef and GLKVM glkvm 3e8dd23c4bd638a4650433664cc3b0f3b4d29395. These are source revisions, not firmware releases, and neither profile is independently verified by this fixture.
@@ -2126,7 +2131,7 @@ async fn explicit_video_reopen_after_complete_or_interrupted_stream() {
                     http.write_all(&part(&jpeg(), true, true)).await.unwrap();
                 }
                 drop(http);
-                tokio::time::timeout(Duration::from_secs(3), async {
+                tokio::time::timeout(VIDEO_TIMEOUT, async {
                     while let Some(message) = ws.next().await {
                         if message.is_err() {
                             break;
@@ -2170,7 +2175,7 @@ async fn continuous_frames_and_drop_close_lease() {
         jpeg_colour([200, 20, 50])
     );
     drop(video);
-    tokio::time::timeout(Duration::from_secs(3), closed.notified())
+    tokio::time::timeout(VIDEO_TIMEOUT, closed.notified())
         .await
         .unwrap();
     server.await.unwrap();
@@ -2182,7 +2187,7 @@ async fn final_boundary_ends_stream_and_closes_lease() {
     let mut video = device.video().await.unwrap();
     assert_eq!(video.next_frame().await.unwrap().unwrap().jpeg, jpeg());
     assert!(video.next_frame().await.unwrap().is_none());
-    tokio::time::timeout(Duration::from_secs(3), closed.notified())
+    tokio::time::timeout(VIDEO_TIMEOUT, closed.notified())
         .await
         .unwrap();
     server.await.unwrap();
@@ -2200,7 +2205,7 @@ async fn boundary_prefix_inside_frame_is_not_a_delimiter() {
     let mut video = device.video().await.unwrap();
     assert_eq!(video.next_frame().await.unwrap().unwrap().jpeg, frame);
     assert!(video.next_frame().await.unwrap().is_none());
-    tokio::time::timeout(Duration::from_secs(3), closed.notified())
+    tokio::time::timeout(VIDEO_TIMEOUT, closed.notified())
         .await
         .unwrap();
     server.await.unwrap();
@@ -2214,7 +2219,7 @@ async fn invalid_jpeg_is_rejected() {
         video.next_frame().await,
         Err(kvm_core::Error::InvalidResponse(_))
     ));
-    tokio::time::timeout(Duration::from_secs(3), closed.notified())
+    tokio::time::timeout(VIDEO_TIMEOUT, closed.notified())
         .await
         .unwrap();
     assert!(video.next_frame().await.unwrap().is_none());
@@ -2229,7 +2234,7 @@ async fn oversized_claim_is_rejected_and_closes_lease() {
     let mut video = device.video().await.unwrap();
     assert!(video.next_frame().await.is_err());
     drop(video);
-    tokio::time::timeout(Duration::from_secs(3), closed.notified())
+    tokio::time::timeout(VIDEO_TIMEOUT, closed.notified())
         .await
         .unwrap();
     server.await.unwrap();
