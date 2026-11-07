@@ -65,7 +65,7 @@ Library callers should explicitly await `release_inputs()` when ending input and
 
 ### Errors
 
-Every fallible call returns `kvm_core::Error`. The enum's documentation (`cargo doc -p kvm-core --open` in a checkout of `main`) says when each variant occurs and what a caller should do; it is not in `v0.1.0`, and the first release after `v0.1.0` includes it. The variants divide by whether the device may have acted: `Authentication`, `Unsupported`, `Transport`, `Http` and `InvalidResponse` returned by an input or control method mean the requested input or control was not submitted (releases owed to earlier interrupted presses may have been sent first), while `AmbiguousInput` and `AmbiguousControl` mean it was, or may have been, submitted with an unknown effect. `login` and `complete_approval` return `AmbiguousInput` without sending their own request while inputs are held, or when sending owed releases failed; both may have sent owed releases first, and the second case is as ambiguous as a failed input request. Never replay an ambiguous operation automatically; observe the device and the controlled host first. An acknowledged control request whose effect could not be observed is not an error but `Ok(ControlOutcome::Unverified)`.
+Every fallible call returns `kvm_core::Error`. The enum's documentation (`cargo doc -p kvm-core --open` in a checkout of `main`) says when each variant occurs and what a caller should do; it is not in `v0.1.0`, and the first release after `v0.1.0` includes it. The variants divide by whether the device may have acted: `Authentication`, `Unsupported`, `Transport`, `Http` and `InvalidResponse` returned by an input or control method mean the requested input or control was not submitted (releases owed to earlier interrupted presses may have been sent first), while `AmbiguousInput` and `AmbiguousControl` mean it was, or may have been, submitted with an unknown effect. `login` and `complete_approval` return `AmbiguousInput` without sending their own request while inputs are held, or when the task sending owed releases failed (a panic or runtime shutdown), which is as ambiguous as a failed input request; both may have sent owed releases first. A failed owed release itself is reported to diagnostics, leaves input indeterminate and does not stop the login or approval. Never replay an ambiguous operation automatically; observe the device and the controlled host first. An acknowledged control request whose effect could not be observed is not an error but `Ok(ControlOutcome::Unverified)`.
 
 ### Using the crates from another project
 
@@ -95,8 +95,7 @@ use zeroize::Zeroizing;
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Read the password from redirected standard input, never from arguments or the environment.
-    // Zeroizing clears this String's final buffer when it is dropped. Buffers freed as read_line
-    // grows the String, and standard input's own buffer, keep their bytes until reused.
+    // Zeroizing clears this String's final buffer when it is dropped; buffers freed as read_line grows the String, and standard input's own buffer, keep their bytes until reused.
     let mut password = Zeroizing::new(String::new());
     std::io::stdin().lock().read_line(&mut password)?;
     let adapter = Kvmd::new(Config {
@@ -137,4 +136,4 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ### Video transports
 
-The adapter implements one live-video transport, MJPEG over uStreamer's HTTP stream. The [video transport investigation](docs/video-transports.md) describes the H.264 and WebRTC transports built on uStreamer that the inspected PiKVM and GLKVM sources also offer, how each is negotiated, what the adapter does when a device offers only one of them, and a design for selecting a transport from discovered capabilities.
+The adapter implements one live-video transport, MJPEG over uStreamer's HTTP stream. The [video transport investigation](docs/video-transports.md) describes the H.264 and WebRTC transports, including GLKVM's adaptive WebRTC mode, that the inspected PiKVM and GLKVM sources also offer, how each is negotiated, what the adapter does when a device offers only one of them, and a design for selecting a transport from discovered capabilities.
