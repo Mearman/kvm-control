@@ -1602,6 +1602,12 @@ mod tests {
         image::codecs::jpeg::JpegEncoder::new(&mut jpeg)
             .encode_image(&image)
             .unwrap();
+        let decoded = image::load_from_memory_with_format(&jpeg, image::ImageFormat::Jpeg)
+            .unwrap()
+            .to_rgb8();
+        // A uniform halfblock is encoded as a coloured space, not necessarily a block glyph.
+        let [red, green, blue] = decoded.get_pixel(0, 0).0;
+        let frame_colour = ratatui::style::Color::Rgb(red, green, blue);
         let device = FakeDevice {
             video_frame: Some(jpeg),
             ..FakeDevice::default()
@@ -1627,7 +1633,7 @@ mod tests {
                         .buffer()
                         .content()
                         .iter()
-                        .any(|cell| cell.symbol() == "▀")
+                        .any(|cell| cell.bg == frame_colour)
                     {
                         Ok(Some(Event::Key(crossterm::event::KeyEvent::new(
                             KeyCode::Char('q'),
@@ -1649,7 +1655,7 @@ mod tests {
                 .buffer()
                 .content()
                 .iter()
-                .any(|cell| cell.symbol() == "▀")
+                .any(|cell| cell.bg == frame_colour)
         );
         tokio::time::timeout(Duration::from_secs(2), async {
             while !device.dropped.load(std::sync::atomic::Ordering::SeqCst) {
