@@ -1,0 +1,40 @@
+name: Verification
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: verification-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+env:
+  CARGO_INCREMENTAL: 0
+  CARGO_PROFILE_DEV_DEBUG: 0
+
+jobs:
+  checks:
+    name: Checks (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - name: Check formatting
+        run: cargo fmt --all --check
+      - name: Check Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Test workspace
+        run: cargo test --workspace --locked
+      - name: Test independent consumer
+        run: cargo test --manifest-path examples/in-process/Cargo.toml
