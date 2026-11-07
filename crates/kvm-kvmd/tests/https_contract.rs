@@ -305,9 +305,13 @@ async fn fixture() -> (Url, Vec<u8>, Calls, tokio::task::JoinHandle<()>) {
 }
 
 fn client(endpoint: Url, ca: Option<Vec<u8>>) -> Kvmd {
+    profile_client(endpoint, ca, DeviceProfile::PiKvm)
+}
+
+fn profile_client(endpoint: Url, ca: Option<Vec<u8>>, profile: DeviceProfile) -> Kvmd {
     Kvmd::new(Config {
         endpoint,
-        profile: DeviceProfile::PiKvm,
+        profile,
         trusted_ca_pem: ca,
         insecure_tls: false,
         timeout: Duration::from_secs(5),
@@ -631,7 +635,7 @@ async fn oversized_json_is_rejected_for_length_and_chunked_responses() {
     }
     let mut url = endpoint.clone();
     url.set_path("/bigapproval/");
-    let device = client(url, Some(ca.clone()));
+    let device = profile_client(url, Some(ca.clone()), DeviceProfile::GlKvm);
     assert!(matches!(
         device.login("test-user", "test-password").await.unwrap(),
         LoginState::ApprovalPending { .. }
@@ -693,7 +697,7 @@ async fn ordinary_response_cannot_replace_login_cookie() {
 async fn approval_token_without_usable_cookie_is_rejected() {
     let (mut endpoint, ca, _, server) = fixture().await;
     endpoint.set_path("/nocookie/");
-    let device = client(endpoint, Some(ca));
+    let device = profile_client(endpoint, Some(ca), DeviceProfile::GlKvm);
     assert!(matches!(
         device.login("test-user", "test-password").await.unwrap(),
         LoginState::ApprovalPending { .. }
@@ -710,10 +714,26 @@ async fn approval_token_without_usable_cookie_is_rejected() {
 }
 
 #[tokio::test]
-async fn gl_approval_is_not_reported_as_authenticated() {
+async fn pikvm_rejects_gl_approval_response() {
     let (mut endpoint, ca, _, server) = fixture().await;
     endpoint.set_path("/gl/");
     let device = client(endpoint, Some(ca));
+    assert!(matches!(
+        device.login("test-user", "test-password").await,
+        Err(Error::InvalidResponse(_))
+    ));
+    assert!(matches!(
+        device.complete_approval().await,
+        Err(Error::Unsupported(_))
+    ));
+    server.abort();
+}
+
+#[tokio::test]
+async fn gl_approval_is_not_reported_as_authenticated() {
+    let (mut endpoint, ca, _, server) = fixture().await;
+    endpoint.set_path("/gl/");
+    let device = profile_client(endpoint, Some(ca), DeviceProfile::GlKvm);
     assert_eq!(
         device.login("test-user", "test-password").await.unwrap(),
         LoginState::ApprovalPending {

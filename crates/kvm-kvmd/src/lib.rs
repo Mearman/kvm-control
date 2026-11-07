@@ -348,6 +348,11 @@ impl Kvmd {
             .and_then(serde_json::Value::as_bool)
             == Some(true)
         {
+            if self.profile != DeviceProfile::GlKvm {
+                return Err(Error::InvalidResponse(
+                    "two-step approval is not supported by the PiKVM profile".into(),
+                ));
+            }
             let token = result
                 .get("two_step_token")
                 .and_then(serde_json::Value::as_str)
@@ -370,6 +375,11 @@ impl Kvmd {
 
     /// Checks a pending GLKVM approval without exposing its temporary token.
     pub async fn complete_approval(&self) -> Result<LoginState> {
+        if self.profile != DeviceProfile::GlKvm {
+            return Err(Error::Unsupported(
+                "device approval requires the GLKVM profile".into(),
+            ));
+        }
         let inputs = self.inputs.lock().await;
         if !inputs.keys.is_empty() || !inputs.buttons.is_empty() {
             return Err(Error::AmbiguousInput(
