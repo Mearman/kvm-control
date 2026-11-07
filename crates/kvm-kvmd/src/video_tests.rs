@@ -265,15 +265,24 @@ async fn cancelled_press_finishes_before_concurrent_release() {
     });
     let pressing = device.clone();
     let task = tokio::spawn(async move { pressing.key("KeyA", true).await });
-    accepted_rx.await.unwrap();
+    tokio::time::timeout(INPUT_TIMEOUT, accepted_rx)
+        .await
+        .unwrap()
+        .unwrap();
     task.abort();
     let releasing = device.clone();
     let release = queued(&device, async move { releasing.release_inputs().await }).await;
     queued_tx.send(()).unwrap();
-    checked_rx.await.unwrap();
+    tokio::time::timeout(INPUT_TIMEOUT, checked_rx)
+        .await
+        .unwrap()
+        .unwrap();
     finish_tx.send(()).unwrap();
     release.await.unwrap().unwrap();
-    let (first, second, listener) = server.await.unwrap();
+    let (first, second, listener) = tokio::time::timeout(INPUT_TIMEOUT, server)
+        .await
+        .unwrap()
+        .unwrap();
     assert!(first.contains("state=true"));
     assert!(second.contains("state=false"));
     let inputs = device.inputs.clone();
@@ -322,7 +331,10 @@ async fn concurrent_key_and_button_presses_are_serialised() {
     });
     let first_device = device.clone();
     let first = tokio::spawn(async move { first_device.key("KeyA", true).await });
-    accepted_rx.await.unwrap();
+    tokio::time::timeout(INPUT_TIMEOUT, accepted_rx)
+        .await
+        .unwrap()
+        .unwrap();
     let second_device = device.clone();
     let second = queued(&device, async move {
         second_device.mouse_button("left", true).await
@@ -331,7 +343,10 @@ async fn concurrent_key_and_button_presses_are_serialised() {
     proceed_tx.send(()).unwrap();
     first.await.unwrap().unwrap();
     second.await.unwrap().unwrap();
-    server.await.unwrap();
+    tokio::time::timeout(INPUT_TIMEOUT, server)
+        .await
+        .unwrap()
+        .unwrap();
 }
 
 #[tokio::test]
@@ -406,7 +421,10 @@ async fn timed_out_press_remains_indeterminate_after_release() {
         Err(kvm_core::Error::AmbiguousInput(_))
     ));
     applied_tx.send(()).unwrap();
-    server.await.unwrap();
+    tokio::time::timeout(INPUT_TIMEOUT, server)
+        .await
+        .unwrap()
+        .unwrap();
 }
 
 async fn read_input_request(stream: &mut tokio::net::TcpStream) -> String {
@@ -451,7 +469,10 @@ async fn relogin_cannot_discard_authentication_with_held_input() {
         Err(kvm_core::Error::AmbiguousInput(_))
     ));
     device.release_inputs().await.unwrap();
-    server.await.unwrap();
+    tokio::time::timeout(INPUT_TIMEOUT, server)
+        .await
+        .unwrap()
+        .unwrap();
 }
 
 #[tokio::test]
@@ -516,7 +537,10 @@ async fn cancelled_move_finishes_before_button_press() {
     });
     let moving = device.clone();
     let movement = tokio::spawn(async move { moving.mouse_move(1, 2).await });
-    accepted_rx.await.unwrap();
+    tokio::time::timeout(INPUT_TIMEOUT, accepted_rx)
+        .await
+        .unwrap()
+        .unwrap();
     movement.abort();
     let clicking = device.clone();
     let button = queued(
@@ -525,10 +549,16 @@ async fn cancelled_move_finishes_before_button_press() {
     )
     .await;
     queued_tx.send(()).unwrap();
-    checked_rx.await.unwrap();
+    tokio::time::timeout(INPUT_TIMEOUT, checked_rx)
+        .await
+        .unwrap()
+        .unwrap();
     finish_tx.send(()).unwrap();
     button.await.unwrap().unwrap();
-    server.await.unwrap();
+    tokio::time::timeout(INPUT_TIMEOUT, server)
+        .await
+        .unwrap()
+        .unwrap();
 }
 
 #[tokio::test]
@@ -558,7 +588,10 @@ async fn movement_abandoned_during_its_state_read_is_not_sent() {
     });
     let moving = device.clone();
     let movement = tokio::spawn(async move { moving.mouse_move(1, 2).await });
-    read_rx.await.unwrap();
+    tokio::time::timeout(INPUT_TIMEOUT, read_rx)
+        .await
+        .unwrap()
+        .unwrap();
     // The caller leaves while the state read is unanswered, after the check that follows settlement.
     movement.abort();
     assert!(movement.await.unwrap_err().is_cancelled());
