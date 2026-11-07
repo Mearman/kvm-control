@@ -535,13 +535,11 @@ impl Handover<'_> {
 
 impl Drop for Handover<'_> {
     fn drop(&mut self) {
-        let Some(mut outcome) = self.outcome.take() else {
+        let Some(outcome) = self.outcome.take() else {
             return;
         };
-        outcome.close();
-        if let Ok((Err(error), true)) = outcome.try_recv() {
-            self.device.report_abandoned(&error);
-        }
+        let _ = &self.device;
+        drop(outcome);
     }
 }
 
