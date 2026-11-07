@@ -161,6 +161,30 @@ fn invoke_with_signal(
     (output, server.join().unwrap())
 }
 
+/// The version and usage name the installed `kvm-cli` binary, so they match the command a user runs.
+#[test]
+fn version_and_usage_name_the_kvm_cli_binary() {
+    let output = Command::new(env!("CARGO_BIN_EXE_kvm-cli"))
+        .arg("--version")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        format!("kvm-cli {}\n", env!("CARGO_PKG_VERSION"))
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_kvm-cli"))
+        .arg("--help")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert!(
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .contains("Usage: kvm-cli ")
+    );
+}
+
 #[test]
 fn status_is_json_and_authentication_is_not_leaked() {
     let ok = b"{\"ok\":true,\"result\":{}}";

@@ -13,7 +13,7 @@ use url::Url;
 use zeroize::Zeroizing;
 
 #[derive(Parser)]
-#[command(name = "kvm", version, about = "Control a KVMD-compatible device")]
+#[command(version, about = "Control a KVMD-compatible device")]
 struct Cli {
     /// Device base HTTPS URL without credentials (the adapter adds its API path)
     #[arg(long)]
@@ -896,7 +896,7 @@ mod tests {
     fn rejects_password_argument() {
         assert!(
             Cli::try_parse_from([
-                "kvm",
+                "kvm-cli",
                 "--endpoint",
                 "https://example.com",
                 "--profile",
@@ -914,7 +914,7 @@ mod tests {
     #[test]
     fn totp_is_a_flag_and_cannot_share_password_stdin() {
         let args = [
-            "kvm",
+            "kvm-cli",
             "--endpoint",
             "https://example.com",
             "--profile",
@@ -926,7 +926,7 @@ mod tests {
         ];
         assert!(Cli::try_parse_from(args).unwrap().totp);
         let args = [
-            "kvm",
+            "kvm-cli",
             "--endpoint",
             "https://example.com",
             "--profile",
@@ -944,7 +944,7 @@ mod tests {
     fn accepts_negative_coordinates() {
         assert!(
             Cli::try_parse_from([
-                "kvm",
+                "kvm-cli",
                 "--endpoint",
                 "https://example.com",
                 "--profile",
