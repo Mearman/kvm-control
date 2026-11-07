@@ -240,6 +240,24 @@ async fn fixture() -> (Url, Vec<u8>, Calls, tokio::task::JoinHandle<()>) {
         .route("/proxy/api/auth/check", get(status))
         .route("/proxy/api/atx", get(locked_capability))
         .route("/proxy/api/atx/power", post(locked_control))
+        .route("/partial/api/hid", get(status))
+        .route("/partial/api/info", get(|| async { StatusCode::FORBIDDEN }))
+        .route("/partial/api/streamer", get(status))
+        .route("/partial/api/atx", get(|| async { StatusCode::FORBIDDEN }))
+        .route(
+            "/partial/api/switch",
+            get(|| async { StatusCode::NOT_FOUND }),
+        )
+        .route(
+            "/partial/api/gpio",
+            get(|| async {
+                Json(json!({"ok": true, "result": {"state": {"outputs": {"lamp": {}}}}}))
+            }),
+        )
+        .route(
+            "/partial/api/msd",
+            get(|| async { StatusCode::UNAUTHORIZED }),
+        )
         .route("/api/auth/check", get(status))
         .route("/api/info", get(status))
         .route("/api/hid", get(status))
@@ -294,6 +312,33 @@ fn client(endpoint: Url, ca: Option<Vec<u8>>) -> Kvmd {
         timeout: Duration::from_secs(5),
     })
     .unwrap()
+}
+
+#[tokio::test]
+async fn capabilities_preserve_accessible_features_with_partial_permissions() {
+    let (mut endpoint, ca, _, server) = fixture().await;
+    endpoint.set_path("/partial/");
+    let device = Kvmd::with_header_auth(
+        Config {
+            endpoint,
+            profile: DeviceProfile::PiKvm,
+            trusted_ca_pem: Some(ca),
+            insecure_tls: false,
+            timeout: Duration::from_secs(5),
+        },
+        "test-user",
+        "test-password",
+    )
+    .unwrap();
+    let capabilities = device.capabilities().await.unwrap();
+    assert_eq!(capabilities.keyboard, Capability::Supported);
+    assert_eq!(capabilities.mouse, Capability::Supported);
+    assert_eq!(capabilities.status, Capability::Unknown);
+    assert_eq!(capabilities.power, Capability::Unknown);
+    assert_eq!(capabilities.switch, Capability::Unsupported);
+    assert_eq!(capabilities.gpio, Capability::Supported);
+    assert_eq!(capabilities.media, Capability::Unknown);
+    server.abort();
 }
 
 #[tokio::test]

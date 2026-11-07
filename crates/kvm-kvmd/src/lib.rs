@@ -483,11 +483,6 @@ impl Kvmd {
             .ok_or_else(|| Error::InvalidResponse("missing result".into()))
     }
 
-    async fn discover_endpoint(&self, path: &str) -> Result<Capability> {
-        let active = self.client.read().await;
-        self.discover_with(&active.client, path).await
-    }
-
     async fn discover_with(&self, active: &Client, path: &str) -> Result<Capability> {
         match self.json_with(active, path).await {
             Ok(state) => {
@@ -509,6 +504,7 @@ impl Kvmd {
                 })
             }
             Err(Error::Http(404)) => Ok(Capability::Unsupported),
+            Err(Error::Authentication) => Ok(Capability::Unknown),
             Err(error) => Err(error),
         }
     }
@@ -607,26 +603,35 @@ impl Device for Kvmd {
     }
 
     async fn capabilities(&self) -> Result<Capabilities> {
-        let status = self.status().await?;
+        let active = self.client.read().await;
+        let hid = self.json_with(&active.client, "hid").await?;
+        let mut status = Capability::Supported;
+        for path in ["info", "streamer"] {
+            match self.json_with(&active.client, path).await {
+                Ok(_) => {}
+                Err(Error::Authentication | Error::Http(404)) => status = Capability::Unknown,
+                Err(error) => return Err(error),
+            }
+        }
         Ok(Capabilities {
-            status: Capability::Supported,
+            status,
             snapshot: if self.snapshot_proven.load(Ordering::Acquire) {
                 Capability::Supported
             } else {
                 Capability::Unknown
             },
-            keyboard: hid_capability(&status.hid, "keyboard"),
-            mouse: hid_capability(&status.hid, "mouse"),
-            mouse_mode: mouse_mode(&status.hid),
+            keyboard: hid_capability(&hid, "keyboard"),
+            mouse: hid_capability(&hid, "mouse"),
+            mouse_mode: mouse_mode(&hid),
             live_video: if self.video_proven.load(Ordering::Acquire) {
                 Capability::Supported
             } else {
                 Capability::Unknown
             },
-            power: self.discover_endpoint("atx").await?,
-            switch: self.discover_endpoint("switch").await?,
-            gpio: self.discover_endpoint("gpio").await?,
-            media: self.discover_endpoint("msd").await?,
+            power: self.discover_with(&active.client, "atx").await?,
+            switch: self.discover_with(&active.client, "switch").await?,
+            gpio: self.discover_with(&active.client, "gpio").await?,
+            media: self.discover_with(&active.client, "msd").await?,
         })
     }
 
