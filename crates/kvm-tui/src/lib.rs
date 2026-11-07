@@ -42,22 +42,31 @@ pub struct App {
     submitted: Option<kvm_core::Control>,
     /// Set by the refresh key; the event loop starts the read in the background so input keeps being handled while it runs.
     refresh_requested: bool,
+    /// Whether a refresh read is in flight.
+    refreshing: bool,
+    /// The outcome of the last refresh, shown on its own line so it never replaces the message, which carries the command being typed, a confirmation prompt or a control's outcome.
+    refresh_note: String,
+    /// Control outcomes received so far, so a refresh started before the latest one is shown as predating it.
+    controls_completed: u64,
 }
 
-/// The outcome of reading capabilities and status, applied to an [`App`] by [`App::apply_refresh`].
+/// The outcome of reading capabilities and status, applied to an [`App`] by [`App::finish_refresh`].
 pub struct Refresh {
     capabilities: kvm_core::Result<Capabilities>,
     status: kvm_core::Result<DeviceStatus>,
+    /// The app's count of control outcomes when the read started.
+    controls_before: u64,
 }
 
 impl Refresh {
     /// Reads capabilities and then status. Status is read whatever the status capability says, since each subsystem reports its own support. It changes no interface state, so it can run while input is handled.
-    pub async fn read(device: &dyn Device) -> Self {
+    pub async fn read(device: &dyn Device, controls_before: u64) -> Self {
         let capabilities = device.capabilities().await;
         let status = device.status().await;
         Self {
             capabilities,
             status,
+            controls_before,
         }
     }
 }
@@ -80,6 +89,9 @@ impl Default for App {
             command: None,
             submitted: None,
             refresh_requested: false,
+            refreshing: false,
+            refresh_note: "Device state not read yet".into(),
+            controls_completed: 0,
         }
     }
 }
@@ -95,27 +107,78 @@ impl App {
         self.drag_modifiers.clear();
     }
 
-    /// Refreshes capability and status information through the shared device API, waiting for the read; the event loop instead runs [`Refresh::read`] in the background and applies it with [`App::apply_refresh`].
+    /// Refreshes capability and status information through the shared device API, waiting for the read; the event loop instead runs [`Refresh::read`] as its own task and applies it with [`App::finish_refresh`].
     pub async fn refresh(&mut self, device: &dyn Device) {
-        self.apply_refresh(Refresh::read(device).await);
+        let refresh = Refresh::read(device, self.controls_completed).await;
+        self.finish_refresh(device, refresh).await;
     }
 
-    /// Shows a completed read; a failure of either part is shown as the message.
-    pub fn apply_refresh(&mut self, refresh: Refresh) {
+    /// Applies a completed read. The message is left alone: the outcome goes on the device-state line.
+    ///
+    /// Input mode was entered under the capabilities shown then, and its key and mouse handling (releases included) is gated on them, so they must not change under it: when the read reports different capabilities, or fails to read them, input mode ends and every tracked input is released first, as `F12` does. Capabilities are written nowhere else, so while input mode lasts its gates stay those it was entered under.
+    pub async fn finish_refresh(&mut self, device: &dyn Device, refresh: Refresh) {
+        self.refreshing = false;
         let mut errors = Vec::new();
-        self.capabilities = refresh
+        let capabilities = refresh
             .capabilities
             .map_err(|error| errors.push(error.to_string()))
             .ok();
+        if self.control && capabilities != self.capabilities {
+            self.control = false;
+            self.clear_input_state();
+            self.message = match device.release_inputs().await {
+                Ok(()) => {
+                    "Device capabilities changed; input mode ended and inputs released".into()
+                }
+                Err(error) => {
+                    format!(
+                        "Device capabilities changed; input mode ended; input cleanup uncertain: {error}"
+                    )
+                }
+            };
+        }
+        self.capabilities = capabilities;
         self.status = refresh
             .status
             .map_err(|error| errors.push(error.to_string()))
             .ok();
-        self.message = if errors.is_empty() {
-            "Press v to open live video".into()
+        let predates = if refresh.controls_before < self.controls_completed {
+            " (read before the last control; r refreshes)"
         } else {
-            errors.join("; ")
+            ""
         };
+        self.refresh_note = if errors.is_empty() {
+            format!("Device state read{predates}")
+        } else {
+            format!("Device state read failed: {}{predates}", errors.join("; "))
+        };
+    }
+
+    /// The device-state line: a read in flight, or the outcome of the last one.
+    fn device_state_line(&self) -> String {
+        if self.refreshing {
+            "Refreshing device state".into()
+        } else {
+            self.refresh_note.clone()
+        }
+    }
+
+    /// Records a control's outcome as the message, so it is not replaced by a refresh, and marks the device state shown as predating it.
+    fn control_finished(&mut self, outcome: kvm_core::Result<kvm_core::ControlOutcome>) {
+        self.controls_completed += 1;
+        self.message = match outcome {
+            Ok(kvm_core::ControlOutcome::ObservedMatching) => {
+                "Request acknowledged; device state matches (causation not established)".into()
+            }
+            Ok(kvm_core::ControlOutcome::Unverified) => {
+                "Request acknowledged; outcome not verified".into()
+            }
+            Err(error) => error.to_string(),
+        };
+        if !self.refreshing && !self.refresh_note.contains("read before the last control") {
+            self.refresh_note
+                .push_str(" (read before the last control; r refreshes)");
+        }
     }
 
     /// Forwards mouse events in the viewing area while input mode is active.
@@ -454,6 +517,8 @@ impl App {
                         self.message
                             .push_str("; terminal lacks key releases, keys are tapped");
                     }
+                } else if self.capabilities.is_none() && self.refreshing {
+                    self.message = "Capabilities are still being read".into();
                 } else {
                     self.message = "Keyboard and mouse are unsupported or undiscovered".into();
                 }
@@ -982,14 +1047,19 @@ fn status_summary(status: &DeviceStatus) -> String {
     )
 }
 
-/// Draws the current state using any ratatui backend, including its test backend.
-pub fn draw(frame: &mut Frame<'_>, app: &App) {
-    let areas = Layout::vertical([
+/// Splits the screen into the capability header, the video or status area and the controls footer. The footer's three inner rows are the key help, the message and the device-state line.
+fn screen_areas(area: ratatui::layout::Rect) -> std::rc::Rc<[ratatui::layout::Rect]> {
+    Layout::vertical([
         Constraint::Length(3),
         Constraint::Min(3),
-        Constraint::Length(4),
+        Constraint::Length(5),
     ])
-    .split(frame.area());
+    .split(area)
+}
+
+/// Draws the current state using any ratatui backend, including its test backend.
+pub fn draw(frame: &mut Frame<'_>, app: &App) {
+    let areas = screen_areas(frame.area());
     let capabilities = match &app.capabilities {
         Some(c) => format!(
             "status: {:?}  snapshot: {:?}  keyboard: {:?}  mouse: {:?}  live: {:?}",
@@ -1053,9 +1123,13 @@ pub fn draw(frame: &mut Frame<'_>, app: &App) {
         "q quit | r refresh | v video | i input | : control"
     };
     frame.render_widget(
-        Paragraph::new(format!("{help}\n{}", app.message))
-            .wrap(Wrap { trim: false })
-            .block(Block::default().title("Controls").borders(Borders::ALL)),
+        Paragraph::new(format!(
+            "{help}\n{}\n{}",
+            app.message,
+            app.device_state_line()
+        ))
+        .wrap(Wrap { trim: false })
+        .block(Block::default().title("Controls").borders(Borders::ALL)),
         areas[2],
     );
 }
@@ -1317,7 +1391,7 @@ async fn run_with_probe_deadline(
             )?;
         }
         let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
-        run_loop(&mut terminal, device.as_ref(), &picker, enhanced, |_| {
+        run_loop(&mut terminal, device.clone(), &picker, enhanced, |_| {
             if event::poll(Duration::from_millis(25))? {
                 Ok(Some(event::read()?))
             } else {
@@ -1394,7 +1468,7 @@ impl Termination {
 
 async fn run_loop<B: Backend>(
     terminal: &mut Terminal<B>,
-    device: &dyn Device,
+    shared: std::sync::Arc<dyn Device>,
     picker: &ImagePicker,
     enhanced: bool,
     mut next_event: impl FnMut(&Terminal<B>) -> io::Result<Option<Event>>,
@@ -1402,16 +1476,30 @@ async fn run_loop<B: Backend>(
 where
     B::Error: std::error::Error + Send + Sync + 'static,
 {
+    let device = shared.as_ref();
     let mut app = App {
         enhanced_keyboard: enhanced,
         cell_size: picker.cell_size,
+        message: "Press v to open live video".into(),
         ..App::default()
     };
-    // A device read can take up to its whole timeout per route, so refreshing runs beside input handling, polled once per loop like a control request: 'q' and other keys keep working while it is in flight, and leaving the loop drops it.
-    let mut refresh_request: Option<
-        std::pin::Pin<Box<dyn std::future::Future<Output = Refresh> + '_>>,
-    > = Some(Box::pin(Refresh::read(device)));
-    app.message = "Refreshing device state".into();
+    /// A refresh read running as its own task, aborted when dropped (on quit, on a termination signal or when the loop ends otherwise).
+    struct RefreshTask(tokio::task::JoinHandle<Refresh>);
+    impl Drop for RefreshTask {
+        fn drop(&mut self) {
+            self.0.abort();
+        }
+    }
+    // A device read can take up to its routes' deadlines, so it runs as its own task: it keeps making progress while the loop awaits video, input or cleanup calls (which would otherwise stall it and could turn a reply that arrived into a timeout), keys and `q` are handled meanwhile, and at most one read is in flight. Its outcome goes on the device-state line, never the message, and capabilities that change under input mode end it with inputs released (`App::finish_refresh`).
+    let start_refresh = |app: &mut App| {
+        app.refreshing = true;
+        let device = shared.clone();
+        let controls_before = app.controls_completed;
+        RefreshTask(tokio::spawn(async move {
+            Refresh::read(device.as_ref(), controls_before).await
+        }))
+    };
+    let mut refresh_task = Some(start_refresh(&mut app));
     let mut video_rx: Option<
         tokio::sync::watch::Receiver<Option<Result<kvm_core::Snapshot, String>>>,
     > = None;
@@ -1430,35 +1518,31 @@ where
     > = None;
     loop {
         tokio::task::yield_now().await;
-        if std::mem::take(&mut app.refresh_requested) {
-            if refresh_request.is_some() {
-                app.message = "A refresh is already in progress".into();
-            } else {
-                refresh_request = Some(Box::pin(Refresh::read(device)));
-                app.message = "Refreshing device state".into();
+        if refresh_task
+            .as_ref()
+            .is_some_and(|task| task.0.is_finished())
+            && let Some(mut task) = refresh_task.take()
+        {
+            match (&mut task.0).await {
+                Ok(refresh) => app.finish_refresh(device, refresh).await,
+                Err(error) => {
+                    app.refreshing = false;
+                    app.refresh_note = format!("Device state read failed: {error}");
+                }
             }
         }
-        if let Some(request) = &mut refresh_request {
-            let refresh = tokio::select! { refresh = request.as_mut() => Some(refresh), _ = tokio::time::sleep(Duration::from_millis(1)) => None };
-            if let Some(refresh) = refresh {
-                refresh_request = None;
-                app.apply_refresh(refresh);
+        if std::mem::take(&mut app.refresh_requested) {
+            if refresh_task.is_some() {
+                app.message = "A refresh is already in progress".into();
+            } else {
+                refresh_task = Some(start_refresh(&mut app));
             }
         }
         if let Some(request) = &mut control_request {
             let outcome = tokio::select! { outcome = request.as_mut() => Some(outcome), _ = tokio::time::sleep(Duration::from_millis(1)) => None };
             if let Some(outcome) = outcome {
                 control_request = None;
-                app.message = match outcome {
-                    Ok(kvm_core::ControlOutcome::ObservedMatching) => {
-                        "Request acknowledged; device state matches (causation not established)"
-                            .into()
-                    }
-                    Ok(kvm_core::ControlOutcome::Unverified) => {
-                        "Request acknowledged; outcome not verified".into()
-                    }
-                    Err(error) => error.to_string(),
-                };
+                app.control_finished(outcome);
             }
         }
         if let Some(receiver) = &mut video_rx
@@ -1525,12 +1609,7 @@ where
                     frame.render_widget(Paragraph::new(warning), row);
                 }
                 if let Some(image) = &app.video {
-                    let areas = Layout::vertical([
-                        Constraint::Length(3),
-                        Constraint::Min(3),
-                        Constraint::Length(4),
-                    ])
-                    .split(frame.area());
+                    let areas = screen_areas(frame.area());
                     if let Some(area) =
                         video_viewport(areas[1], image.width(), image.height(), app.cell_size)
                         && let Some(protocol) = &mut image_protocol
@@ -1624,12 +1703,7 @@ where
                     };
                 }
                 Event::Mouse(mouse) => {
-                    let areas = Layout::vertical([
-                        Constraint::Length(3),
-                        Constraint::Min(3),
-                        Constraint::Length(4),
-                    ])
-                    .split(terminal.size().map_err(io::Error::other)?.into());
+                    let areas = screen_areas(terminal.size().map_err(io::Error::other)?.into());
                     app.mouse(device, mouse, areas[1]).await;
                 }
                 _ => {}
@@ -1646,6 +1720,30 @@ mod live_view_e2e;
 mod tests {
     use super::*;
     use ratatui::backend::TestBackend;
+
+    /// The screen's text, for event closures that wait on what is drawn.
+    fn screen_text(terminal: &Terminal<TestBackend>) -> String {
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect()
+    }
+
+    /// Gives `next` no events until the start-up refresh, which runs as its own task, has been applied, so a test's first key sees the capabilities it read.
+    fn after_start_up_refresh(
+        mut next: impl FnMut(&Terminal<TestBackend>) -> io::Result<Option<Event>>,
+    ) -> impl FnMut(&Terminal<TestBackend>) -> io::Result<Option<Event>> {
+        move |terminal| {
+            if screen_text(terminal).contains("Refreshing device state") {
+                std::thread::yield_now();
+                return Ok(None);
+            }
+            next(terminal)
+        }
+    }
 
     #[derive(Default)]
     struct FakeDevice {
@@ -1666,6 +1764,10 @@ mod tests {
         /// Never answers a status read, as a device whose route never answers holds a read until its timeout.
         status_hangs: bool,
         status_reads: std::sync::atomic::AtomicUsize,
+        /// Makes the status read wait until video is requested, and video wait until the status read has finished, so the two can only both finish if the read progresses while the loop awaits video.
+        video_waits_for_status: bool,
+        video_requested: tokio::sync::Notify,
+        status_finished: tokio::sync::Notify,
     }
     struct FakeStream {
         jpeg: Option<Vec<u8>>,
@@ -1693,6 +1795,11 @@ mod tests {
     #[async_trait::async_trait]
     impl Device for FakeDevice {
         async fn video(&self) -> kvm_core::Result<Box<dyn kvm_core::VideoStream>> {
+            if self.video_waits_for_status {
+                self.video_requested.notify_one();
+                self.status_finished.notified().await;
+                return Err(kvm_core::Error::Unsupported("video".into()));
+            }
             let calls = self
                 .video_calls
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -1713,6 +1820,10 @@ mod tests {
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             if self.status_hangs {
                 std::future::pending::<()>().await;
+            }
+            if self.video_waits_for_status {
+                self.video_requested.notified().await;
+                self.status_finished.notify_one();
             }
             Ok(DeviceStatus {
                 info: Reported::Unknown,
@@ -1804,19 +1915,19 @@ mod tests {
         image::codecs::jpeg::JpegEncoder::new(&mut jpeg)
             .encode_image(&image::RgbImage::new(8, 8))
             .unwrap();
-        let device = FakeDevice {
+        let device = std::sync::Arc::new(FakeDevice {
             video_frame: Some(jpeg),
             fail_video_after_frame: true,
             ..FakeDevice::default()
-        };
+        });
         let mut terminal = Terminal::new(TestBackend::new(60, 16)).unwrap();
         let mut count = 0;
         run_loop(
             &mut terminal,
-            &device,
+            device.clone(),
             &ImagePicker::halfblocks(),
             false,
-            |_| {
+            after_start_up_refresh(|_| {
                 count += 1;
                 if count == 1 {
                     return Ok(Some(Event::Key(crossterm::event::KeyEvent::new(
@@ -1832,7 +1943,7 @@ mod tests {
                 }
                 std::thread::yield_now();
                 Ok(None)
-            },
+            }),
         )
         .await
         .unwrap();
@@ -1861,20 +1972,20 @@ mod tests {
         // A uniform halfblock is encoded as a coloured space, not necessarily a block glyph.
         let [red, green, blue] = decoded.get_pixel(0, 0).0;
         let frame_colour = ratatui::style::Color::Rgb(red, green, blue);
-        let device = FakeDevice {
+        let device = std::sync::Arc::new(FakeDevice {
             video_frame: Some(jpeg),
             ..FakeDevice::default()
-        };
+        });
         let mut terminal = Terminal::new(TestBackend::new(40, 16)).unwrap();
         let mut rounds = 0;
         let result = tokio::time::timeout(
             Duration::from_secs(5),
             run_loop(
                 &mut terminal,
-                &device,
+                device.clone(),
                 &ImagePicker::halfblocks(),
                 false,
-                |terminal| {
+                after_start_up_refresh(|terminal| {
                     rounds += 1;
                     if rounds == 1 {
                         Ok(Some(Event::Key(crossterm::event::KeyEvent::new(
@@ -1896,7 +2007,7 @@ mod tests {
                         std::thread::yield_now();
                         Ok(None)
                     }
-                },
+                }),
             ),
         )
         .await
@@ -1921,19 +2032,19 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn focus_loss_is_processed_during_submitted_control() {
-        let device = FakeDevice {
+        let device = std::sync::Arc::new(FakeDevice {
             block_control: true,
             ..FakeDevice::default()
-        };
+        });
         let mut terminal = Terminal::new(TestBackend::new(60, 16)).unwrap();
         let mut events = ":power off\ny".chars();
         let mut focus_sent = false;
         run_loop(
             &mut terminal,
-            &device,
+            device.clone(),
             &ImagePicker::halfblocks(),
             false,
-            |_| {
+            after_start_up_refresh(|_| {
                 if let Some(c) = events.next() {
                     return Ok(Some(Event::Key(crossterm::event::KeyEvent::new(
                         if c == '\n' {
@@ -1958,7 +2069,7 @@ mod tests {
                 }
                 std::thread::yield_now();
                 Ok(None)
-            },
+            }),
         )
         .await
         .unwrap();
@@ -1967,7 +2078,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn focus_loss_cancels_pending_confirmation() {
-        let device = FakeDevice::default();
+        let device = std::sync::Arc::new(FakeDevice::default());
         let mut terminal = Terminal::new(TestBackend::new(60, 16)).unwrap();
         let sequence = [
             Some(':'),
@@ -1988,10 +2099,10 @@ mod tests {
         let mut events = sequence.into_iter();
         run_loop(
             &mut terminal,
-            &device,
+            device.clone(),
             &ImagePicker::halfblocks(),
             false,
-            |_| {
+            after_start_up_refresh(|_| {
                 Ok(Some(match events.next().expect("quit") {
                     None => Event::FocusLost,
                     Some(c) => Event::Key(crossterm::event::KeyEvent::new(
@@ -2003,7 +2114,7 @@ mod tests {
                         crossterm::event::KeyModifiers::NONE,
                     )),
                 }))
-            },
+            }),
         )
         .await
         .unwrap();
@@ -2012,7 +2123,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn video_key_is_routed_to_command_and_confirmation() {
-        let device = FakeDevice::default();
+        let device = std::sync::Arc::new(FakeDevice::default());
         let mut terminal = Terminal::new(TestBackend::new(60, 16)).unwrap();
         let sequence = [
             ':', 'p', 'o', 'w', 'e', 'r', ' ', 'o', 'f', 'f', '\n', 'v', 'q',
@@ -2020,10 +2131,10 @@ mod tests {
         let mut events = sequence.into_iter();
         run_loop(
             &mut terminal,
-            &device,
+            device.clone(),
             &ImagePicker::halfblocks(),
             false,
-            |_| {
+            after_start_up_refresh(|_| {
                 let c = events.next().expect("quit event");
                 Ok(Some(Event::Key(crossterm::event::KeyEvent::new(
                     if c == '\n' {
@@ -2033,7 +2144,7 @@ mod tests {
                     },
                     crossterm::event::KeyModifiers::NONE,
                 ))))
-            },
+            }),
         )
         .await
         .unwrap();
@@ -2051,19 +2162,19 @@ mod tests {
         image::codecs::jpeg::JpegEncoder::new(&mut jpeg)
             .encode_image(&image)
             .unwrap();
-        let device = FakeDevice {
+        let device = std::sync::Arc::new(FakeDevice {
             video_frame: Some(jpeg),
             fail_restart: true,
             ..FakeDevice::default()
-        };
+        });
         let mut terminal = Terminal::new(TestBackend::new(60, 16)).unwrap();
         let mut count = 0;
         run_loop(
             &mut terminal,
-            &device,
+            device.clone(),
             &ImagePicker::halfblocks(),
             false,
-            |_| {
+            after_start_up_refresh(|_| {
                 count += 1;
                 let code = if count == 1 || count == 100 {
                     Some('v')
@@ -2079,7 +2190,7 @@ mod tests {
                         crossterm::event::KeyModifiers::NONE,
                     ))
                 }))
-            },
+            }),
         )
         .await
         .unwrap();
@@ -2187,15 +2298,15 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn input_repeat_events_reach_device() {
-        let device = FakeDevice::default();
+        let device = std::sync::Arc::new(FakeDevice::default());
         let mut terminal = Terminal::new(TestBackend::new(40, 16)).unwrap();
         let mut step = 0;
         run_loop(
             &mut terminal,
-            &device,
+            device.clone(),
             &ImagePicker::halfblocks(),
             false,
-            |_| {
+            after_start_up_refresh(|_| {
                 step += 1;
                 let event = match step {
                     1 => crossterm::event::KeyEvent::new(
@@ -2217,7 +2328,7 @@ mod tests {
                     ),
                 };
                 Ok(Some(Event::Key(event)))
-            },
+            }),
         )
         .await
         .unwrap();
@@ -3285,10 +3396,10 @@ mod tests {
     // Breaks if a refresh blocks input handling: with a status read that never finishes, 'q' would never be read.
     #[tokio::test]
     async fn quit_works_while_a_refresh_is_in_flight() {
-        let device = FakeDevice {
+        let device = std::sync::Arc::new(FakeDevice {
             status_hangs: true,
             ..FakeDevice::default()
-        };
+        });
         let mut terminal = Terminal::new(TestBackend::new(80, 16)).unwrap();
         let mut events = 0;
         let key = |code| {
@@ -3302,7 +3413,7 @@ mod tests {
             Duration::from_secs(10),
             run_loop(
                 &mut terminal,
-                &device,
+                device.clone(),
                 &ImagePicker::halfblocks(),
                 false,
                 |terminal| {
@@ -3345,6 +3456,209 @@ mod tests {
                 .load(std::sync::atomic::Ordering::SeqCst),
             1
         );
+    }
+
+    // Breaks if the refresh only progresses while the loop polls it: the loop then awaits video, which waits for the read, and neither finishes.
+    #[tokio::test]
+    async fn the_refresh_progresses_while_the_loop_awaits_a_device_call() {
+        let device = std::sync::Arc::new(FakeDevice {
+            video_waits_for_status: true,
+            ..FakeDevice::default()
+        });
+        let mut terminal = Terminal::new(TestBackend::new(80, 16)).unwrap();
+        let mut events = 0;
+        let key = |code| {
+            Some(Event::Key(crossterm::event::KeyEvent::new(
+                code,
+                crossterm::event::KeyModifiers::NONE,
+            )))
+        };
+        // The timeout only keeps a regression from hanging the suite.
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            run_loop(
+                &mut terminal,
+                device.clone(),
+                &ImagePicker::halfblocks(),
+                false,
+                |terminal| {
+                    events += 1;
+                    Ok(if events == 1 {
+                        key(KeyCode::Char('v'))
+                    } else if screen_text(terminal).contains("Device state read") {
+                        key(KeyCode::Char('q'))
+                    } else {
+                        std::thread::yield_now();
+                        None
+                    })
+                },
+            ),
+        )
+        .await
+        .expect("the read and the video request must both finish")
+        .unwrap();
+    }
+
+    fn fake_capabilities(keyboard: Capability) -> Capabilities {
+        Capabilities {
+            status: Capability::Supported,
+            snapshot: Capability::Unknown,
+            keyboard,
+            mouse: Capability::Supported,
+            mouse_mode: kvm_core::MouseMode::Absolute,
+            live_video: Capability::Unknown,
+            power: Capability::Supported,
+            switch: Capability::Unknown,
+            gpio: Capability::Unknown,
+            media: Capability::Unknown,
+        }
+    }
+
+    async fn read_with(
+        device: &FakeDevice,
+        capabilities: kvm_core::Result<Capabilities>,
+        controls_before: u64,
+    ) -> Refresh {
+        Refresh {
+            capabilities,
+            status: device.status().await,
+            controls_before,
+        }
+    }
+
+    // Breaks if a refresh that fails to read capabilities during input mode leaves the held button pressed: input mode must end and the inputs be released.
+    #[tokio::test]
+    async fn a_refresh_that_loses_capabilities_ends_input_mode_and_releases_a_held_button() {
+        let device = FakeDevice::default();
+        let mut app = App::default();
+        app.refresh(&device).await;
+        app.key(&device, KeyCode::Char('i')).await;
+        assert!(app.control);
+        app.video = Some(image::RgbImage::new(2, 4));
+        let area = ratatui::layout::Rect::new(0, 0, 4, 4);
+        app.mouse(
+            &device,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 1,
+                row: 1,
+                modifiers: crossterm::event::KeyModifiers::NONE,
+            },
+            area,
+        )
+        .await;
+        let refresh = read_with(
+            &device,
+            Err(kvm_core::Error::Transport("timeout".into())),
+            0,
+        )
+        .await;
+        app.finish_refresh(&device, refresh).await;
+        assert!(!app.control);
+        assert!(app.capabilities.is_none());
+        assert_eq!(
+            device.calls.lock().unwrap().last().map(String::as_str),
+            Some("release")
+        );
+        assert!(app.message.contains("inputs released"));
+    }
+
+    // Breaks if a refresh reporting the keyboard unsupported during input mode leaves a held modifier pressed or still tracked.
+    #[tokio::test]
+    async fn a_refresh_that_changes_capabilities_releases_a_held_modifier() {
+        let device = FakeDevice::default();
+        let mut app = App {
+            enhanced_keyboard: true,
+            ..App::default()
+        };
+        app.refresh(&device).await;
+        app.key(&device, KeyCode::Char('i')).await;
+        app.key_event(
+            &device,
+            crossterm::event::KeyEvent::new(
+                KeyCode::Modifier(crossterm::event::ModifierKeyCode::LeftShift),
+                crossterm::event::KeyModifiers::SHIFT,
+            ),
+        )
+        .await;
+        assert!(!app.held_modifiers.is_empty());
+        let refresh = read_with(&device, Ok(fake_capabilities(Capability::Unsupported)), 0).await;
+        app.finish_refresh(&device, refresh).await;
+        assert!(!app.control);
+        assert!(app.held_modifiers.is_empty());
+        assert_eq!(
+            device.calls.lock().unwrap().last().map(String::as_str),
+            Some("release")
+        );
+    }
+
+    // Breaks if an unchanged refresh interrupts input mode.
+    #[tokio::test]
+    async fn an_unchanged_refresh_keeps_input_mode() {
+        let device = FakeDevice::default();
+        let mut app = App::default();
+        app.refresh(&device).await;
+        app.key(&device, KeyCode::Char('i')).await;
+        let refresh = read_with(&device, Ok(fake_capabilities(Capability::Supported)), 0).await;
+        app.finish_refresh(&device, refresh).await;
+        assert!(app.control);
+        assert!(device.calls.lock().unwrap().is_empty());
+    }
+
+    // Breaks if a refresh replaces the command being typed, a confirmation prompt or a control's outcome.
+    #[tokio::test]
+    async fn a_refresh_never_replaces_the_message() {
+        let device = FakeDevice::default();
+        let mut app = App::default();
+        app.refresh(&device).await;
+        for c in ":power off-hard".chars() {
+            app.key(&device, KeyCode::Char(c)).await;
+        }
+        let typed = app.message.clone();
+        let failed = read_with(&device, Err(kvm_core::Error::Http(502)), 0).await;
+        app.finish_refresh(&device, failed).await;
+        assert_eq!(app.message, typed);
+        assert!(app.device_state_line().contains("read failed"));
+        app.key(&device, KeyCode::Enter).await;
+        // The refresh failed to read capabilities, so the command is refused; read them again and retry.
+        app.refresh(&device).await;
+        for c in ":power off-hard".chars() {
+            app.key(&device, KeyCode::Char(c)).await;
+        }
+        app.key(&device, KeyCode::Enter).await;
+        let prompt = app.message.clone();
+        assert!(prompt.starts_with("Confirm"));
+        let refresh = read_with(&device, Ok(fake_capabilities(Capability::Supported)), 0).await;
+        app.finish_refresh(&device, refresh).await;
+        assert_eq!(app.message, prompt);
+        // A control's error stays the message, and a read that started before it is marked as predating it.
+        app.control_finished(Err(kvm_core::Error::Http(500)));
+        let error = app.message.clone();
+        let earlier = read_with(&device, Ok(fake_capabilities(Capability::Supported)), 0).await;
+        app.finish_refresh(&device, earlier).await;
+        assert_eq!(app.message, error);
+        assert!(
+            app.device_state_line()
+                .contains("read before the last control")
+        );
+        let later = read_with(
+            &device,
+            Ok(fake_capabilities(Capability::Supported)),
+            app.controls_completed,
+        )
+        .await;
+        app.finish_refresh(&device, later).await;
+        assert_eq!(app.device_state_line(), "Device state read");
+    }
+
+    #[tokio::test]
+    async fn input_mode_during_the_first_read_says_capabilities_are_still_being_read() {
+        let mut app = App {
+            refreshing: true,
+            ..App::default()
+        };
+        app.key(&FakeDevice::default(), KeyCode::Char('i')).await;
+        assert_eq!(app.message, "Capabilities are still being read");
     }
 
     #[tokio::test]

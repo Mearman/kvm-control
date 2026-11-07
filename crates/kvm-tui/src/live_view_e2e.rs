@@ -140,7 +140,7 @@ async fn stream(State(fixture): State<Fixture>) -> impl IntoResponse {
 }
 
 struct SyntheticDevice {
-    adapter: Kvmd,
+    adapter: std::sync::Arc<Kvmd>,
     calls: Arc<Mutex<Vec<String>>>,
     frames: UnboundedSender<Vec<u8>>,
     server: tokio::task::JoinHandle<()>,
@@ -205,7 +205,7 @@ async fn synthetic_device() -> SyntheticDevice {
         LoginState::Authenticated
     );
     SyntheticDevice {
-        adapter,
+        adapter: std::sync::Arc::new(adapter),
         calls,
         frames,
         server,
@@ -274,14 +274,9 @@ async fn live_view_renders_distinct_frames_forwards_input_and_restores_terminal(
     let modes = Arc::new(Mutex::new(Vec::new()));
     let mut guard = TerminalGuard::enter(RecordedModes(modes.clone())).unwrap();
     let mut terminal = Terminal::new(TestBackend::new(60, 24)).unwrap();
-    // The same layout `run_loop` draws into: a three row header, the video area, a four row footer.
+    // The same layout `run_loop` draws into.
     let picker = ImagePicker::halfblocks();
-    let video_area = Layout::vertical([
-        Constraint::Length(3),
-        Constraint::Min(3),
-        Constraint::Length(4),
-    ])
-    .split(terminal.size().unwrap().into())[1];
+    let video_area = screen_areas(terminal.size().unwrap().into())[1];
     let viewport = video_viewport(video_area, FRAME_EDGE, FRAME_EDGE, picker.cell_size).unwrap();
     let centre = (
         viewport.cells.x + viewport.cells.width / 2,
@@ -302,43 +297,49 @@ async fn live_view_renders_distinct_frames_forwards_input_and_restores_terminal(
     let mut opened = false;
     let result = tokio::time::timeout(
         Duration::from_secs(20),
-        run_loop(&mut terminal, &device.adapter, &picker, false, |terminal| {
-            if !opened {
-                opened = true;
-                return Ok(Some(press(KeyCode::Char('v'))));
-            }
-            if seen < jpegs.len() {
-                // Release one frame at a time and wait for it to reach the buffer before the
-                // next, so a stale frame can never satisfy a later check.
-                if sent == seen {
-                    device.frames.send(jpegs[sent].clone()).unwrap();
-                    sent += 1;
-                } else if shows(terminal, seen) {
-                    seen += 1;
+        run_loop(
+            &mut terminal,
+            device.adapter.clone(),
+            &picker,
+            false,
+            |terminal| {
+                if !opened {
+                    opened = true;
+                    return Ok(Some(press(KeyCode::Char('v'))));
                 }
-                std::thread::yield_now();
-                return Ok(None);
-            }
-            // Input mode needs the capabilities the startup refresh reads in the background; wait until it has been shown.
-            let refreshing = terminal
-                .backend()
-                .buffer()
-                .content()
-                .iter()
-                .map(|cell| cell.symbol())
-                .collect::<String>()
-                .contains("Refreshing device state");
-            if refreshing {
-                std::thread::yield_now();
-                return Ok(None);
-            }
-            Ok(input_events.next())
-        }),
+                if seen < jpegs.len() {
+                    // Release one frame at a time and wait for it to reach the buffer before the
+                    // next, so a stale frame can never satisfy a later check.
+                    if sent == seen {
+                        device.frames.send(jpegs[sent].clone()).unwrap();
+                        sent += 1;
+                    } else if shows(terminal, seen) {
+                        seen += 1;
+                    }
+                    std::thread::yield_now();
+                    return Ok(None);
+                }
+                // Input mode needs the capabilities the startup refresh reads in the background; wait until it has been shown.
+                let refreshing = terminal
+                    .backend()
+                    .buffer()
+                    .content()
+                    .iter()
+                    .map(|cell| cell.symbol())
+                    .collect::<String>()
+                    .contains("Refreshing device state");
+                if refreshing {
+                    std::thread::yield_now();
+                    return Ok(None);
+                }
+                Ok(input_events.next())
+            },
+        ),
     )
     .await
     .expect("live view must finish");
     assert_eq!(seen, jpegs.len(), "every frame must reach the buffer");
-    let cleanup = cleanup_terminal(result, &device.adapter, &mut guard).await;
+    let cleanup = cleanup_terminal(result, device.adapter.as_ref(), &mut guard).await;
     assert!(cleanup.is_ok(), "{cleanup:?}");
 
     let calls = device.calls.lock().unwrap().clone();

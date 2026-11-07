@@ -79,7 +79,7 @@ pub enum MouseMode {
     Unknown,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Capabilities {
     pub status: Capability,
     pub snapshot: Capability,
