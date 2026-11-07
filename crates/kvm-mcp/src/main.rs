@@ -40,17 +40,22 @@ fn read_password(_: &str) -> Result<zeroize::Zeroizing<String>, Box<dyn Error>> 
 }
 
 #[cfg(unix)]
-async fn shutdown_signal() -> std::io::Result<()> {
+fn shutdown_signal() -> std::io::Result<impl std::future::Future<Output = ()>> {
     use tokio::signal::unix::{SignalKind, signal};
     let mut terminate = signal(SignalKind::terminate())?;
     let mut interrupt = signal(SignalKind::interrupt())?;
-    tokio::select! { _ = terminate.recv() => (), _ = interrupt.recv() => () }
-    Ok(())
+    Ok(async move {
+        tokio::select! { _ = terminate.recv() => (), _ = interrupt.recv() => () }
+    })
 }
 
 #[cfg(not(unix))]
-async fn shutdown_signal() -> std::io::Result<()> {
-    tokio::signal::ctrl_c().await
+fn shutdown_signal() -> std::io::Result<impl std::future::Future<Output = ()>> {
+    Ok(async {
+        if let Err(error) = tokio::signal::ctrl_c().await {
+            eprintln!("Could not listen for shutdown signal: {error}");
+        }
+    })
 }
 
 #[tokio::main]
@@ -111,12 +116,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let transport = rmcp::transport::stdio();
     let allow_consequential = env::var("KVM_ALLOW_CONSEQUENTIAL").as_deref() == Ok("1");
     let server = Server::new(device.clone(), allow_control, allow_consequential);
+    let signal = shutdown_signal()?;
     let service = server.clone().serve(transport).await?;
     let cancel = service.cancellation_token();
     let signal_task = tokio::spawn(async move {
-        if let Err(error) = shutdown_signal().await {
-            eprintln!("Could not listen for shutdown signal: {error}");
-        }
+        signal.await;
         cancel.cancel();
     });
     let outcome = service.waiting().await;
