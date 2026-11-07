@@ -1206,7 +1206,7 @@ fn release_interrupted_by_runtime_shutdown_is_finished_by_the_next_lock_holder()
     server.abort();
 }
 
-/// Returns the recorded movement requests and HID state reads, in order.
+/// Returns the recorded HID requests (key, button and movement events and HID state reads), in order.
 fn movement_events(calls: &Calls) -> Vec<String> {
     calls
         .0
