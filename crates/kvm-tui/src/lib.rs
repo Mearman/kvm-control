@@ -50,7 +50,7 @@ pub struct App {
     controls_completed: u64,
     /// The message shown when input mode was entered, so leaving input mode can replace it while it is still shown, but not a message written since (a control's outcome, a failed key).
     input_entry_message: Option<String>,
-    /// Why a refresh ended input mode, and how its release of inputs went; shown first on the device-state line until input mode is entered again.
+    /// Why a refresh ended input mode, and how its release of inputs went; shown first on the device-state line. A pending or uncertain release keeps it there until input mode is entered again or a later release succeeds, since a key or button may still be held on the remote host; once a release has succeeded, the next refresh outcome replaces it.
     input_ended: Option<InputEnded>,
 }
 
@@ -172,10 +172,7 @@ impl App {
             .map_err(|error| errors.push(error.to_string()))
             .ok();
         let mut ended = false;
-        // A notice whose release has finished has been shown; this outcome replaces it, so it does not sit in front of every later read.
-        if !self.input_release_pending() {
-            self.input_ended = None;
-        }
+        self.clear_released_notice();
         if self.control
             && input_gates(capabilities.as_ref()) != input_gates(self.capabilities.as_ref())
         {
@@ -208,6 +205,36 @@ impl App {
         ended
     }
 
+    /// Drops the notice once its release has succeeded, so it does not sit in front of every later outcome. A pending release keeps it, since `i` waits on it, and an uncertain one keeps it, since a key or button may still be held.
+    fn clear_released_notice(&mut self) {
+        if self
+            .input_ended
+            .as_ref()
+            .is_some_and(|ended| ended.release == Release::Done)
+        {
+            self.input_ended = None;
+        }
+    }
+
+    /// Releases every tracked input. A success also settles an uncertain cleanup on the notice, which then gives way to the next outcome.
+    async fn release_tracked(&mut self, device: &dyn Device) -> kvm_core::Result<()> {
+        let release = device.release_inputs().await;
+        if release.is_ok()
+            && let Some(ended) = &mut self.input_ended
+            && matches!(ended.release, Release::Failed(_))
+        {
+            ended.release = Release::Done;
+        }
+        release
+    }
+
+    /// Whether `i` would enter input mode with the capabilities shown.
+    fn input_available(&self) -> bool {
+        self.capabilities.as_ref().is_some_and(|c| {
+            c.keyboard == Capability::Supported || c.mouse == Capability::Supported
+        })
+    }
+
     /// Records how the release after a refresh ended input mode went. A failed release also goes at the start of the message, which wraps, since a key or button may still be held on the remote host; a waiting `i`'s message is replaced either way.
     pub fn input_release_finished(&mut self, release: kvm_core::Result<()>) {
         let waiting = self.message == RELEASE_WAIT;
@@ -218,13 +245,16 @@ impl App {
             Ok(()) => {
                 ended.release = Release::Done;
                 if waiting {
-                    self.message = "Inputs released; i enters input mode".into();
+                    self.message = if self.input_available() {
+                        "Inputs released; i enters input mode".into()
+                    } else {
+                        "Inputs released".into()
+                    };
                 }
             }
             Err(error) => {
-                let warning = format!(
-                    "Input cleanup uncertain, a key or button may still be held on the remote host: {error}"
-                );
+                // Short, so a message written earlier (a control's outcome) still fits beside it; the device-state line carries it durably.
+                let warning = format!("Cleanup uncertain: {error}");
                 ended.release = Release::Failed(error.to_string());
                 self.message = if waiting || self.message.is_empty() {
                     warning
@@ -299,7 +329,7 @@ impl App {
         let Some(video) = &self.video else {
             if matches!(event.kind, MouseEventKind::Up(_)) {
                 self.clear_input_state();
-                if let Err(error) = device.release_inputs().await {
+                if let Err(error) = self.release_tracked(device).await {
                     self.control = false;
                     self.message = error.to_string();
                 }
@@ -310,7 +340,7 @@ impl App {
         else {
             if matches!(event.kind, MouseEventKind::Up(_)) {
                 self.clear_input_state();
-                if let Err(error) = device.release_inputs().await {
+                if let Err(error) = self.release_tracked(device).await {
                     self.control = false;
                     self.message = error.to_string();
                 }
@@ -333,7 +363,7 @@ impl App {
                                 self.control = false;
                                 self.clear_input_state();
                                 self.message = error.to_string();
-                                let _ = device.release_inputs().await;
+                                let _ = self.release_tracked(device).await;
                                 return;
                             }
                             self.drag_modifiers.retain(|held| *held != modifier);
@@ -368,7 +398,7 @@ impl App {
                         if let Err(error) = device.key(modifier, true).await {
                             self.control = false;
                             self.clear_input_state();
-                            let cleanup = device.release_inputs().await;
+                            let cleanup = self.release_tracked(device).await;
                             self.message = match cleanup {
                                 Ok(()) => error.to_string(),
                                 Err(cleanup) => {
@@ -393,7 +423,7 @@ impl App {
                 if let Err(error) = device.mouse_button(name, false).await {
                     self.control = false;
                     self.clear_input_state();
-                    let cleanup = device.release_inputs().await;
+                    let cleanup = self.release_tracked(device).await;
                     self.message = match cleanup {
                         Ok(()) => error.to_string(),
                         Err(cleanup) => format!("{error}; input cleanup uncertain: {cleanup}"),
@@ -404,7 +434,7 @@ impl App {
                         if let Err(error) = device.key(modifier, false).await {
                             self.control = false;
                             self.message = error.to_string();
-                            let _ = device.release_inputs().await;
+                            let _ = self.release_tracked(device).await;
                             break;
                         }
                     }
@@ -517,7 +547,7 @@ impl App {
         if let Err(error) = result {
             self.control = false;
             self.clear_input_state();
-            let cleanup = device.release_inputs().await;
+            let cleanup = self.release_tracked(device).await;
             self.message = match cleanup {
                 Ok(()) => error.to_string(),
                 Err(cleanup) => format!("{error}; input cleanup uncertain: {cleanup}"),
@@ -593,7 +623,7 @@ impl App {
             }
             KeyCode::F(12) if self.control => {
                 self.leave_input_mode();
-                if let Err(error) = device.release_inputs().await {
+                if let Err(error) = self.release_tracked(device).await {
                     self.message = error.to_string();
                 }
             }
@@ -603,9 +633,7 @@ impl App {
                 self.message = RELEASE_WAIT.into();
             }
             KeyCode::Char('i') if !self.control => {
-                if self.capabilities.as_ref().is_some_and(|c| {
-                    c.keyboard == Capability::Supported || c.mouse == Capability::Supported
-                }) {
+                if self.input_available() {
                     self.control = true;
                     self.message = match self.capabilities.as_ref().map(|c| c.mouse_mode) {
                         Some(kvm_core::MouseMode::Absolute) => {
@@ -664,7 +692,7 @@ impl App {
                                         self.control = false;
                                         self.clear_input_state();
                                         self.message = error.to_string();
-                                        let _ = device.release_inputs().await;
+                                        let _ = self.release_tracked(device).await;
                                         return true;
                                     }
                                     self.held_modifiers.insert(name);
@@ -779,7 +807,7 @@ impl App {
                         if let Err(error) = result {
                             self.control = false;
                             self.clear_input_state();
-                            let cleanup = device.release_inputs().await;
+                            let cleanup = self.release_tracked(device).await;
                             self.message = match cleanup {
                                 Ok(()) => error.to_string(),
                                 Err(cleanup) => {
@@ -830,7 +858,7 @@ impl App {
                     }
                     if let Err(error) = result {
                         self.control = false;
-                        let cleanup = device.release_inputs().await;
+                        let cleanup = self.release_tracked(device).await;
                         self.message = match cleanup {
                             Ok(()) => error.to_string(),
                             Err(cleanup) => format!("{error}; input cleanup uncertain: {cleanup}"),
@@ -1660,6 +1688,7 @@ where
                 }
                 Err(error) => {
                     app.refreshing = false;
+                    app.clear_released_notice();
                     app.refresh_note = format!("Device state read failed: {error}");
                 }
             }
@@ -1695,13 +1724,12 @@ where
         {
             let item = receiver.borrow_and_update().clone();
             app.video = None;
-            app.control = false;
-            app.clear_input_state();
+            app.leave_input_mode();
             app.video_message = match item {
                 Some(Err(error)) => error,
                 _ => "Video stream closed".into(),
             };
-            if let Err(error) = device.release_inputs().await {
+            if let Err(error) = app.release_tracked(device).await {
                 app.video_message =
                     format!("{}; input cleanup uncertain: {error}", app.video_message);
             }
@@ -1838,7 +1866,7 @@ where
                     app.clear_input_state();
                     app.pending = None;
                     app.command = None;
-                    app.message = match device.release_inputs().await {
+                    app.message = match app.release_tracked(device).await {
                         Ok(()) if control_request.is_some() => {
                             "Focus lost; inputs released; submitted request remains in flight"
                                 .into()
@@ -1925,6 +1953,8 @@ mod tests {
         capabilities_gate: tokio::sync::Notify,
         /// Panics in `release_inputs`, so the task running it ends with a join error.
         panic_release: bool,
+        /// Holds the stream's failure after its frame until notified.
+        stream_close: Option<std::sync::Arc<tokio::sync::Notify>>,
         status_reads: std::sync::atomic::AtomicUsize,
         /// Makes the status read wait until video is requested, and video wait until the status read has finished, so the two can only both finish if the read progresses while the loop awaits video.
         video_waits_for_status: bool,
@@ -1935,6 +1965,8 @@ mod tests {
         jpeg: Option<Vec<u8>>,
         fail_after_frame: bool,
         dropped: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        /// When set, the failure after the frame waits for this, so a test can act while the stream is open.
+        close_gate: Option<std::sync::Arc<tokio::sync::Notify>>,
     }
     impl Drop for FakeStream {
         fn drop(&mut self) {
@@ -1948,6 +1980,9 @@ mod tests {
             if let Some(jpeg) = self.jpeg.take() {
                 Ok(Some(kvm_core::Snapshot { jpeg }))
             } else if self.fail_after_frame {
+                if let Some(gate) = &self.close_gate {
+                    gate.notified().await;
+                }
                 Err(kvm_core::Error::Transport("stream failed".into()))
             } else {
                 std::future::pending().await
@@ -1973,6 +2008,7 @@ mod tests {
                     jpeg: Some(jpeg.clone()),
                     fail_after_frame: self.fail_video_after_frame,
                     dropped: self.dropped.clone(),
+                    close_gate: self.stream_close.clone(),
                 })),
                 None => Err(kvm_core::Error::Unsupported("video".into())),
             }
@@ -3965,8 +4001,10 @@ mod tests {
                             release.control_release.notify_one();
                             None
                         }
+                        // The read that ended input mode lost the capabilities, so the message must not offer `i`.
                         2 if text.contains("Inputs released; input mode ended")
-                            && text.contains("Inputs released; i enters input mode") =>
+                            && !text.contains(RELEASE_WAIT)
+                            && !text.contains("i enters input mode") =>
                         {
                             phase = 3;
                             key(KeyCode::Char('q'))
@@ -4074,9 +4112,17 @@ mod tests {
             .collect()
     }
 
-    // Breaks if an uncertain cleanup is cut off on narrow screens, or if a finished notice keeps hiding later refresh outcomes.
+    fn failed_read() -> Refresh {
+        Refresh {
+            capabilities: Err(kvm_core::Error::Transport("device request: timeout".into())),
+            status: Err(kvm_core::Error::Transport("device request: timeout".into())),
+            controls_before: 0,
+        }
+    }
+
+    // Breaks if an uncertain cleanup is cut off on narrow screens, or if a later refresh outcome removes it although nothing has been released.
     #[tokio::test]
-    async fn an_uncertain_cleanup_stays_visible_and_a_finished_notice_gives_way() {
+    async fn an_uncertain_cleanup_stays_visible_until_a_release_succeeds() {
         let device = FakeDevice {
             fail_cleanup: true,
             ..FakeDevice::default()
@@ -4084,12 +4130,7 @@ mod tests {
         let mut app = App::default();
         app.refresh(&device).await;
         app.key(&device, KeyCode::Char('i')).await;
-        let failed = Refresh {
-            capabilities: Err(kvm_core::Error::Transport("device request: timeout".into())),
-            status: Err(kvm_core::Error::Transport("device request: timeout".into())),
-            controls_before: 0,
-        };
-        app.finish_refresh(&device, failed).await;
+        app.finish_refresh(&device, failed_read()).await;
         for width in [20, 30, 52, 80] {
             let row = state_row(&app, width);
             assert!(
@@ -4097,14 +4138,162 @@ mod tests {
                 "width {width}: {row:?}"
             );
         }
-        assert!(
-            app.message
-                .starts_with("Input cleanup uncertain, a key or button may still be held")
-        );
-        // The next refresh outcome replaces the finished notice.
+        assert!(app.message.starts_with("Cleanup uncertain: "));
+        // A later refresh outcome, failed or successful, leaves the warning in front.
+        app.finish_refresh(&device, failed_read()).await;
         let later = read_with(&device, Ok(fake_capabilities(Capability::Unsupported)), 0).await;
         app.finish_refresh(&device, later).await;
-        assert_eq!(state_row(&app, 52).trim_end(), "Device state read");
+        assert!(state_row(&app, 20).starts_with("Cleanup uncertain"));
+    }
+
+    // Breaks if a released notice keeps hiding later refresh outcomes, or if a later successful release does not settle an uncertain cleanup.
+    #[tokio::test]
+    async fn a_notice_gives_way_once_a_release_has_succeeded() {
+        let device = FakeDevice::default();
+        let mut app = App::default();
+        app.refresh(&device).await;
+        app.key(&device, KeyCode::Char('i')).await;
+        app.finish_refresh(&device, failed_read()).await;
+        assert!(app.device_state_line().starts_with("Inputs released"));
+        let later = read_with(&device, Ok(fake_capabilities(Capability::Unsupported)), 0).await;
+        app.finish_refresh(&device, later).await;
+        assert_eq!(app.device_state_line(), "Device state read");
+
+        // An uncertain cleanup is settled by the next successful release, here from focus loss's path, and then gives way.
+        app.input_ended = Some(InputEnded {
+            cause: "capabilities could not be read",
+            release: Release::Failed("cleanup failed".into()),
+        });
+        app.release_tracked(&device).await.unwrap();
+        assert!(app.device_state_line().starts_with("Inputs released"));
+        let later = read_with(&device, Ok(fake_capabilities(Capability::Supported)), 0).await;
+        app.finish_refresh(&device, later).await;
+        assert_eq!(app.device_state_line(), "Device state read");
+    }
+
+    // Breaks if a read applied while the release is pending drops the notice, which would let `i` re-enter input mode and the release lift what is pressed next.
+    #[tokio::test]
+    async fn a_pending_release_survives_a_later_read() {
+        let device = FakeDevice::default();
+        let mut app = App::default();
+        app.refresh(&device).await;
+        app.key(&device, KeyCode::Char('i')).await;
+        assert!(app.apply_refresh(failed_read()));
+        let later = read_with(&device, Ok(fake_capabilities(Capability::Supported)), 0).await;
+        assert!(!app.apply_refresh(later));
+        assert!(app.device_state_line().starts_with("Releasing inputs"));
+        app.key(&device, KeyCode::Char('i')).await;
+        assert!(!app.control);
+        assert_eq!(app.message, RELEASE_WAIT);
+    }
+
+    // Scenario 1: a second refresh requested before the release fails completes after it; the warning must stay on the row, visible at 20 columns.
+    #[tokio::test]
+    async fn a_failed_release_survives_a_read_requested_before_it_failed() {
+        let device = FakeDevice::default();
+        let mut app = App::default();
+        app.refresh(&device).await;
+        app.key(&device, KeyCode::Char('i')).await;
+        assert!(app.apply_refresh(failed_read()));
+        let second = read_with(&device, Ok(fake_capabilities(Capability::Supported)), 0).await;
+        app.input_release_finished(Err(kvm_core::Error::AmbiguousInput(
+            "cleanup failed".into(),
+        )));
+        app.apply_refresh(second);
+        assert!(state_row(&app, 20).starts_with("Cleanup uncertain"));
+    }
+
+    // Scenario 2: a control's outcome replaces the message and a refresh follows; the warning must still be on screen at every width.
+    #[tokio::test]
+    async fn a_failed_release_survives_a_control_outcome_and_a_refresh() {
+        let device = FakeDevice::default();
+        let mut app = App::default();
+        app.refresh(&device).await;
+        app.key(&device, KeyCode::Char('i')).await;
+        assert!(app.apply_refresh(failed_read()));
+        app.input_release_finished(Err(kvm_core::Error::AmbiguousInput(
+            "cleanup failed".into(),
+        )));
+        app.control_finished(Ok(kvm_core::ControlOutcome::Unverified));
+        assert!(!app.message.contains("Cleanup uncertain"));
+        let later = read_with(
+            &device,
+            Ok(fake_capabilities(Capability::Supported)),
+            app.controls_completed,
+        )
+        .await;
+        app.apply_refresh(later);
+        for width in [20, 30, 52, 80] {
+            let row = state_row(&app, width);
+            assert!(
+                row.starts_with("Cleanup uncertain"),
+                "width {width}: {row:?}"
+            );
+        }
+    }
+
+    // Breaks if the stream closing leaves input mode's entry text as the message after input mode has ended.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_closing_stream_replaces_the_input_mode_entry_message() {
+        let mut jpeg = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new(&mut jpeg)
+            .encode_image(&image::RgbImage::new(8, 8))
+            .unwrap();
+        let close = std::sync::Arc::new(tokio::sync::Notify::new());
+        let device = std::sync::Arc::new(FakeDevice {
+            video_frame: Some(jpeg),
+            fail_video_after_frame: true,
+            stream_close: Some(close.clone()),
+            ..FakeDevice::default()
+        });
+        let mut terminal = Terminal::new(TestBackend::new(80, 16)).unwrap();
+        let mut phase = 0;
+        let key = |code| {
+            Some(Event::Key(crossterm::event::KeyEvent::new(
+                code,
+                crossterm::event::KeyModifiers::NONE,
+            )))
+        };
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            run_loop(
+                &mut terminal,
+                device.clone(),
+                &ImagePicker::halfblocks(),
+                false,
+                after_start_up_refresh(move |terminal| {
+                    let text = screen_text(terminal);
+                    Ok(match phase {
+                        0 => {
+                            phase = 1;
+                            key(KeyCode::Char('v'))
+                        }
+                        1 if text.contains("Live video") && !text.contains("Waiting for video") => {
+                            phase = 2;
+                            key(KeyCode::Char('i'))
+                        }
+                        2 if text.contains("Input mode:") => {
+                            phase = 3;
+                            close.notify_one();
+                            None
+                        }
+                        3 if text.contains("stream failed") => {
+                            assert!(!text.contains("Input mode:"), "{text}");
+                            assert!(text.contains(INPUT_MODE_ENDED), "{text}");
+                            phase = 4;
+                            key(KeyCode::Char('q'))
+                        }
+                        _ => {
+                            std::thread::yield_now();
+                            None
+                        }
+                    })
+                }),
+            ),
+        )
+        .await
+        .expect("the loop must finish")
+        .unwrap();
     }
 
     // Breaks if a long help, message or command wraps the device-state line out of view.
