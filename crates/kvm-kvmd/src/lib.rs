@@ -503,10 +503,7 @@ impl std::ops::DerefMut for TaskLock {
 impl Drop for TaskLock {
     fn drop(&mut self) {
         if let Some(owed) = self.owes.take() {
-            self.owed
-                .lock()
-                .expect("owed releases lock poisoned")
-                .push_back(owed);
+            let _ = (&self.owed, owed);
         }
     }
 }
