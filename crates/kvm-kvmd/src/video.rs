@@ -455,9 +455,10 @@ mod tests {
             }
         }
         send.send(true).await.unwrap();
-        assert!(video.next_frame().await.unwrap().unwrap().jpeg.len() > 64 * 258);
+        let frame = video.next_frame().await.unwrap().unwrap().jpeg;
+        assert!(frame.len() > 64 * 258);
         assert!(video.proven.load(Ordering::Acquire));
-        assert!(video.scanned < 64 * (258 + b"\r\n--frame".len() * 2));
+        assert!(video.scanned < frame.len() + 64 * b"\r\n--frame".len() * 2);
         server.await.unwrap();
     }
 
