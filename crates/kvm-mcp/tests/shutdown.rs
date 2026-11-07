@@ -127,6 +127,10 @@ async fn exercise(delayed: bool) {
         .spawn()
         .unwrap();
     drop(reader);
+    let mut stderr = BufReader::new(child.stderr.take().unwrap());
+    let mut readiness = String::new();
+    stderr.read_line(&mut readiness).unwrap();
+    assert_eq!(readiness.trim_end(), "MCP shutdown handlers registered");
     let mut input = child.stdin.take().unwrap();
     let mut output = BufReader::new(child.stdout.take().unwrap());
     fn request(input: &mut impl Write, output: &mut impl BufRead, value: Value) -> Value {
@@ -167,14 +171,25 @@ async fn exercise(delayed: bool) {
     if delayed {
         fixture.proceed.notify_one();
     }
-    let status = tokio::time::timeout(
+    let output = tokio::time::timeout(
         Duration::from_secs(10),
-        tokio::task::spawn_blocking(move || child.wait().unwrap()),
+        tokio::task::spawn_blocking(move || child.wait_with_output().unwrap()),
     )
     .await
     .unwrap()
     .unwrap();
-    assert!(status.success());
+    let mut remaining_stderr = String::new();
+    std::io::Read::read_to_string(&mut stderr, &mut remaining_stderr).unwrap();
+    let stderr = remaining_stderr
+        .replace("synthetic-password", "[redacted]")
+        .replace("synthetic-token", "[redacted]")
+        .replace("synthetic-session", "[redacted]");
+    assert!(
+        output.status.success(),
+        "child status: {}; stderr: {}",
+        output.status,
+        stderr
+    );
     if delayed {
         assert_eq!(*fixture.events.lock().unwrap(), vec![true, false]);
     } else {
@@ -256,14 +271,23 @@ async fn approval_precedes_mcp_initialisation() {
         .unwrap();
     assert!(serde_json::from_str::<Value>(&line).unwrap()["result"].is_object());
     drop(input);
-    let status = tokio::time::timeout(
+    let output = tokio::time::timeout(
         Duration::from_secs(10),
-        tokio::task::spawn_blocking(move || child.wait().unwrap()),
+        tokio::task::spawn_blocking(move || child.wait_with_output().unwrap()),
     )
     .await
     .unwrap()
     .unwrap();
-    assert!(status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr)
+        .replace("synthetic-password", "[redacted]")
+        .replace("synthetic-token", "[redacted]")
+        .replace("synthetic-session", "[redacted]");
+    assert!(
+        output.status.success(),
+        "child status: {}; stderr: {}",
+        output.status,
+        stderr
+    );
     output_task.await.unwrap();
     server.abort();
     assert!(server.await.unwrap_err().is_cancelled());

@@ -117,6 +117,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let allow_consequential = env::var("KVM_ALLOW_CONSEQUENTIAL").as_deref() == Ok("1");
     let server = Server::new(device.clone(), allow_control, allow_consequential);
     let signal = shutdown_signal()?;
+    eprintln!("MCP shutdown handlers registered");
     let service = server.clone().serve(transport).await?;
     let cancel = service.cancellation_token();
     let signal_task = tokio::spawn(async move {
