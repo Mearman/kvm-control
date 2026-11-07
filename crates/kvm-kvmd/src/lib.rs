@@ -242,7 +242,7 @@ fn validate_jpeg(bytes: &[u8]) -> Result<Vec<u8>> {
     Ok(stripped)
 }
 
-/// A failed request, with whether the connection itself failed (no connection or no TLS session could be established within the connect phase's timeout) rather than this one request (an error status, no complete response within the response phase after connecting, a body that broke off or could not be parsed, or a reused connection that had closed).
+/// A failed request, with whether the connection itself failed (no connection or no TLS session could be established within `Config::timeout`) rather than this one request (an error status, no complete response by the request's overall deadline, a body that broke off or could not be parsed, or a reused connection that had closed).
 pub(crate) struct RequestFailure {
     pub(crate) error: Error,
     pub(crate) connection: bool,
@@ -284,7 +284,7 @@ pub struct Config {
     pub profile: DeviceProfile,
     pub trusted_ca_pem: Option<Vec<u8>>,
     pub insecure_tls: bool,
-    /// Bounds each phase of a device request separately: establishing the connection (TCP and TLS), and then receiving the complete response. A request other than live video therefore ends within twice this. Bounding the connect phase on its own is what lets a device that cannot be reached be told apart from one that is slow to answer.
+    /// The connection (TCP and TLS) must be established within this, and the whole request, response included, ends within twice it, measured from when it is sent. A response on a connection that is reused, or one that was quick to establish, can therefore take up to twice this. Live video has no overall deadline. Bounding the connection on its own is what lets a device that cannot be reached be told apart from one that is slow to answer.
     pub timeout: Duration,
 }
 
@@ -727,7 +727,7 @@ impl Kvmd {
                 .redirect(reqwest::redirect::Policy::none())
                 .danger_accept_invalid_certs(config.insecure_tls);
             if limited {
-                // The connect phase's budget plus the response phase's: reqwest starts this deadline before connecting, so equal deadlines would let it fire first and report a stalled connection as an ordinary timeout.
+                // Twice the connect deadline: reqwest starts this deadline when the request is sent, before connecting, so equal deadlines would let it fire first and report a stalled connection as an ordinary timeout.
                 builder = builder.timeout(config.timeout.saturating_add(config.timeout));
             }
             if let Some(pem) = &config.trusted_ca_pem {
