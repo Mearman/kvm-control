@@ -20,7 +20,7 @@ async-trait.workspace = true
 axum.workspace = true
 axum-server.workspace = true
 rcgen.workspace = true
-rustix = { version = "1.1.6", features = ["pipe", "fs", "process"] }
+rustix = { workspace = true, features = ["pipe", "fs", "process"] }
 rustls.workspace = true
 tempfile = "3"
 
