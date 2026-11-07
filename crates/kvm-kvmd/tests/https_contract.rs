@@ -361,13 +361,28 @@ fn client(endpoint: Url, ca: Option<Vec<u8>>) -> Kvmd {
     profile_client(endpoint, ca, DeviceProfile::PiKvm)
 }
 
+/// The fixture client's request timeout. A request that has not reached the fake device, or an outcome not delivered, within it would already have failed in the client, so a test waiting longer cannot pass for a different reason.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Waits for `future`, failing the test instead of hanging if it does not finish within the client's request timeout.
+async fn within<F: std::future::Future>(what: &str, future: F) -> F::Output {
+    tokio::time::timeout(REQUEST_TIMEOUT, future)
+        .await
+        .unwrap_or_else(|_| panic!("timed out waiting for {what}"))
+}
+
+/// Waits for the next gated request to reach the fake device.
+async fn arrival(calls: &Calls) {
+    within("a request to reach the device", calls.3.notified()).await;
+}
+
 fn profile_client(endpoint: Url, ca: Option<Vec<u8>>, profile: DeviceProfile) -> Kvmd {
     Kvmd::new(Config {
         endpoint,
         profile,
         trusted_ca_pem: ca,
         insecure_tls: false,
-        timeout: Duration::from_secs(5),
+        timeout: REQUEST_TIMEOUT,
     })
     .unwrap()
 }
@@ -606,13 +621,11 @@ async fn cancelled_input_is_cleaned_up_with_a_retained_owner() {
                 sender.key("KeyA", true).await
             }
         });
-        calls.3.notified().await;
+        arrival(&calls).await;
         task.abort();
         assert!(task.await.unwrap_err().is_cancelled());
         calls.4.notify_one();
-        tokio::time::timeout(Duration::from_secs(5), calls.3.notified())
-            .await
-            .unwrap();
+        arrival(&calls).await;
         calls.4.notify_one();
         device.release_inputs().await.unwrap();
         let events: Vec<_> = calls
@@ -645,14 +658,20 @@ where
     tokio::spawn(future)
 }
 
-/// Completes `future`, letting every gated request reach the device in the order it arrives.
+/// Completes `future`, letting every gated request reach the device in the order it arrives. Each step, a request arriving or the future finishing, is bounded by the client's request timeout.
 async fn drive<F: std::future::Future>(calls: &Calls, future: F) -> F::Output {
     let mut future = std::pin::pin!(future);
     loop {
-        tokio::select! {
-            biased;
-            output = &mut future => return output,
-            () = calls.3.notified() => calls.4.notify_one(),
+        let step = async {
+            tokio::select! {
+                biased;
+                output = &mut future => Some(output),
+                () = calls.3.notified() => None,
+            }
+        };
+        match within("a request or the outcome", step).await {
+            Some(output) => return output,
+            None => calls.4.notify_one(),
         }
     }
 }
@@ -715,13 +734,13 @@ async fn cancelled_cleanup_precedes_later_input_and_explicit_release() {
     let device = Arc::new(client(endpoint, Some(ca)));
     let sender = device.clone();
     let first = tokio::spawn(async move { sender.key("KeyA", true).await });
-    calls.3.notified().await;
+    arrival(&calls).await;
     let sender = device.clone();
     let second = queue(async move { sender.key("KeyB", true).await }).await;
     first.abort();
     assert!(first.await.unwrap_err().is_cancelled());
     calls.4.notify_one();
-    calls.3.notified().await;
+    arrival(&calls).await;
     assert!(
         calls
             .0
@@ -732,7 +751,7 @@ async fn cancelled_cleanup_precedes_later_input_and_explicit_release() {
             .contains("key=KeyA&state=false")
     );
     calls.4.notify_one();
-    calls.3.notified().await;
+    arrival(&calls).await;
     assert!(
         calls
             .0
@@ -746,7 +765,7 @@ async fn cancelled_cleanup_precedes_later_input_and_explicit_release() {
     second.await.unwrap().unwrap();
     let sender = device.clone();
     let release = tokio::spawn(async move { sender.release_inputs().await });
-    calls.3.notified().await;
+    arrival(&calls).await;
     assert!(
         calls
             .0
@@ -770,16 +789,14 @@ async fn completed_input_awaiting_collection_does_not_hold_the_input_lock() {
     let mut press = Box::pin(device.key("KeyA", true));
     tokio::select! {
         result = &mut press => panic!("input completed unexpectedly: {result:?}"),
-        () = calls.3.notified() => {}
+        () = arrival(&calls) => {}
     }
     calls.4.notify_one();
     // The press completes while its future stays alive and unpolled.
     let mut release = Box::pin(device.release_inputs());
     tokio::select! {
         result = &mut release => panic!("release completed unexpectedly: {result:?}"),
-        waited = tokio::time::timeout(Duration::from_secs(5), calls.3.notified()) => {
-            waited.expect("release waited on a lock held for an uncollected outcome");
-        }
+        () = arrival(&calls) => {}
     }
     assert!(
         calls
@@ -810,13 +827,13 @@ fn input_future_dropped_outside_runtime_is_cleaned_up() {
     runtime.block_on(async {
         tokio::select! {
             result = &mut input => panic!("input completed unexpectedly: {result:?}"),
-            () = calls.3.notified() => {}
+            () = arrival(&calls) => {}
         }
     });
     drop(input);
     runtime.block_on(async {
         calls.4.notify_one();
-        calls.3.notified().await;
+        arrival(&calls).await;
         assert!(
             calls
                 .0
@@ -849,7 +866,7 @@ fn input_interrupted_by_runtime_shutdown_stays_tracked_as_ambiguous() {
     input_runtime.block_on(async {
         tokio::select! {
             result = &mut input => panic!("input completed unexpectedly: {result:?}"),
-            () = calls.3.notified() => {}
+            () = arrival(&calls) => {}
         }
     });
     drop(input);
@@ -895,10 +912,10 @@ async fn delivered_but_uncollected_input_is_released_before_the_next_input() {
     let woken = Arc::new(Woken(tokio::sync::Notify::new()));
     let mut press = Box::pin(device.key("KeyA", true));
     poll_once(press.as_mut(), &woken);
-    calls.3.notified().await;
+    arrival(&calls).await;
     calls.4.notify_one();
     // The outcome is delivered, waking the caller, which drops the future without collecting it.
-    woken.0.notified().await;
+    within("the outcome to be delivered", woken.0.notified()).await;
     drop(press);
     drive(&calls, device.key("KeyB", true)).await.unwrap();
     assert_eq!(
@@ -930,13 +947,13 @@ fn cleanup_interrupted_by_runtime_shutdown_stays_pending() {
     input_runtime.block_on(async {
         drive(&calls, device.key("KeyA", true)).await.unwrap();
         poll_once(press.as_mut(), &woken);
-        calls.3.notified().await;
+        arrival(&calls).await;
         calls.4.notify_one();
-        woken.0.notified().await;
+        within("the outcome to be delivered", woken.0.notified()).await;
     });
     // Dropping the delivered press marks cleanup pending and schedules it on the input runtime.
     drop(press);
-    input_runtime.block_on(calls.3.notified());
+    input_runtime.block_on(arrival(&calls));
     assert_eq!(input_events(&calls).last().unwrap(), "key=KeyA&state=false");
     // Shutdown drops the cleanup after it took the pending flag, with the KeyA release in flight and KeyB still held.
     drop(input_runtime);
@@ -968,7 +985,7 @@ async fn release_after_an_ambiguous_press_is_sent_after_cleanup() {
     ));
     let sender = device.clone();
     let abandoned = tokio::spawn(async move { sender.key("KeyB", true).await });
-    calls.3.notified().await;
+    arrival(&calls).await;
     abandoned.abort();
     assert!(abandoned.await.unwrap_err().is_cancelled());
     calls.4.notify_one();
@@ -994,7 +1011,7 @@ async fn release_after_cleanup_is_sent_again_in_a_new_login() {
     let device = Arc::new(client(endpoint, Some(ca)));
     let sender = device.clone();
     let press = tokio::spawn(async move { sender.key("KeyA", true).await });
-    calls.3.notified().await;
+    arrival(&calls).await;
     press.abort();
     assert!(press.await.unwrap_err().is_cancelled());
     calls.4.notify_one();
@@ -1022,7 +1039,7 @@ async fn cancelled_ambiguous_release_is_not_replayed() {
     drive(&calls, device.key("ambiguous", true)).await.unwrap();
     let sender = device.clone();
     let task = tokio::spawn(async move { sender.key("ambiguous", false).await });
-    calls.3.notified().await;
+    arrival(&calls).await;
     task.abort();
     assert!(task.await.unwrap_err().is_cancelled());
     calls.4.notify_one();
@@ -1051,14 +1068,14 @@ async fn request_abandoned_during_owed_cleanup_leaves_nothing_held() {
     let device = Arc::new(client(endpoint, Some(ca)));
     let sender = device.clone();
     let first = tokio::spawn(async move { sender.key("KeyA", true).await });
-    calls.3.notified().await;
+    arrival(&calls).await;
     let sender = device.clone();
     let second = queue(async move { sender.key("KeyB", true).await }).await;
     first.abort();
     assert!(first.await.unwrap_err().is_cancelled());
     calls.4.notify_one();
     // Cleanup owed for the first request is in flight when the second request is abandoned.
-    calls.3.notified().await;
+    arrival(&calls).await;
     assert!(
         calls
             .0
@@ -1087,11 +1104,11 @@ async fn release_after_cleanup_released_the_input_is_not_resent() {
     let device = Arc::new(client(endpoint, Some(ca)));
     let sender = device.clone();
     let press = tokio::spawn(async move { sender.key("KeyA", true).await });
-    calls.3.notified().await;
+    arrival(&calls).await;
     press.abort();
     assert!(press.await.unwrap_err().is_cancelled());
     calls.4.notify_one();
-    calls.3.notified().await;
+    arrival(&calls).await;
     calls.4.notify_one();
     drive(&calls, device.key("KeyA", false)).await.unwrap();
     let events: Vec<_> = calls
