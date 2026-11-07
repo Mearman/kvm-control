@@ -193,7 +193,9 @@ fn flag() -> impl Strategy<Value = Option<Value>> {
         Just(Some(json!(true))),
         Just(Some(json!(false))),
         Just(Some(json!("true"))),
+        Just(Some(json!(0))),
         Just(Some(json!(1))),
+        Just(Some(json!(2))),
         Just(Some(Value::Null)),
     ]
 }
@@ -221,9 +223,9 @@ proptest! {
         prop_assert_eq!(mouse_mode(&state), expected);
     }
 
-    // Breaks if a wrongly typed flag counts as true, or if the other device's state leaks into the answer.
+    // Breaks if a wrongly typed flag counts as true, if CH9329's integer online flag (`1`) is not read as true, or if the other device's state leaks into the answer. `enabled` stays a strict boolean.
     #[test]
-    fn hid_capability_requires_boolean_flags_on_the_named_device(
+    fn hid_capability_reads_typed_flags_on_the_named_device(
         enabled in flag(),
         online in flag(),
         other_online in flag(),
@@ -240,9 +242,14 @@ proptest! {
         if let Some(value) = other_online {
             state[other] = json!({"online": value});
         }
-        let expected = match (enabled, online) {
-            (Some(Value::Bool(false)), _) => Capability::Unsupported,
-            (Some(Value::Bool(true)), Some(Value::Bool(true))) => Capability::Supported,
+        let online_true = match &online {
+            Some(Value::Bool(true)) => true,
+            Some(Value::Number(number)) => number.as_u64() == Some(1),
+            _ => false,
+        };
+        let expected = match enabled {
+            Some(Value::Bool(false)) => Capability::Unsupported,
+            Some(Value::Bool(true)) if online_true => Capability::Supported,
             _ => Capability::Unknown,
         };
         prop_assert_eq!(hid_capability(&state, device), expected);
