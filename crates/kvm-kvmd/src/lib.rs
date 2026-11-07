@@ -13,6 +13,8 @@ use std::{
     time::Duration,
 };
 
+#[cfg(test)]
+mod proptests;
 mod video;
 #[cfg(test)]
 mod video_tests;
