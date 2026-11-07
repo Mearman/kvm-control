@@ -564,48 +564,165 @@ async fn cancelled_move_finishes_before_button_press() {
         .unwrap();
 }
 
+/// Replaces the device's reporter with one that records each report, and returns the record.
+fn capture_reports(device: &mut Kvmd) -> Arc<std::sync::Mutex<Vec<String>>> {
+    let reports = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = reports.clone();
+    device.reporter = crate::Reporter(Arc::new(move |message: &str| {
+        sink.lock().unwrap().push(message.to_owned());
+    }));
+    reports
+}
+
+/// Writes a complete response with a JSON body and closes the connection.
+async fn respond(stream: &mut tokio::net::TcpStream, status: &str, body: &[u8]) {
+    stream
+        .write_all(
+            format!(
+                "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+    stream.write_all(body).await.unwrap();
+}
+
 #[tokio::test]
-async fn movement_abandoned_during_its_state_read_is_not_sent() {
+async fn movement_abandoned_during_its_state_read_is_not_sent_or_reported() {
+    // An answer that allows the movement, one that rejects the mouse mode, and a failed read: none sends a movement or reports anything once the caller has gone.
+    for (status, body) in [
+        (
+            "200 OK",
+            &b"{\"ok\":true,\"result\":{\"enabled\":true,\"mouse\":{\"online\":true,\"absolute\":true}}}"[..],
+        ),
+        (
+            "200 OK",
+            &b"{\"ok\":true,\"result\":{\"enabled\":true,\"mouse\":{\"online\":true,\"absolute\":false}}}"[..],
+        ),
+        ("403 Forbidden", &b"{\"ok\":false}"[..]),
+    ] {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut device = input_device(listener.local_addr().unwrap());
+        let reports = capture_reports(&mut device);
+        let device = Arc::new(device);
+        let (read_tx, read_rx) = tokio::sync::oneshot::channel();
+        let (answer_tx, answer_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut state, _) = listener.accept().await.unwrap();
+            assert!(read_request(&mut state).await.contains("/api/hid "));
+            read_tx.send(()).unwrap();
+            answer_rx.await.unwrap();
+            respond(&mut state, status, body).await;
+            listener
+        });
+        let moving = device.clone();
+        let movement = tokio::spawn(async move { moving.mouse_move(1, 2).await });
+        tokio::time::timeout(INPUT_TIMEOUT, read_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        // The caller leaves while the state read is unanswered, after the check that follows settlement.
+        movement.abort();
+        assert!(movement.await.unwrap_err().is_cancelled());
+        answer_tx.send(()).unwrap();
+        let listener = tokio::time::timeout(INPUT_TIMEOUT, server)
+            .await
+            .unwrap()
+            .unwrap();
+        // Once the input task has finished, any movement it sent is already waiting to be accepted and any report already made.
+        input_tasks_finished(&device.inputs).await;
+        assert_no_waiting_connection(listener, "an abandoned movement was sent");
+        assert_eq!(*reports.lock().unwrap(), Vec::<String>::new(), "{status}");
+    }
+}
+
+#[tokio::test]
+async fn failed_outcome_of_an_abandoned_press_is_reported_once() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let device = Arc::new(input_device(listener.local_addr().unwrap()));
-    let (read_tx, read_rx) = tokio::sync::oneshot::channel();
+    let mut device = input_device(listener.local_addr().unwrap());
+    let reports = capture_reports(&mut device);
+    let device = Arc::new(device);
+    let (arrived_tx, arrived_rx) = tokio::sync::oneshot::channel();
     let (answer_tx, answer_rx) = tokio::sync::oneshot::channel();
     let server = tokio::spawn(async move {
-        let (mut state, _) = listener.accept().await.unwrap();
-        assert!(read_request(&mut state).await.contains("/api/hid "));
-        read_tx.send(()).unwrap();
+        let (mut press, _) = listener.accept().await.unwrap();
+        assert!(read_input_request(&mut press).await.contains("state=true"));
+        arrived_tx.send(()).unwrap();
         answer_rx.await.unwrap();
-        let body = b"{\"ok\":true,\"result\":{\"enabled\":true,\"mouse\":{\"online\":true,\"absolute\":true}}}";
-        state
-            .write_all(
-                format!(
-                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                    body.len()
-                )
-                .as_bytes(),
-            )
-            .await
-            .unwrap();
-        state.write_all(body).await.unwrap();
-        listener
+        respond(&mut press, "500 Internal Server Error", b"").await;
+        // The abandoned press still owes its release, which the device confirms.
+        let (mut release, _) = listener.accept().await.unwrap();
+        assert!(
+            read_input_request(&mut release)
+                .await
+                .contains("state=false")
+        );
+        respond(&mut release, "200 OK", b"{\"ok\":true}").await;
     });
-    let moving = device.clone();
-    let movement = tokio::spawn(async move { moving.mouse_move(1, 2).await });
-    tokio::time::timeout(INPUT_TIMEOUT, read_rx)
+    let pressing = device.clone();
+    let press = tokio::spawn(async move { pressing.key("KeyA", true).await });
+    tokio::time::timeout(INPUT_TIMEOUT, arrived_rx)
         .await
         .unwrap()
         .unwrap();
-    // The caller leaves while the state read is unanswered, after the check that follows settlement.
-    movement.abort();
-    assert!(movement.await.unwrap_err().is_cancelled());
+    press.abort();
+    assert!(press.await.unwrap_err().is_cancelled());
     answer_tx.send(()).unwrap();
+    tokio::time::timeout(INPUT_TIMEOUT, server)
+        .await
+        .unwrap()
+        .unwrap();
+    input_tasks_finished(&device.inputs).await;
+    let reports = reports.lock().unwrap().clone();
+    assert_eq!(reports.len(), 1, "{reports:?}");
+    assert!(
+        reports[0].starts_with("Input outcome uncertain for an abandoned request: "),
+        "{reports:?}"
+    );
+}
+
+#[tokio::test]
+async fn failed_release_by_an_owner_dropped_on_another_runtime_is_reported_once() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut device = input_device(listener.local_addr().unwrap());
+    let reports = capture_reports(&mut device);
+    let server = tokio::spawn(async move {
+        let (mut press, _) = listener.accept().await.unwrap();
+        assert!(read_input_request(&mut press).await.contains("state=true"));
+        respond(&mut press, "200 OK", b"{\"ok\":true}").await;
+        let (mut release, _) = listener.accept().await.unwrap();
+        assert!(
+            read_input_request(&mut release)
+                .await
+                .contains("state=false")
+        );
+        respond(&mut release, "500 Internal Server Error", b"").await;
+        listener
+    });
+    device.key("KeyA", true).await.unwrap();
+    let inputs = device.inputs.clone();
+    // Dropped on another runtime, the owner schedules the release on this one and a waiting task on its own, which must not report the failure again.
+    std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async move { drop(device) });
+    })
+    .join()
+    .unwrap();
     let listener = tokio::time::timeout(INPUT_TIMEOUT, server)
         .await
         .unwrap()
         .unwrap();
-    // Once the input task has finished, any movement it sent is already waiting to be accepted.
-    input_tasks_finished(&device.inputs).await;
-    assert_no_waiting_connection(listener, "an abandoned movement was sent");
+    input_tasks_finished(&inputs).await;
+    assert_eq!(
+        *reports.lock().unwrap(),
+        ["Input cleanup uncertain: a release sent by a dropped owner was not confirmed"]
+    );
+    assert_no_waiting_connection(listener, "the failed release was sent again");
 }
 
 #[tokio::test]
