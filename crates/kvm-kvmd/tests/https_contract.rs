@@ -879,12 +879,6 @@ fn input_interrupted_by_runtime_shutdown_stays_tracked_as_ambiguous() {
     drop(input);
     // Shutdown drops the input task while its request is still in flight.
     drop(input_runtime);
-    server_runtime.block_on(async {
-        assert!(matches!(
-            device.login("test-user", "test-password").await,
-            Err(Error::AmbiguousInput(_))
-        ));
-    });
     assert_eq!(
         calls
             .0
@@ -908,6 +902,11 @@ fn input_interrupted_by_runtime_shutdown_stays_tracked_as_ambiguous() {
             "key=KeyB&state=true"
         ]
     );
+    // The interrupted press stays recorded as ambiguous, since the device may still apply it.
+    assert!(matches!(
+        server_runtime.block_on(drive(&calls, device.release_inputs())),
+        Err(Error::AmbiguousInput(_))
+    ));
     server.abort();
 }
 
