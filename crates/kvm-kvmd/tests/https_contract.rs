@@ -166,6 +166,24 @@ async fn capability(uri: Uri) -> impl IntoResponse {
     Json(json!({"ok": true, "result": state}))
 }
 
+async fn switch_fixture(State(calls): State<Calls>, uri: Uri) -> impl IntoResponse {
+    let mut log = calls.0.lock().unwrap();
+    let reads = log
+        .iter()
+        .filter(|entry| entry.as_str() == uri.path())
+        .count();
+    log.push(uri.path().to_owned());
+    let ports = if uri.path().starts_with("/malformed/") {
+        json!([{}, {"unit": 1, "channel": 1}])
+    } else {
+        json!([{"unit": 0, "channel": 0}, {"unit": 0, "channel": 1}])
+    };
+    let synced = uri.path().starts_with("/eventual/") && reads >= 2;
+    Json(
+        json!({"ok": true, "result": {"model": {"ports": ports}, "summary": {"active_port": if synced {1} else {0}, "synced": synced}, "usb_otg": {"links": [true, false]}}}),
+    )
+}
+
 async fn control(State(calls): State<Calls>, uri: Uri) -> impl IntoResponse {
     calls.0.lock().unwrap().push(uri.to_string());
     Json(json!({"ok": true, "result": {}}))
@@ -266,6 +284,14 @@ async fn fixture() -> (Url, Vec<u8>, Calls, tokio::task::JoinHandle<()>) {
         .route("/api/poison", get(poisoning_status))
         .route("/api/atx", get(capability))
         .route("/api/switch", get(capability))
+        .route("/eventual/api/switch", get(switch_fixture))
+        .route("/eventual/api/switch/set_active", post(control))
+        .route("/timeout/api/switch", get(switch_fixture))
+        .route("/timeout/api/switch/set_active", post(control))
+        .route("/malformed/api/switch", get(switch_fixture))
+        .route("/malformed/api/switch/set_active", post(control))
+        .route("/glswitch/api/switch", get(switch_fixture))
+        .route("/glswitch/api/switch/set_active", post(control))
         .route("/api/gpio", get(capability))
         .route("/api/msd", get(capability))
         .route("/api/hid/events/send_key", post(status))
@@ -739,6 +765,113 @@ async fn switch_observation_uses_profile_semantics_and_rejects_unknown_ports() {
         2
     );
     assert!(paths.iter().all(|path| !path.contains("port=2")));
+    server.abort();
+}
+
+#[tokio::test]
+async fn pikvm_switch_polling_observes_eventual_match_without_replaying() {
+    let (mut endpoint, ca, calls, server) = fixture().await;
+    endpoint.set_path("/eventual/");
+    let device = client(endpoint, Some(ca));
+    assert_eq!(
+        device
+            .control(Control::Switch { port: 1 }, Confirmation::new())
+            .await
+            .unwrap(),
+        ControlOutcome::ObservedMatching
+    );
+    let log = calls.0.lock().unwrap();
+    assert_eq!(
+        log.iter()
+            .filter(|entry| entry.as_str() == "/eventual/api/switch")
+            .count(),
+        3
+    );
+    assert_eq!(
+        log.iter()
+            .filter(|entry| entry.starts_with("/eventual/api/switch/set_active?"))
+            .count(),
+        1
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn pikvm_switch_polling_stops_without_a_match() {
+    let (mut endpoint, ca, calls, server) = fixture().await;
+    endpoint.set_path("/timeout/");
+    let device = client(endpoint, Some(ca));
+    assert_eq!(
+        device
+            .control(Control::Switch { port: 1 }, Confirmation::new())
+            .await
+            .unwrap(),
+        ControlOutcome::Unverified
+    );
+    let log = calls.0.lock().unwrap();
+    assert_eq!(
+        log.iter()
+            .filter(|entry| entry.as_str() == "/timeout/api/switch")
+            .count(),
+        6
+    );
+    assert_eq!(
+        log.iter()
+            .filter(|entry| entry.starts_with("/timeout/api/switch/set_active?"))
+            .count(),
+        1
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn gl_switch_channel_does_not_verify_usb_completion() {
+    let (mut endpoint, ca, calls, server) = fixture().await;
+    endpoint.set_path("/glswitch/");
+    let device = profile_client(endpoint, Some(ca), DeviceProfile::GlKvm);
+    assert_eq!(
+        device
+            .control(Control::Switch { port: 0 }, Confirmation::new())
+            .await
+            .unwrap(),
+        ControlOutcome::Unverified
+    );
+    assert_eq!(
+        calls
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|entry| entry.starts_with("/glswitch/api/switch/set_active?"))
+            .count(),
+        1
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn malformed_switch_inventory_never_sends_a_control_request() {
+    let (mut endpoint, ca, calls, server) = fixture().await;
+    endpoint.set_path("/malformed/");
+    for profile in [DeviceProfile::GlKvm, DeviceProfile::PiKvm] {
+        let device = profile_client(endpoint.clone(), Some(ca.clone()), profile);
+        for port in [0, 1] {
+            assert!(matches!(
+                device
+                    .control(Control::Switch { port }, Confirmation::new())
+                    .await,
+                Err(Error::Unsupported(_))
+            ));
+        }
+    }
+    assert!(
+        !calls
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|entry| entry.starts_with("/malformed/api/switch/set_active"))
+    );
     server.abort();
 }
 
