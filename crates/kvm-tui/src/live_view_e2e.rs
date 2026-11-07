@@ -25,7 +25,7 @@ use std::{
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use url::Url;
 
-/// Frame colours are far apart so that JPEG quantisation can never make two frames match.
+/// Each frame is dominated by a different colour channel, so no two frames can be confused.
 const FRAME_COLOURS: [[u8; 3]; 3] = [[220, 10, 10], [10, 200, 10], [10, 10, 220]];
 const FRAME_EDGE: u32 = 160;
 
@@ -47,14 +47,14 @@ fn encode_frame(colour: [u8; 3]) -> Vec<u8> {
     jpeg
 }
 
-/// The colour a decoded frame occupies in the buffer, after JPEG loss.
-fn decoded_colour(jpeg: &[u8]) -> Color {
-    let [r, g, b] = image::load_from_memory_with_format(jpeg, image::ImageFormat::Jpeg)
-        .unwrap()
-        .to_rgb8()
-        .get_pixel(0, 0)
-        .0;
-    Color::Rgb(r, g, b)
+/// Whether a rendered cell colour is dominated by `channel`. Resampling and JPEG loss shift exact
+/// values, but never turn a dominant channel into a minor one.
+fn dominated_by(colour: Color, channel: usize) -> bool {
+    let Color::Rgb(r, g, b) = colour else {
+        return false;
+    };
+    let channels = [u16::from(r), u16::from(g), u16::from(b)];
+    channels[channel] > channels.iter().sum::<u16>() - channels[channel]
 }
 
 fn multipart(jpeg: &[u8]) -> Vec<u8> {
@@ -146,6 +146,9 @@ impl Drop for SyntheticDevice {
 }
 
 async fn synthetic_device() -> SyntheticDevice {
+    // axum-server is built without a provider; install one explicitly so the test does not depend
+    // on which provider features other crates in the build enable. A second install is harmless.
+    let _ = rustls::crypto::ring::default_provider().install_default();
     let certificate = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
     let ca = certificate.cert.pem().into_bytes();
     let tls = RustlsConfig::from_pem(
@@ -246,28 +249,19 @@ fn mouse(kind: MouseEventKind, column: u16, row: u16) -> Event {
     })
 }
 
-fn shows(terminal: &Terminal<TestBackend>, colour: Color) -> bool {
+fn shows(terminal: &Terminal<TestBackend>, channel: usize) -> bool {
     terminal
         .backend()
         .buffer()
         .content()
         .iter()
-        .any(|cell| cell.bg == colour)
+        .any(|cell| dominated_by(cell.bg, channel))
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn live_view_renders_distinct_frames_forwards_input_and_restores_terminal() {
     let device = synthetic_device().await;
     let jpegs = FRAME_COLOURS.map(encode_frame);
-    let colours = jpegs.each_ref().map(|jpeg| decoded_colour(jpeg));
-    assert_eq!(
-        colours
-            .iter()
-            .collect::<std::collections::BTreeSet<_>>()
-            .len(),
-        colours.len(),
-        "frames must be distinguishable after decoding"
-    );
 
     let modes = Arc::new(Mutex::new(Vec::new()));
     let mut guard = TerminalGuard::enter(RecordedModes(modes.clone())).unwrap();
@@ -311,7 +305,7 @@ async fn live_view_renders_distinct_frames_forwards_input_and_restores_terminal(
                 if sent == seen {
                     device.frames.send(jpegs[sent].clone()).unwrap();
                     sent += 1;
-                } else if shows(terminal, colours[seen]) {
+                } else if shows(terminal, seen) {
                     seen += 1;
                 }
                 std::thread::yield_now();

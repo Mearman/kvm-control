@@ -1569,6 +1569,7 @@ dependencies = [
  "ratatui-image",
  "rcgen 0.13.2",
  "rpassword",
+ "rustls",
  "serde_json",
  "tokio",
  "url",
