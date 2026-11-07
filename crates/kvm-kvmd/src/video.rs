@@ -191,7 +191,7 @@ struct Parser {
     last_copy: Option<(bool, bytes::Bytes, usize)>,
     /// Set when the final frame was given up to a waiting stream, which the next read reports.
     final_reclaimed: bool,
-    /// Set when the stream gives up a frame or part of one, and cleared when it next delivers a frame, so the actor can tell that a read it ended at the consumer deadline was still recovering from storage it gave up (dropping a given-up part's body, or scanning past it).
+    /// Set when the stream gives up a frame or part of one, and cleared only when it next delivers a frame: it stays set while the stream drops or scans past the given-up part, and while it reads and validates the next part, including while that frame waits for a decoder slot. The actor reports a read it ends at the consumer deadline while this is set as storage exhaustion, since a frame was lost to storage pressure within that window.
     lost: bool,
     /// Set while a reservation is blocked waiting for storage. It stays set when the read is dropped there, so the actor can tell that a read it ended at the consumer deadline was starved, and is cleared when the actor sees the read cancelled and at the start of each read.
     starved: bool,
@@ -388,7 +388,7 @@ fn storage_exhausted() -> Error {
     Error::Transport("video stream storage exhausted".into())
 }
 
-/// Why the actor ended its stream at the consumer deadline: the consumer was idle, or a read was still waiting for storage.
+/// Why the actor ended its stream at the consumer deadline: the consumer was idle, or a read was outstanding while the stream was blocked waiting for storage or had given up a frame, or part of one, to storage pressure without delivering a frame since.
 #[derive(Clone, Copy)]
 enum Terminal {
     Idle,
@@ -2608,15 +2608,15 @@ mod tests {
         let (response, _socket) = multipart().await;
         let storage = StreamStorage::new(STREAM_STORAGE_BYTES);
         let (mut video, _lease) = parser(response, storage.clone());
-        // The stream has dropped a given-up body and copied the start of its delimiter, and the rest is already received.
+        // The stream has dropped a given-up body and copied the start of its delimiter, and the rest is already received. While the delimiter is incomplete the carry is empty: copying takes the carry first, and only a buffer that reached the delimiter's end could leave some.
         video.first = false;
         video.part = Part::Delimiter;
         video.buffer = b"\r\n--fr".to_vec();
-        video.carry = bytes::Bytes::copy_from_slice(&rest[..2]);
-        video.incoming = bytes::Bytes::copy_from_slice(&rest[2..]);
+        video.incoming = bytes::Bytes::copy_from_slice(&rest);
         video.discard();
         assert!(video.buffer.is_empty());
-        assert_eq!(&video.carry[..], b"\r\n--fram");
+        assert_eq!(&video.carry[..], b"\r\n--fr");
+        assert_eq!(&video.incoming[..], &rest[..]);
         assert_eq!(
             to_snapshot(video.next_charged().await)
                 .unwrap()
@@ -2663,6 +2663,72 @@ mod tests {
         );
         drop(video);
         assert_eq!(storage.available(), storage.capacity());
+    }
+
+    #[tokio::test]
+    async fn read_after_an_unclaimed_frame_was_reclaimed_reports_storage_exhausted() {
+        let mut body = part(&jpeg(), true, false);
+        body.extend_from_slice(b"--frame\r\n");
+        let (response, mut socket) = multipart().await;
+        socket.write_all(&body).await.unwrap();
+        let storage = StreamStorage::new(STREAM_STORAGE_BYTES);
+        let (parser, _lease) = parser(response, storage.clone());
+        // The read and storage timeout is the bound, so only the consumer deadline, half of it, can end the next read within the bound.
+        let mut stream = Mjpeg::start(parser, BOUND / 2);
+        let (send, receive) = tokio::sync::oneshot::channel();
+        stream.requests.send(send).await.unwrap();
+        drop(tokio::time::timeout(BOUND, receive).await.unwrap().unwrap());
+        eventually("frame was not retained", || {
+            storage.available() < storage.capacity()
+        })
+        .await;
+        let waiter = Waiting::new(storage.clone(), u64::MAX);
+        eventually("unclaimed frame was not reclaimed", || {
+            storage.available() == storage.capacity()
+        })
+        .await;
+        drop(waiter);
+        // The device sends nothing more, so the next read ends at the consumer deadline, with the frame lost to storage since the last delivery.
+        assert!(matches!(
+            tokio::time::timeout(BOUND, stream.next_frame()).await.unwrap(),
+            Err(Error::Transport(message)) if message == "video stream storage exhausted"
+        ));
+    }
+
+    #[tokio::test]
+    async fn read_after_a_queued_validation_was_reclaimed_reports_storage_exhausted() {
+        let jpeg = jpeg();
+        let mut body = part(&jpeg, true, false);
+        body.extend_from_slice(b"--frame\r\n");
+        let (response, mut socket) = multipart().await;
+        socket.write_all(&body).await.unwrap();
+        let decoders = Arc::new(Semaphore::new(0));
+        let storage = StreamStorage::with_decoders(STREAM_STORAGE_BYTES, decoders);
+        let (parser, _lease) = parser(response, storage.clone());
+        let mut stream = Mjpeg::start(parser, BOUND / 2);
+        {
+            let mut read = Box::pin(stream.next_frame());
+            let queued = async {
+                while storage.capacity() - storage.available() < part_end(&jpeg) {
+                    tokio::task::yield_now().await;
+                }
+            };
+            tokio::select! {
+                result = &mut read => panic!("frame validated without a decoder slot: {result:?}"),
+                result = tokio::time::timeout(BOUND, queued) => result.expect("frame was not parsed"),
+            }
+        }
+        // The frame is complete, so the stream is between parts; giving up its queued validation is the only loss.
+        let waiter = Waiting::new(storage.clone(), u64::MAX);
+        eventually("idle stream kept its queued frame", || {
+            storage.available() == storage.capacity()
+        })
+        .await;
+        drop(waiter);
+        assert!(matches!(
+            tokio::time::timeout(BOUND, stream.next_frame()).await.unwrap(),
+            Err(Error::Transport(message)) if message == "video stream storage exhausted"
+        ));
     }
 
     struct BlockedSink;
