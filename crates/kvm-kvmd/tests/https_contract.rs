@@ -1696,7 +1696,7 @@ fn cleanup_for_an_uncollected_press_records_its_runtime() {
     server.abort();
 }
 
-// Pinned to the current-thread runtime, as the key case is, so the movement's task runs its settlement after the movement is abandoned.
+// Pinned to the current-thread runtime, as the key case is: the movement's task starts settling only after the press is dropped, so the owed KeyA release is in flight when the movement is abandoned.
 #[tokio::test(flavor = "current_thread")]
 async fn movement_abandoned_during_owed_cleanup_is_not_sent() {
     let (mut endpoint, ca, calls, server) = fixture().await;
