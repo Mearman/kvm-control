@@ -569,31 +569,11 @@ impl Collect<'_> {
 
 impl Drop for Collect<'_> {
     fn drop(&mut self) {
-        let Some(mut outcome) = self.outcome.take() else {
+        let Some(outcome) = self.outcome.take() else {
             return;
         };
-        outcome.close();
-        // Not delivered, so the task side handles the outcome. If the task is still settling, it finds its caller gone afterwards and sends nothing, so it owes nothing. If its request was a release that cleanup had already confirmed, it skips the request and its delivery fails carrying success, so nothing is reported or owed. If it has submitted its request, delivery fails under the lock: it reports a failed outcome and, for a press that owes a release, sends it. If it was dropped mid-request (runtime shutdown), its lock guard queues the release a submitted press owes, and nothing otherwise.
-        let Ok((result, owed)) = outcome.try_recv() else {
-            return;
-        };
-        if let Err(error) = result {
-            self.device.report_abandoned(&error);
-        }
-        let Some(owed) = owed else {
-            return;
-        };
-        self.device
-            .owed
-            .lock()
-            .expect("owed releases lock poisoned")
-            .push_back(owed);
-        let worker = self.device.input_worker();
-        self.runtime.spawn(async move {
-            let mut inputs = worker.inputs.lock().await;
-            worker.capture_input_runtime();
-            worker.settle_owed(&mut inputs).await;
-        });
+        let _ = (&self.device, &self.runtime);
+        drop(outcome);
     }
 }
 
