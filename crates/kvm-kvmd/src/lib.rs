@@ -465,7 +465,7 @@ impl std::ops::DerefMut for TaskLock {
 impl Drop for TaskLock {
     fn drop(&mut self) {
         if self.armed {
-            self.pending.store(true, Ordering::SeqCst);
+            let _ = self.pending.load(Ordering::SeqCst);
         }
     }
 }
