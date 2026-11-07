@@ -6,8 +6,9 @@ use std::{
 use axum::{
     Json, Router,
     extract::{State, WebSocketUpgrade},
-    http::{Uri, header},
-    response::IntoResponse,
+    http::{Request, StatusCode, Uri, header},
+    middleware::{self, Next},
+    response::{IntoResponse, Response},
     routing::{get, post},
 };
 use axum_server::tls_rustls::RustlsConfig;
@@ -16,8 +17,34 @@ use kvm_kvmd::{Config, Kvmd};
 use serde_json::json;
 use url::Url;
 
-const JPEG: &[u8] = &[0xff, 0xd8, 0xff, 0xd9];
+const JPEG: &[u8] = include_bytes!("synthetic.jpg");
 type Calls = Arc<Mutex<Vec<String>>>;
+
+async fn authenticate(request: Request<axum::body::Body>, next: Next) -> Response {
+    if request
+        .headers()
+        .get(header::COOKIE)
+        .and_then(|v| v.to_str().ok())
+        != Some("auth_token=synthetic")
+    {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    next.run(request).await
+}
+
+async fn login(body: String) -> Response {
+    if body != "user=test-user&passwd=test-password" {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    (
+        [(
+            header::SET_COOKIE,
+            "auth_token=synthetic; Path=/; Secure; HttpOnly",
+        )],
+        Json(json!({"ok": true, "result": {}})),
+    )
+        .into_response()
+}
 
 async fn state(State(calls): State<Calls>, uri: Uri) -> impl IntoResponse {
     calls.lock().unwrap().push(uri.path().into());
@@ -41,7 +68,11 @@ async fn lease(State(calls): State<Calls>, ws: WebSocketUpgrade) -> impl IntoRes
 
 async fn stream(State(calls): State<Calls>) -> impl IntoResponse {
     calls.lock().unwrap().push("video stream".into());
-    let mut body = b"--frame\r\nContent-Type: image/jpeg\r\nContent-Length: 4\r\n\r\n".to_vec();
+    let mut body = format!(
+        "--frame\r\nContent-Type: image/jpeg\r\nContent-Length: {}\r\n\r\n",
+        JPEG.len()
+    )
+    .into_bytes();
     body.extend_from_slice(JPEG);
     body.extend_from_slice(b"\r\n--frame--\r\n");
     (
@@ -72,6 +103,9 @@ async fn downstream_uses_real_adapter_against_synthetic_https_device() {
         .route("/api/streamer/snapshot", get(|| async { JPEG }))
         .route("/api/ws", get(lease))
         .route("/streamer/stream", get(stream))
+        .route("/api/auth/check", get(state))
+        .route_layer(middleware::from_fn(authenticate))
+        .route("/api/auth/login", post(login))
         .with_state(calls.clone());
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -90,6 +124,14 @@ async fn downstream_uses_real_adapter_against_synthetic_https_device() {
         timeout: Duration::from_secs(5),
     })
     .unwrap();
+    assert!(matches!(
+        adapter.status().await,
+        Err(kvm_core::Error::Authentication)
+    ));
+    assert!(matches!(
+        adapter.login("test-user", "test-password").await.unwrap(),
+        kvm_kvmd::LoginState::Authenticated
+    ));
     let device: &dyn Device = &adapter;
     assert_eq!(device.status().await.unwrap().info["online"], true);
     assert_eq!(device.snapshot().await.unwrap().jpeg, JPEG);
