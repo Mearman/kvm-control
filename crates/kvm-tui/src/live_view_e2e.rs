@@ -319,7 +319,7 @@ async fn live_view_renders_distinct_frames_forwards_input_and_restores_terminal(
                     std::thread::yield_now();
                     return Ok(None);
                 }
-                // Input mode needs the capabilities the start-up refresh reads in the background; wait until the capability header shows them, since the header is never wrapped out of view.
+                // Input mode needs the capabilities the start-up refresh reads in the background; wait until the capability header shows them, since the device-state row is cut off at narrow widths and reads the same before the read starts as while it runs.
                 let refreshing = terminal
                     .backend()
                     .buffer()
