@@ -1576,16 +1576,23 @@ async fn streams_beyond_decoder_slots_share_storage() {
     let storage = crate::video::StreamStorage::new(crate::video::STREAM_STORAGE_BYTES);
     let mut streams = Vec::new();
     let mut servers = Vec::new();
-    // More streams than frames can be decoded at once stay open together: they share compressed bytes, not stream slots.
+    // More streams than frames can be decoded at once open and read together: they share compressed bytes, not stream slots.
     for _ in 0..=crate::MAX_JPEG_VALIDATIONS {
         let mut body = part(&jpeg(), true, false);
         body.extend_from_slice(b"--frame\r\n");
         let (mut device, closed, server) = device(body).await;
         device.stream_storage = storage.clone();
-        let mut stream = device.video().await.unwrap();
-        assert_eq!(stream.next_frame().await.unwrap().unwrap().jpeg, jpeg());
-        streams.push(stream);
+        streams.push(device.video().await.unwrap());
         servers.push((closed, server));
+    }
+    let frames = tokio::time::timeout(
+        VIDEO_TIMEOUT,
+        futures_util::future::join_all(streams.iter_mut().map(|stream| stream.next_frame())),
+    )
+    .await
+    .unwrap();
+    for frame in frames {
+        assert_eq!(frame.unwrap().unwrap().jpeg, jpeg());
     }
     drop(streams);
     for (closed, server) in servers {
