@@ -1,7 +1,7 @@
-# Conventional Commits for convco: which commit types move the version, and how the changelog names them. `convco check` fails a commit whose type is not listed here, `convco version --bump` reads `increment`, and `convco changelog` reads `section` and `hidden`.
+# Conventional Commits for convco: which commit types move the version, and how the changelog names them. `convco check` fails a commit whose type is not listed here, `convco version --bump` reads `increment`, and `convco changelog` reads `section` and `hidden` to write the release notes, which have no heading of their own because GitHub shows the release title above them.
 #
 # A feat commit bumps the minor version, and fix, perf, revert, refactor, docs and build commits bump the patch version. A breaking change (a `!` after the type or a BREAKING CHANGE footer) bumps the major version, and below 1.0.0 the minor version, which is Cargo's own convention for a 0.x breaking change. ci, test, style and chore commits release nothing on their own.
-header: "# Changelog\n"
+header: ""
 types:
   - {type: feat, increment: Minor, section: Features, hidden: false}
   - {type: fix, increment: Patch, section: Bug Fixes, hidden: false}
@@ -14,4 +14,3 @@ types:
   - {type: test, increment: None, section: Tests, hidden: false}
   - {type: style, increment: None, section: Styles, hidden: false}
   - {type: chore, increment: None, section: Other, hidden: true}
-lineLength: 100
