@@ -1171,12 +1171,18 @@ pub async fn run(device: std::sync::Arc<dyn Device>) -> io::Result<()> {
     let result = wait_for_termination(run, &mut terminate).await;
     #[cfg(not(unix))]
     let result = run.await;
-    let restored = guard.restore();
-    let cleanup = tokio::time::timeout(Duration::from_secs(5), device.release_inputs())
-        .await
-        .map_err(|_| io::Error::other("input cleanup timed out"))
-        .and_then(|result| result.map_err(io::Error::other));
+    let result = cleanup_terminal(result, device.as_ref(), &mut guard).await;
     input_cleanup.0 = None;
+    result
+}
+
+async fn cleanup_terminal<T: TerminalModes>(
+    result: io::Result<()>,
+    device: &dyn Device,
+    guard: &mut TerminalGuard<T>,
+) -> io::Result<()> {
+    let restored = guard.restore();
+    let cleanup = device.release_inputs().await.map_err(io::Error::other);
     finish_terminal(result, cleanup, restored)
 }
 
@@ -1443,6 +1449,7 @@ mod tests {
         calls: std::sync::Mutex<Vec<String>>,
         fail_key: bool,
         fail_cleanup: bool,
+        delayed_cleanup: bool,
         fail_mouse_release: bool,
         video_calls: std::sync::atomic::AtomicUsize,
         fail_restart: bool,
@@ -1544,6 +1551,12 @@ mod tests {
             Ok(())
         }
         async fn release_inputs(&self) -> kvm_core::Result<()> {
+            if self.delayed_cleanup {
+                println!("SIGTERM_RELEASE_WAITING");
+                use std::io::Write;
+                std::io::stdout().flush().unwrap();
+                self.control_release.notified().await;
+            }
             self.calls.lock().unwrap().push("release".into());
             if self.fail_cleanup {
                 Err(kvm_core::Error::AmbiguousInput("cleanup failed".into()))
@@ -3216,13 +3229,33 @@ finally:
                     fail_restore: false,
                 })
                 .unwrap();
-                let device = FakeDevice::default();
+                let device = FakeDevice {
+                    delayed_cleanup: true,
+                    ..FakeDevice::default()
+                };
                 let _ = terminal_capabilities();
                 println!("SIGTERM_READY");
                 std::io::stdout().flush().unwrap();
                 let result = wait_for_termination(std::future::pending(), &mut signal).await;
-                let cleanup = device.release_inputs().await.map_err(io::Error::other);
-                assert!(finish_terminal(result, cleanup, guard.restore()).is_err());
+                let cleanup = cleanup_terminal(result, &device, &mut guard);
+                tokio::pin!(cleanup);
+                tokio::select! {
+                    _ = &mut cleanup => panic!("cleanup returned before delayed release"),
+                    _ = tokio::time::sleep(Duration::from_millis(20)) => {}
+                }
+                assert_eq!(
+                    *calls.borrow(),
+                    [
+                        "raw",
+                        "alternate",
+                        "mouse_on",
+                        "mouse_off",
+                        "leave",
+                        "cooked"
+                    ]
+                );
+                device.control_release.notify_one();
+                assert!(cleanup.await.is_err());
                 assert_eq!(*device.calls.lock().unwrap(), ["release"]);
                 assert_eq!(
                     *calls.borrow(),
@@ -3272,6 +3305,7 @@ finally:
         let mut rest = String::new();
         std::io::Read::read_to_string(&mut output, &mut rest).unwrap();
         assert!(child.wait().unwrap().success());
+        assert!(rest.contains("SIGTERM_RELEASE_WAITING"));
         assert!(rest.contains("SIGTERM_CLEANED"));
     }
 

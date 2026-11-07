@@ -122,6 +122,7 @@ pub trait Device: Send + Sync {
     async fn key(&self, key: &str, pressed: bool) -> Result<()>;
     async fn mouse_button(&self, button: &str, pressed: bool) -> Result<()>;
     async fn mouse_move(&self, x: i16, y: i16) -> Result<()>;
+    /// Releases tracked inputs, attempting each release within the device transport deadline. Returns an error if any release cannot be confirmed.
     async fn release_inputs(&self) -> Result<()>;
     async fn control(
         &self,
