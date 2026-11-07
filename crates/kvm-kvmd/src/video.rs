@@ -767,6 +767,7 @@ mod tests {
             timeout: Duration::from_secs(1),
             first: true,
             ended: false,
+            proven: Arc::new(AtomicBool::new(false)),
         };
         let mut stream = Mjpeg::start(parser, Duration::from_millis(20));
         tokio::time::timeout(Duration::from_secs(1), async {
@@ -817,6 +818,7 @@ mod tests {
             timeout: Duration::from_secs(1),
             first: true,
             ended: false,
+            proven: Arc::new(AtomicBool::new(false)),
         };
         let mut stream = Mjpeg::start(parser, Duration::from_millis(40));
         assert!(
@@ -1029,6 +1031,7 @@ mod tests {
             timeout: Duration::from_secs(1),
             first: true,
             ended: false,
+            proven: Arc::new(AtomicBool::new(false)),
         };
         let stream = Mjpeg::start(parser, Duration::from_secs(2));
         let (send, mut receive) = tokio::sync::oneshot::channel();
@@ -1100,6 +1103,7 @@ mod tests {
             timeout: Duration::from_secs(3),
             first: true,
             ended: false,
+            proven: Arc::new(AtomicBool::new(false)),
         };
         let mut stream = Mjpeg::start(parser, Duration::from_secs(3));
         assert!(

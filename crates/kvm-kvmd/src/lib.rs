@@ -1480,17 +1480,21 @@ mod tests {
         let endpoint = Url::parse(&format!("http://{address}/")).unwrap();
         let client = reqwest::Client::new();
         let device = Kvmd {
-            client: RwLock::new(Session {
+            client: Arc::new(RwLock::new(Session {
                 client: client.clone(),
                 video: client,
                 cookies: Default::default(),
-            }),
+            })),
             config: config(endpoint.as_str()),
             endpoint,
             profile: DeviceProfile::PiKvm,
             inputs: Default::default(),
             auth_headers: Default::default(),
             approval_token: Default::default(),
+            snapshot_proven: Default::default(),
+            video_proven: Default::default(),
+            cleanup_on_drop: false,
+            input_runtime: Default::default(),
             stream_storage: Arc::new(tokio::sync::Semaphore::new(MAX_JPEG_VALIDATIONS)),
             snapshot_storage: Arc::new(tokio::sync::Semaphore::new(MAX_JPEG_VALIDATIONS)),
         };
