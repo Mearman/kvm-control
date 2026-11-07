@@ -319,7 +319,7 @@ async fn live_view_renders_distinct_frames_forwards_input_and_restores_terminal(
                     std::thread::yield_now();
                     return Ok(None);
                 }
-                // Input mode needs the capabilities the startup refresh reads in the background; wait until it has been shown.
+                // Input mode needs the capabilities the start-up refresh reads in the background; wait until the capability header shows them, since the header is never wrapped out of view.
                 let refreshing = terminal
                     .backend()
                     .buffer()
@@ -327,7 +327,7 @@ async fn live_view_renders_distinct_frames_forwards_input_and_restores_terminal(
                     .iter()
                     .map(|cell| cell.symbol())
                     .collect::<String>()
-                    .contains("Refreshing device state");
+                    .contains("Capabilities unknown");
                 if refreshing {
                     std::thread::yield_now();
                     return Ok(None);
