@@ -16,8 +16,8 @@ use axum::{
 use axum_server::tls_rustls::RustlsConfig;
 use kvm_core::{
     AuthScheme, Authenticate, CallerIdentity, Capability, Confirmation, Connected, Connector,
-    Control, ControlOutcome, Credentials, Device, DeviceProfile, Endpoint, Error, LoginState,
-    MouseMode, PowerAction, Reported, ServerTrust,
+    Control, ControlOutcome, Credentials, Device, DeviceProfile, Endpoint, EndpointName, Error,
+    LoginState, MouseMode, PowerAction, Reported, ServerTrust,
 };
 use kvm_kvmd::{Kvmd, KvmdConnector};
 use serde_json::json;
@@ -2862,7 +2862,10 @@ async fn connector_logs_in_and_identity_separates_claims_from_configuration() {
             .unwrap(),
         LoginState::Unverified
     );
+    calls.0.lock().unwrap().clear();
     let identity = connection.identity().await.unwrap();
+    // Identity reads the info route alone.
+    assert_eq!(*calls.0.lock().unwrap(), ["GET /pikvmstatus/api/info"]);
     assert_eq!(identity.label, None);
     assert_eq!(identity.address, header.address);
     assert!(identity.address_verified);
@@ -2872,7 +2875,11 @@ async fn connector_logs_in_and_identity_separates_claims_from_configuration() {
         Reported::Supported("0000000000000000".into())
     );
     assert_eq!(identity.host, Reported::Supported("pikvm.example".into()));
-    assert_eq!(identity.id().endpoint, header.address.to_string());
+    assert_eq!(identity.id(), header.device_id());
+    assert_eq!(
+        identity.id().endpoint,
+        EndpointName::Address(header.address.clone())
+    );
     server.abort();
 }
 
@@ -2912,5 +2919,95 @@ async fn per_request_schemes_refuse_one_time_codes_and_approval() {
         ));
     }
     assert!(calls.0.lock().unwrap().is_empty());
+    server.abort();
+}
+
+// Breaks if the connector returns per-request credentials it has not checked, reports refused ones as connected, or a later check does not see a refusal.
+#[tokio::test]
+async fn the_connector_checks_per_request_credentials() {
+    let (endpoint, ca, calls, server) = fixture().await;
+    for auth in [AuthScheme::Header, AuthScheme::Basic] {
+        let configured = Endpoint {
+            label: None,
+            address: endpoint.clone(),
+            profile: DeviceProfile::PiKvm,
+            auth,
+            trust: ServerTrust::Verified {
+                additional_ca_pem: Some(String::from_utf8(ca.clone()).unwrap()),
+            },
+            timeout: REQUEST_TIMEOUT,
+        };
+        calls.0.lock().unwrap().clear();
+        let Connected::Authenticated(connection) = KvmdConnector
+            .connect(
+                configured.clone(),
+                Credentials::new("test-user", "test-password"),
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("per-request credentials never wait for approval");
+        };
+        // The credentials were installed without a request and then checked once.
+        assert_eq!(*calls.0.lock().unwrap(), ["/api/auth/check"]);
+        assert_eq!(
+            connection.caller(),
+            Some(CallerIdentity {
+                username: "test-user".into()
+            })
+        );
+        connection.check_auth().await.unwrap();
+
+        assert!(matches!(
+            KvmdConnector
+                .connect(configured.clone(), Credentials::new("test-user", "bad"))
+                .await,
+            Err(Error::Authentication)
+        ));
+        // A login that installs refused credentials is not itself refused; the check that follows is.
+        assert_eq!(
+            connection
+                .login(Credentials::new("test-user", "bad"))
+                .await
+                .unwrap(),
+            LoginState::Unverified
+        );
+        assert!(matches!(
+            connection.check_auth().await,
+            Err(Error::Authentication)
+        ));
+    }
+    server.abort();
+}
+
+// Breaks if a one-time code refused under a per-request scheme discards the credentials already installed.
+#[tokio::test]
+async fn a_refused_one_time_code_keeps_the_installed_credentials() {
+    let (endpoint, ca, calls, server) = fixture().await;
+    let device = per_request_client(Endpoint {
+        label: None,
+        address: endpoint,
+        profile: DeviceProfile::PiKvm,
+        auth: AuthScheme::Header,
+        trust: ServerTrust::Verified {
+            additional_ca_pem: Some(String::from_utf8(ca).unwrap()),
+        },
+        timeout: REQUEST_TIMEOUT,
+    })
+    .await;
+    assert!(matches!(
+        device
+            .login(Credentials::new("another-user", "another-password").with_totp("012345"))
+            .await,
+        Err(Error::InvalidResponse(_))
+    ));
+    assert_eq!(
+        device.caller(),
+        Some(CallerIdentity {
+            username: "test-user".into()
+        })
+    );
+    device.check_auth().await.unwrap();
+    assert_eq!(*calls.0.lock().unwrap(), ["/api/auth/check"]);
     server.abort();
 }

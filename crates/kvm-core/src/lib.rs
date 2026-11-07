@@ -10,7 +10,7 @@ pub use connection::{
     AuthScheme, Authenticate, CallerIdentity, Connected, Connection, Connector, Credentials,
     Endpoint, LoginState, Secret, ServerTrust,
 };
-pub use identity::{DeviceId, DeviceIdentity};
+pub use identity::{DeviceId, DeviceIdentity, EndpointName};
 
 pub use status::{
     AtxStatus, DeviceStatus, GpioInput, GpioOutput, GpioStatus, HidOutputs, HidStatus,

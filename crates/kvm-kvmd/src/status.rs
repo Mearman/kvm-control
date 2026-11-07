@@ -58,6 +58,21 @@ impl Kvmd {
         }
         parse(self.profile, reads)
     }
+
+    /// Reads the info route alone, with one GET request, for the identifiers in the device's system information. With a single route there is nothing to keep when it fails, so any failure is returned as the error, as a status read does when no route could be read; a response that is not an object is `Error::InvalidResponse`.
+    pub(crate) async fn read_info(&self) -> Result<SystemInfo> {
+        let active = self.client.read().await;
+        let state = self
+            .state_with(&active.client, ROUTES[0])
+            .await
+            .map_err(|failure| failure.error)?;
+        if !state.is_object() {
+            return Err(Error::InvalidResponse(
+                "system information is not an object".into(),
+            ));
+        }
+        Ok(system_info(self.profile, &state))
+    }
 }
 
 /// Builds a typed status from the route reads, in `ROUTES` order.

@@ -15,6 +15,11 @@ use std::{
     time::Duration,
 };
 
+// Compiles the README's Rust examples as documentation tests, so the published usage cannot drift from the API.
+#[cfg(doctest)]
+#[doc = include_str!("../../../README.md")]
+struct ReadmeExamples;
+
 #[cfg(test)]
 mod proptests;
 mod status;
@@ -1484,13 +1489,13 @@ impl Connection for Kvmd {
         &self.config
     }
 
-    /// Reads status and combines its reported serial number and host name with the endpoint. The address counts as verified when TLS verification is enabled, since every request then authenticated the server's certificate for the address's host.
+    /// Reads the info route alone and combines its reported serial number and host name with the endpoint; it fails as that one read does. The address counts as verified when TLS verification is enabled, since every request then authenticated the server's certificate for the address's host.
     async fn identity(&self) -> Result<DeviceIdentity> {
-        let status = self.status().await?;
+        let info = self.read_info().await?;
         Ok(DeviceIdentity::observe(
             &self.config,
             matches!(self.config.trust, ServerTrust::Verified { .. }),
-            &status,
+            &kvm_core::Reported::Supported(info),
         ))
     }
 }
