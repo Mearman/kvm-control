@@ -4,7 +4,7 @@
 //!
 //! These sources do not establish compatibility with every firmware version. Only synthetic server tests have been run; no physical device has been verified. The video API supports MJPEG only and does not change encoder settings. JPEG pixel data is decoded under resource limits before delivery; original metadata is preserved but not validated and must be treated as untrusted by consumers. Video capabilities remain unknown until this connection receives a valid JPEG snapshot or live frame. A successful operation records support for that connection; failures do not prove a capability unsupported.
 //!
-//! Live video streams in a process share one bounded budget of compressed frame storage rather than a number of stream slots, so any number of streams may be open. A stream that is not being read gives up its buffered bytes and any frame it parsed for a cancelled read while another stream waits for storage, and of two streams waiting the one opened later gives up its partial frame; such a stream skips to its next frame, and a final frame given up this way is reported as an error. A stream that cannot obtain storage within the configured timeout fails.
+//! Live video streams in a process share one bounded budget of compressed frame storage rather than a number of stream slots, so the budget does not limit how many streams are open; each open stream's HTTP connection keeps its own read buffer, which the budget does not cover. A stream counts as idle while no read is outstanding, including after a read is cancelled, when it stops reading. While another stream waits for storage, an idle stream gives up its buffered bytes and any frame it parsed, including one waiting for or undergoing validation, and of two waiting streams the one opened later gives up its partial frame; such a stream skips to its next frame, and a final frame given up this way is reported as an error. A frame being returned to a reader is never given up. A stream that cannot obtain storage within the configured timeout fails, and a part larger than the whole budget fails at once.
 
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
@@ -147,12 +147,24 @@ fn jpeg_frame_safe(bytes: &[u8], stripped: &mut Vec<u8>) -> bool {
     false
 }
 
-async fn jpeg_permit() -> Result<Arc<tokio::sync::OwnedSemaphorePermit>> {
+/// The process's JPEG decoder slots, shared by snapshots and video streams, each bounding one validation's working memory by `MAX_JPEG_WORKING_BYTES`.
+fn jpeg_slots() -> Arc<tokio::sync::Semaphore> {
     static SLOTS: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> = std::sync::OnceLock::new();
-    let slots = SLOTS.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(MAX_JPEG_VALIDATIONS)));
-    Ok(Arc::new(slots.clone().acquire_owned().await.map_err(
-        |_| Error::Transport("JPEG validation unavailable".into()),
-    )?))
+    SLOTS
+        .get_or_init(|| Arc::new(tokio::sync::Semaphore::new(MAX_JPEG_VALIDATIONS)))
+        .clone()
+}
+
+async fn jpeg_permit_from(
+    slots: Arc<tokio::sync::Semaphore>,
+) -> Result<Arc<tokio::sync::OwnedSemaphorePermit>> {
+    Ok(Arc::new(slots.acquire_owned().await.map_err(|_| {
+        Error::Transport("JPEG validation unavailable".into())
+    })?))
+}
+
+async fn jpeg_permit() -> Result<Arc<tokio::sync::OwnedSemaphorePermit>> {
+    jpeg_permit_from(jpeg_slots()).await
 }
 
 #[cfg(test)]
@@ -163,10 +175,12 @@ static VALIDATION_GATE: std::sync::Mutex<
     )>,
 > = std::sync::Mutex::new(None);
 
-async fn validate_jpeg_async(
+/// Validates `bytes` on a blocking thread and returns them with `hold`. The blocking work cannot be cancelled, so `hold` (the storage charged for `bytes`) moves with the bytes and is released with them: when validation fails, or by the caller once it drops what is returned. Cancelling this future before the blocking work starts drops both at once.
+async fn validate_jpeg_async<H: Send + 'static>(
     bytes: Vec<u8>,
     permit: Arc<tokio::sync::OwnedSemaphorePermit>,
-) -> Result<Vec<u8>> {
+    hold: H,
+) -> Result<(Vec<u8>, H)> {
     tokio::task::spawn_blocking(move || {
         let _permit = permit;
         #[cfg(test)]
@@ -181,7 +195,7 @@ async fn validate_jpeg_async(
             }
         }
         validate_jpeg(&bytes)?;
-        Ok(bytes)
+        Ok((bytes, hold))
     })
     .await
     .map_err(|_| Error::Transport("JPEG validation task failed".into()))?
@@ -630,8 +644,9 @@ impl Kvmd {
         }
         let permit = jpeg_permit().await?;
         let task = tokio::spawn(async move {
-            let _storage = storage;
-            validate_jpeg_async(bytes, permit).await
+            validate_jpeg_async(bytes, permit, storage)
+                .await
+                .map(|(jpeg, _)| jpeg)
         });
         let jpeg = task
             .await
@@ -1755,9 +1770,10 @@ mod tests {
         assert_eq!(stripped, original);
         assert_eq!(validate_jpeg(&frame).unwrap(), original);
         assert_eq!(
-            validate_jpeg_async(frame.clone(), jpeg_permit().await.unwrap())
+            validate_jpeg_async(frame.clone(), jpeg_permit().await.unwrap(), ())
                 .await
-                .unwrap(),
+                .unwrap()
+                .0,
             frame
         );
     }
