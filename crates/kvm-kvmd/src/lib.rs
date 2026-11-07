@@ -1049,7 +1049,7 @@ impl Kvmd {
         tokio::spawn(async move {
             worker.clean_pending(&mut inputs).await;
             let cleaned = std::mem::take(&mut inputs.cleaned);
-            let result = if !pressed && cleaned.contains(&(kind, name.clone())) {
+            let result = if !pressed && cleaned.contains(&(kind, String::new())) {
                 Ok(())
             } else {
                 worker.send_held(&mut inputs, kind, &name, pressed).await
