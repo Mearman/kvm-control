@@ -1054,9 +1054,7 @@ impl Kvmd {
             } else {
                 worker.send_held(&mut inputs, kind, &name, pressed).await
             };
-            if result_tx.send(result).is_err() {
-                worker.clean_abandoned(&mut inputs).await;
-            }
+            let _ = result_tx.send(result);
             inputs.settle();
         });
         collect.outcome().await
