@@ -699,7 +699,7 @@ mod tests {
     }
 
     #[test]
-    fn press_outcome_names_the_signal_only_for_a_failure() {
+    fn press_outcome_covers_every_press_cleanup_and_signal_combination() {
         let (press, cleanup) = (synthetic("press"), synthetic("cleanup"));
         for (pressed, cleaned, signalled, expected) in [
             (Some(Ok(())), Ok(()), false, Ok(())),
@@ -719,9 +719,42 @@ mod tests {
             ),
             (
                 Some(Err(())),
+                Ok(()),
+                true,
+                Err(format!("interrupted; press: {press}; cleanup: confirmed")),
+            ),
+            (
+                Some(Err(())),
+                Err(()),
+                false,
+                Err(format!("{press}; cleanup: {cleanup}")),
+            ),
+            (
+                Some(Err(())),
                 Err(()),
                 true,
                 Err(format!("interrupted; press: {press}; cleanup: {cleanup}")),
+            ),
+            // A press the signal ended is an interruption whatever `signalled` says, since the signal was consumed by ending it.
+            (
+                None,
+                Ok(()),
+                false,
+                Err("interrupted; input outcome uncertain; cleanup: confirmed".into()),
+            ),
+            (
+                None,
+                Ok(()),
+                true,
+                Err("interrupted; input outcome uncertain; cleanup: confirmed".into()),
+            ),
+            (
+                None,
+                Err(()),
+                false,
+                Err(format!(
+                    "interrupted; input outcome uncertain; cleanup: {cleanup}"
+                )),
             ),
             (
                 None,
