@@ -958,10 +958,10 @@ impl Device for Kvmd {
                     Err(error)
                 }
             };
-            if result_tx.send(result).is_err() || ack_rx.await.is_err() {
-                if let Err(error) = worker.release_locked(&mut inputs).await {
-                    eprintln!("Input cleanup uncertain: {error}");
-                }
+            if (result_tx.send(result).is_err() || ack_rx.await.is_err())
+                && let Err(error) = worker.release_locked(&mut inputs).await
+            {
+                eprintln!("Input cleanup uncertain: {error}");
             }
         });
         let result = result_rx
@@ -1005,10 +1005,10 @@ impl Device for Kvmd {
                     Err(error)
                 }
             };
-            if result_tx.send(result).is_err() || ack_rx.await.is_err() {
-                if let Err(error) = worker.release_locked(&mut inputs).await {
-                    eprintln!("Input cleanup uncertain: {error}");
-                }
+            if (result_tx.send(result).is_err() || ack_rx.await.is_err())
+                && let Err(error) = worker.release_locked(&mut inputs).await
+            {
+                eprintln!("Input cleanup uncertain: {error}");
             }
         });
         let result = result_rx
