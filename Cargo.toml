@@ -30,8 +30,9 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"
 url = "2"
 zeroize = "1.9.1"
 
-# Deny-level lints the CI command already makes errors through `-D warnings`, stated here so a local `cargo build` or `cargo clippy` enforces them too, plus the unsafe-code policy: every unsafe block is opted into with a justified `#[allow(unsafe_code)]` and carries a `// SAFETY:` comment.
-# examples/in-process is its own workspace and repeats this table; its tests check the two stay identical.
+# The rust table denies lints CI already makes errors through `-D warnings`, so a local `cargo build` or `cargo clippy` enforces them too, and adds the unsafe-code policy: `unsafe_code` is denied, so each function holding unsafe code opts in with a justified `#[allow(unsafe_code)]`, and Clippy requires a `// SAFETY:` comment on every unsafe block.
+# The clippy table also denies `dbg!`, `todo!` and `unimplemented!`, allow-by-default restriction lints that `-D warnings` alone does not reject.
+# examples/in-process is its own workspace and repeats both tables; its tests check the copies stay identical.
 [workspace.lints.rust]
 dead_code = "deny"
 unreachable_patterns = "deny"
