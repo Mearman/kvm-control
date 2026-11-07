@@ -331,8 +331,9 @@ pub struct Kvmd {
     reporter: Reporter,
     // Releases owed by abandoned presses. A dropped future may have no runtime and cannot await the input lock, so it queues here and the next lock holder sends them.
     owed: Arc<std::sync::Mutex<VecDeque<Owed>>>,
+    /// The compressed-byte budget this device's video streams share; production streams share one budget per process.
     #[cfg(test)]
-    stream_storage: Arc<tokio::sync::Semaphore>,
+    stream_storage: Arc<video::StreamStorage>,
     #[cfg(test)]
     snapshot_storage: Arc<tokio::sync::Semaphore>,
 }
@@ -667,7 +668,7 @@ impl Kvmd {
             reporter: Default::default(),
             owed: Default::default(),
             #[cfg(test)]
-            stream_storage: Arc::new(tokio::sync::Semaphore::new(MAX_JPEG_VALIDATIONS)),
+            stream_storage: video::StreamStorage::new(video::STREAM_STORAGE_BYTES),
             #[cfg(test)]
             snapshot_storage: Arc::new(tokio::sync::Semaphore::new(MAX_JPEG_VALIDATIONS)),
         })
@@ -1851,7 +1852,7 @@ mod tests {
             input_runtime: Default::default(),
             reporter: Default::default(),
             owed: Default::default(),
-            stream_storage: Arc::new(tokio::sync::Semaphore::new(MAX_JPEG_VALIDATIONS)),
+            stream_storage: video::StreamStorage::new(video::STREAM_STORAGE_BYTES),
             snapshot_storage: Arc::new(tokio::sync::Semaphore::new(MAX_JPEG_VALIDATIONS)),
         };
         assert!(matches!(
@@ -1900,7 +1901,7 @@ mod tests {
             input_runtime: Default::default(),
             reporter: Default::default(),
             owed: Default::default(),
-            stream_storage: Arc::new(tokio::sync::Semaphore::new(MAX_JPEG_VALIDATIONS)),
+            stream_storage: video::StreamStorage::new(video::STREAM_STORAGE_BYTES),
             snapshot_storage: Arc::new(tokio::sync::Semaphore::new(MAX_JPEG_VALIDATIONS)),
         };
         let slots = Arc::new(tokio::sync::Semaphore::new(1));
