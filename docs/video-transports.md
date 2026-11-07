@@ -80,7 +80,7 @@ No client can be designed from the inspected source, and entering the mode is a 
 
 ### VNC
 
-P's VNC server reads both the JPEG and H.264 sinks ([P v2-hdmi-rpi4.yaml L53-L58][p-main-vnc]) and implements the Tight JPEG, JPEG and Open H.264 RFB encodings ([P vnc/rfb/encodings.py L37-L39][p-vnc-enc]) on its own TCP port, 5900 by default ([P \_scheme.py L721-L729][p-vnc-scheme]). It is a separate protocol and endpoint from the HTTPS origin `Config::endpoint` names, with its own authentication, so it is recorded here for completeness and not analysed further.
+P's VNC server reads both the JPEG and H.264 sinks ([P v2-hdmi-rpi4.yaml L53-L58][p-main-vnc]) and implements the Tight JPEG, JPEG and Open H.264 RFB encodings ([P vnc/rfb/encodings.py L37-L39][p-vnc-enc]) on its own TCP port, 5900 by default ([P \_scheme.py L721-L729][p-vnc-scheme]). It is a separate protocol and endpoint from the HTTPS origin `Endpoint::address` names, with its own authentication, so it is recorded here for completeness and not analysed further.
 
 ## What the library does when only an unsupported transport is offered
 
@@ -107,7 +107,7 @@ This is a sketch for a future implementation, which is separate work; nothing be
 Decisions to settle when implementing:
 
 - **Remembering absence.** A 404 from a transport's own stream route could save later attempts. The options are never remembering it (the core above), remembering it for a bounded time, or until the transport later delivers a frame. A proxy can answer 404 briefly while a backend re-registers.
-- **First-frame wait length.** The wait may cover streamer start-up, when no stream client, snapshot or stream-forever setting had uStreamer running, plus one forced key frame, which the media server requests when a client starts. The options are the adapter's request timeout, a separate bound, or a caller-supplied bound; the `kvm-core` default selection cannot reach `kvm-kvmd`'s `Config::timeout`, so it can honour only a separate or caller-supplied bound.
+- **First-frame wait length.** The wait may cover streamer start-up, when no stream client, snapshot or stream-forever setting had uStreamer running, plus one forced key frame, which the media server requests when a client starts. The options are the adapter's request timeout, a separate bound, or a caller-supplied bound; a default selection on `Device` alone cannot reach the request timeout, which is `Endpoint::timeout` and visible only through `Connection::endpoint`, so it can honour only a separate or caller-supplied bound unless the selection is given the connection.
 - **Format change mid-stream.** On G another viewer can change `video_format` at any time. The options are re-reading the parameters periodically and ending the stream when the format changes, validating the codec from the bitstream itself, or documenting the gap.
 - **Using `GET /api/media`.** Under the PiKVM profile its listing could reorder or skip attempts. The options are ignoring it (the core), skipping `MediaH264` for one selection on a 404, or exposing it only as status.
 - **Janus discovery.** Whether to send the plugin's `features` request before `watch` to learn audio and ICE settings, or to rely on the offer alone.
