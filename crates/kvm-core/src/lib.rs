@@ -154,6 +154,8 @@ pub trait Device: Send + Sync {
     async fn mouse_button(&self, button: &str, pressed: bool) -> Result<()>;
     async fn mouse_move(&self, x: i16, y: i16) -> Result<()>;
     /// Releases tracked inputs, attempting each release within the device transport deadline. Returns an error if any release cannot be confirmed.
+    ///
+    /// `Ok` means every tracked input is released and no earlier input request is left unconfirmed. Once an input request's outcome could not be confirmed (it returned `AmbiguousInput`, or was interrupted), an implementation keeps returning `AmbiguousInput` from this method for as long as that request could still take effect, so a caller may treat `Ok` as the end of any uncertainty about held inputs. `kvm-kvmd` keeps it for the adapter instance's lifetime, since the device may apply a timed-out request at any later time; a new login does not end it.
     async fn release_inputs(&self) -> Result<()>;
     async fn control(
         &self,
