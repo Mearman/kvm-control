@@ -12,8 +12,11 @@ use axum::{
     routing::{get, post},
 };
 use axum_server::tls_rustls::RustlsConfig;
-use kvm_core::{Device, DeviceProfile};
-use kvm_kvmd::{Config, Kvmd};
+use kvm_core::{
+    AuthScheme, CallerIdentity, Connector, Credentials, Device, DeviceProfile, Endpoint,
+    LoginState, Reported, ServerTrust,
+};
+use kvm_kvmd::KvmdConnector;
 use serde_json::json;
 use url::Url;
 
@@ -51,7 +54,10 @@ async fn state(State(calls): State<Calls>, uri: Uri) -> impl IntoResponse {
     let result = if uri.path().ends_with("/hid") {
         json!({"enabled": true, "online": true, "keyboard": {"online": true}, "mouse": {"online": true, "absolute": true}})
     } else if uri.path().ends_with("/info") {
-        json!({"system": {"kvmd": {"version": "0.0.0-synthetic"}}})
+        json!({
+            "system": {"kvmd": {"version": "0.0.0-synthetic"}, "platform": {"serial": "SYNTHETIC-0001"}},
+            "meta": {"server": {"host": "synthetic-kvm"}},
+        })
     } else {
         json!({"online": true})
     };
@@ -89,9 +95,9 @@ async fn stream(State(calls): State<Calls>) -> impl IntoResponse {
 #[tokio::test]
 async fn downstream_uses_real_adapter_against_synthetic_https_device() {
     let certificate = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
-    let ca = certificate.cert.pem().into_bytes();
+    let ca = certificate.cert.pem();
     let tls = RustlsConfig::from_pem(
-        ca.clone(),
+        ca.clone().into_bytes(),
         certificate.signing_key.serialize_pem().into_bytes(),
     )
     .await
@@ -118,23 +124,48 @@ async fn downstream_uses_real_adapter_against_synthetic_https_device() {
             .await
             .unwrap();
     });
-    let adapter = Kvmd::new(Config {
-        endpoint: Url::parse(&format!("https://localhost:{port}/")).unwrap(),
+    // The consumer names only kvm-core types; the connector is the one adapter-specific value.
+    let connector: &dyn Connector = &KvmdConnector;
+    let endpoint = Endpoint {
+        label: Some("synthetic-bench".into()),
+        address: Url::parse(&format!("https://localhost:{port}/")).unwrap(),
         profile: DeviceProfile::PiKvm,
-        trusted_ca_pem: Some(ca),
-        insecure_tls: false,
+        auth: AuthScheme::Session,
+        trust: ServerTrust::Verified {
+            additional_ca_pem: Some(ca),
+        },
         timeout: Duration::from_secs(5),
-    })
-    .unwrap();
+    };
+    let connection = connector.open(endpoint.clone()).await.unwrap();
     assert!(matches!(
-        adapter.status().await,
+        connection.status().await,
         Err(kvm_core::Error::Authentication)
     ));
-    assert!(matches!(
-        adapter.login("test-user", "test-password").await.unwrap(),
-        kvm_kvmd::LoginState::Authenticated
-    ));
-    let device: &dyn Device = &adapter;
+    assert_eq!(connection.caller(), None);
+    assert_eq!(
+        connection
+            .login(Credentials::new("test-user", "test-password"))
+            .await
+            .unwrap(),
+        LoginState::Authenticated
+    );
+    assert_eq!(
+        connection.caller(),
+        Some(CallerIdentity {
+            username: "test-user".into()
+        })
+    );
+    assert_eq!(connection.endpoint(), &endpoint);
+    let identity = connection.identity().await.unwrap();
+    assert!(identity.address_verified);
+    assert_eq!(
+        identity.serial,
+        Reported::Supported("SYNTHETIC-0001".into())
+    );
+    assert_eq!(identity.host, Reported::Supported("synthetic-kvm".into()));
+    assert_eq!(identity.id().endpoint, "synthetic-bench");
+    assert_eq!(identity.id(), connection.identity().await.unwrap().id());
+    let device: Arc<dyn Device> = connection;
     let status = device.status().await.unwrap();
     assert_eq!(
         status.info.value().unwrap().kvmd_version,
