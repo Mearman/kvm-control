@@ -588,6 +588,78 @@ async fn drop_on_ordinary_thread_uses_captured_runtime() {
 }
 
 #[tokio::test]
+async fn cancelling_snapshot_read_releases_capacity() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (arrived, ready) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        let (mut first, _) = listener.accept().await.unwrap();
+        let mut request = [0; 4096];
+        let n = first.read(&mut request).await.unwrap();
+        assert!(
+            std::str::from_utf8(&request[..n])
+                .unwrap()
+                .starts_with("GET /proxy/streamer/snapshot ")
+        );
+        first
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 999\r\n\r\n")
+            .await
+            .unwrap();
+        arrived.send(()).unwrap();
+        let mut byte = [0; 1];
+        assert_eq!(first.read(&mut byte).await.unwrap(), 0);
+        let (mut second, _) = listener.accept().await.unwrap();
+        let n = second.read(&mut request).await.unwrap();
+        assert!(
+            std::str::from_utf8(&request[..n])
+                .unwrap()
+                .starts_with("GET /proxy/streamer/snapshot ")
+        );
+        let frame = jpeg();
+        second
+            .write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    frame.len()
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        second.write_all(&frame).await.unwrap();
+    });
+    let client = reqwest::Client::builder().http1_only().build().unwrap();
+    let endpoint = Url::parse(&format!("http://{address}/proxy/")).unwrap();
+    let device = Kvmd {
+        client: tokio::sync::RwLock::new(crate::Session {
+            client: client.clone(),
+            video: client,
+            cookies: Default::default(),
+        }),
+        config: Config {
+            endpoint: endpoint.clone(),
+            profile: DeviceProfile::PiKvm,
+            trusted_ca_pem: None,
+            insecure_tls: false,
+            timeout: Duration::from_secs(3),
+        },
+        endpoint,
+        profile: DeviceProfile::PiKvm,
+        inputs: Default::default(),
+        auth_headers: Default::default(),
+        approval_token: Default::default(),
+    };
+    let mut snapshot = Box::pin(device.snapshot());
+    tokio::select! {
+        result = &mut snapshot => panic!("snapshot completed early: {result:?}"),
+        result = ready => result.unwrap(),
+    }
+    drop(snapshot);
+    assert_eq!(device.snapshot().await.unwrap().jpeg, jpeg());
+    server.await.unwrap();
+}
+
+#[tokio::test]
 async fn trusted_tls_login_cookie_reaches_lease_and_stream() {
     use tokio_rustls::TlsAcceptor;
     use tokio_rustls::rustls::{ServerConfig, pki_types::PrivatePkcs8KeyDer};
@@ -1212,10 +1284,10 @@ async fn invalid_jpeg_is_rejected() {
         video.next_frame().await,
         Err(kvm_core::Error::InvalidResponse(_))
     ));
-    drop(video);
     tokio::time::timeout(Duration::from_secs(3), closed.notified())
         .await
         .unwrap();
+    assert!(video.next_frame().await.unwrap().is_none());
     server.await.unwrap();
 }
 

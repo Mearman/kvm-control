@@ -25,7 +25,7 @@ struct Mjpeg {
     boundary: Vec<u8>,
     buffer: Vec<u8>,
     pending: bytes::Bytes,
-    storage: std::sync::Arc<tokio::sync::OwnedSemaphorePermit>,
+    storage: Option<std::sync::Arc<tokio::sync::OwnedSemaphorePermit>>,
     validation: Option<JoinHandle<Result<Vec<u8>>>>,
     scan_offset: usize,
     #[cfg(test)]
@@ -163,7 +163,7 @@ pub(crate) async fn open(device: &Kvmd) -> Result<Box<dyn VideoStream>> {
         boundary,
         buffer: Vec::new(),
         pending: bytes::Bytes::new(),
-        storage: std::sync::Arc::new(storage),
+        storage: Some(std::sync::Arc::new(storage)),
         validation: None,
         scan_offset: 0,
         #[cfg(test)]
@@ -287,6 +287,20 @@ impl Mjpeg {
 #[async_trait]
 impl VideoStream for Mjpeg {
     async fn next_frame(&mut self) -> Result<Option<Snapshot>> {
+        let result = self.read_frame().await;
+        if result.is_err() {
+            self.ended = true;
+            self.lease.abort();
+            self.storage = None;
+            self.buffer = Vec::new();
+            self.pending = bytes::Bytes::new();
+        }
+        result
+    }
+}
+
+impl Mjpeg {
+    async fn read_frame(&mut self) -> Result<Option<Snapshot>> {
         if self.validation.is_some() {
             let result = self.validation.as_mut().expect("validation exists").await;
             self.validation = None;
@@ -473,7 +487,7 @@ mod tests {
             boundary: b"--frame".to_vec(),
             buffer: Vec::new(),
             pending: bytes::Bytes::new(),
-            storage: std::sync::Arc::new(storage_slot().unwrap()),
+            storage: Some(std::sync::Arc::new(storage_slot().unwrap())),
             validation: None,
             scan_offset: 0,
             scanned: 0,
