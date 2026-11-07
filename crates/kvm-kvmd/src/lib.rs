@@ -157,7 +157,8 @@ async fn validate_jpeg_async(
 ) -> Result<Vec<u8>> {
     tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        validate_jpeg(&bytes)
+        validate_jpeg(&bytes)?;
+        Ok(bytes)
     })
     .await
     .map_err(|_| Error::Transport("JPEG validation task failed".into()))?
@@ -1271,8 +1272,8 @@ mod tests {
         assert!(!jpeg_frame_safe(&image[..sof + 4], &mut Vec::new()));
     }
 
-    #[test]
-    fn validation_strips_repeated_metadata_without_changing_the_frame() {
+    #[tokio::test]
+    async fn validation_strips_repeated_metadata_without_changing_the_frame() {
         let mut original = Vec::new();
         image::codecs::jpeg::JpegEncoder::new(&mut original)
             .encode(&[64, 128, 192], 1, 1, image::ExtendedColorType::Rgb8)
@@ -1297,6 +1298,12 @@ mod tests {
         assert!(jpeg_frame_safe(&frame, &mut stripped));
         assert_eq!(stripped, original);
         assert_eq!(validate_jpeg(&frame).unwrap(), original);
+        assert_eq!(
+            validate_jpeg_async(frame.clone(), jpeg_permit().await.unwrap())
+                .await
+                .unwrap(),
+            frame
+        );
     }
 
     #[test]

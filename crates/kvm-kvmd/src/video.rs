@@ -25,7 +25,8 @@ struct Mjpeg {
     boundary: Vec<u8>,
     buffer: Vec<u8>,
     pending: bytes::Bytes,
-    permit: Option<std::sync::Arc<tokio::sync::OwnedSemaphorePermit>>,
+    storage: std::sync::Arc<tokio::sync::OwnedSemaphorePermit>,
+    validation: Option<JoinHandle<Result<Vec<u8>>>>,
     scan_offset: usize,
     #[cfg(test)]
     scanned: usize,
@@ -45,7 +46,20 @@ impl Drop for Mjpeg {
     }
 }
 
+fn storage_slot() -> Result<tokio::sync::OwnedSemaphorePermit> {
+    static SLOTS: std::sync::OnceLock<std::sync::Arc<tokio::sync::Semaphore>> =
+        std::sync::OnceLock::new();
+    SLOTS
+        .get_or_init(|| {
+            std::sync::Arc::new(tokio::sync::Semaphore::new(crate::MAX_JPEG_VALIDATIONS))
+        })
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| Error::Transport("video stream capacity exhausted".into()))
+}
+
 pub(crate) async fn open(device: &Kvmd) -> Result<Box<dyn VideoStream>> {
+    let storage = storage_slot()?;
     let session = device.client.read().await;
     let mut ws_url = device.url("ws")?;
     ws_url.query_pairs_mut().append_pair("stream", "true");
@@ -149,7 +163,8 @@ pub(crate) async fn open(device: &Kvmd) -> Result<Box<dyn VideoStream>> {
         boundary,
         buffer: Vec::new(),
         pending: bytes::Bytes::new(),
-        permit: None,
+        storage: std::sync::Arc::new(storage),
+        validation: None,
         scan_offset: 0,
         #[cfg(test)]
         scanned: 0,
@@ -272,14 +287,19 @@ impl Mjpeg {
 #[async_trait]
 impl VideoStream for Mjpeg {
     async fn next_frame(&mut self) -> Result<Option<Snapshot>> {
+        if self.validation.is_some() {
+            let result = self.validation.as_mut().expect("validation exists").await;
+            self.validation = None;
+            let jpeg = result
+                .map_err(|_| Error::Transport("JPEG validation task failed".into()))??;
+            self.proven.store(true, Ordering::Release);
+            return Ok(Some(Snapshot { jpeg }));
+        }
         if self.ended {
             return Ok(None);
         }
         if !*self.lease_state.borrow() {
             return Err(Error::Transport("stream lease ended".into()));
-        }
-        if self.permit.is_none() {
-            self.permit = Some(crate::jpeg_permit().await?);
         }
         if self.first {
             let marker = [self.boundary.as_slice(), b"\r\n"].concat();
@@ -373,11 +393,6 @@ impl VideoStream for Mjpeg {
             return Err(Error::InvalidResponse("frame exceeds limit".into()));
         }
         let frame = self.buffer[body_start..body_start + size].to_vec();
-        let frame = crate::validate_jpeg_async(
-            frame,
-            self.permit.as_ref().expect("permit acquired").clone(),
-        )
-        .await?;
         let suffix_start = body_start + size + delimiter.len();
         let suffix = &self.buffer[suffix_start..suffix_start + 2];
         if suffix == b"--" {
@@ -388,12 +403,17 @@ impl VideoStream for Mjpeg {
         }
         self.buffer.drain(..suffix_start + 2);
         self.scan_offset = 0;
+        let storage = self.storage.clone();
+        self.validation = Some(tokio::spawn(async move {
+            let _storage = storage;
+            let permit = crate::jpeg_permit().await?;
+            crate::validate_jpeg_async(frame, permit).await
+        }));
+        let result = self.validation.as_mut().expect("validation exists").await;
+        self.validation = None;
+        let jpeg = result.map_err(|_| Error::Transport("JPEG validation task failed".into()))??;
         self.proven.store(true, Ordering::Release);
-        if self.buffer.is_empty() && self.pending.is_empty() {
-            self.buffer = Vec::new();
-            self.permit = None;
-        }
-        Ok(Some(Snapshot { jpeg: frame }))
+        Ok(Some(Snapshot { jpeg }))
     }
 }
 
@@ -404,6 +424,16 @@ mod tests {
         pin::Pin,
         task::{Context, Poll},
     };
+
+    #[test]
+    fn stream_capacity_is_explicit_and_released_on_drop() {
+        let slots = (0..crate::MAX_JPEG_VALIDATIONS)
+            .map(|_| storage_slot().unwrap())
+            .collect::<Vec<_>>();
+        assert!(storage_slot().is_err());
+        drop(slots);
+        assert!(storage_slot().is_ok());
+    }
 
     #[tokio::test]
     async fn repeated_cancellation_keeps_fragment_scan_linear() {
@@ -443,7 +473,8 @@ mod tests {
             boundary: b"--frame".to_vec(),
             buffer: Vec::new(),
             pending: bytes::Bytes::new(),
-            permit: None,
+            storage: std::sync::Arc::new(storage_slot().unwrap()),
+            validation: None,
             scan_offset: 0,
             scanned: 0,
             scan_progress: Some(progress_tx),
