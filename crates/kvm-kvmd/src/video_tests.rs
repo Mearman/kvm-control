@@ -346,6 +346,28 @@ async fn timed_out_press_remains_indeterminate_after_release() {
     server.await.unwrap();
 }
 
+async fn read_input_request(stream: &mut tokio::net::TcpStream) -> String {
+    let mut request = Vec::new();
+    let mut byte = [0; 1];
+    while !request.ends_with(b"\r\n\r\n") {
+        stream.read_exact(&mut byte).await.unwrap();
+        request.push(byte[0]);
+    }
+    let headers = std::str::from_utf8(&request).unwrap();
+    let length = headers
+        .lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case("content-length")
+                .then(|| value.trim().parse::<usize>().unwrap())
+        })
+        .unwrap();
+    let mut body = vec![0; length];
+    stream.read_exact(&mut body).await.unwrap();
+    request.extend(body);
+    String::from_utf8(request).unwrap()
+}
+
 #[tokio::test]
 async fn cancelled_waiter_cannot_replace_cleanup_runtime() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -355,7 +377,7 @@ async fn cancelled_waiter_cannot_replace_cleanup_runtime() {
     let server = tokio::spawn(async move {
         let mut buffer = [0; 4096];
         let (mut press, _) = listener.accept().await.unwrap();
-        press.read(&mut buffer).await.unwrap();
+        assert!(read_input_request(&mut press).await.contains("state=true"));
         accepted_tx.send(()).unwrap();
         finish_rx.await.unwrap();
         press
@@ -406,9 +428,8 @@ async fn ambiguous_release_is_not_replayed_on_drop() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let device = input_device(listener.local_addr().unwrap());
     let server = tokio::spawn(async move {
-        let mut buffer = [0; 4096];
         let (mut press, _) = listener.accept().await.unwrap();
-        press.read(&mut buffer).await.unwrap();
+        assert!(read_input_request(&mut press).await.contains("state=true"));
         press
             .write_all(
                 b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}",
@@ -416,7 +437,11 @@ async fn ambiguous_release_is_not_replayed_on_drop() {
             .await
             .unwrap();
         let (mut release, _) = listener.accept().await.unwrap();
-        release.read(&mut buffer).await.unwrap();
+        assert!(
+            read_input_request(&mut release)
+                .await
+                .contains("state=false")
+        );
         release
             .write_all(b"HTTP/1.1 500 Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
             .await
@@ -444,7 +469,7 @@ async fn drop_on_ordinary_thread_uses_captured_runtime() {
     let server = tokio::spawn(async move {
         let mut buffer = [0; 4096];
         let (mut press, _) = listener.accept().await.unwrap();
-        press.read(&mut buffer).await.unwrap();
+        assert!(read_input_request(&mut press).await.contains("state=true"));
         press
             .write_all(
                 b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}",
