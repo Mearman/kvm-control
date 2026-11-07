@@ -2608,7 +2608,7 @@ mod tests {
         let (response, mut socket) = multipart().await;
         let storage = StreamStorage::new(STREAM_STORAGE_BYTES);
         let (mut video, _lease) = parser(response, storage.clone());
-        // The stream has dropped a given-up body and copied the start of its delimiter. While the delimiter is incomplete both received-byte sources are empty: the delimiter read grows the buffer straight to the delimiter's end, each copy either reaches that end or empties its source (the carry first, then the received chunk, without suspending between them), and the read suspends with a short buffer only to receive more, so a discard sees a short delimiter with nothing received after it.
+        // The stream has dropped a given-up body and copied the start of its delimiter. While the delimiter is incomplete both received-byte sources are empty: the delimiter read grows the buffer straight to the delimiter's end, each copy either reaches that end or empties its source (the carry first, then the received chunk, without suspending between them), and the read suspends with part of the delimiter buffered only to receive more (its one storage wait comes before the first copy, with the buffer empty), so a discard that keeps delimiter bytes has nothing received after them.
         video.first = false;
         video.part = Part::Delimiter;
         video.buffer = b"\r\n--fr".to_vec();
