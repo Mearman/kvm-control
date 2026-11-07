@@ -99,6 +99,7 @@ async fn device(body: impl Into<Vec<u8>>) -> (Kvmd, Arc<Notify>, tokio::task::Jo
         video_proven: Default::default(),
         cleanup_on_drop: false,
         input_runtime: Default::default(),
+        reporter: Default::default(),
         stream_storage: Arc::new(tokio::sync::Semaphore::new(crate::MAX_JPEG_VALIDATIONS)),
         snapshot_storage: Arc::new(tokio::sync::Semaphore::new(crate::MAX_JPEG_VALIDATIONS)),
     };
@@ -187,6 +188,7 @@ fn input_device(address: std::net::SocketAddr) -> Kvmd {
         video_proven: Default::default(),
         cleanup_on_drop: true,
         input_runtime: Default::default(),
+        reporter: Default::default(),
         stream_storage: Arc::new(tokio::sync::Semaphore::new(crate::MAX_JPEG_VALIDATIONS)),
         snapshot_storage: Arc::new(tokio::sync::Semaphore::new(crate::MAX_JPEG_VALIDATIONS)),
     }
@@ -260,6 +262,7 @@ async fn cancelled_press_finishes_before_concurrent_release() {
         video_proven: Default::default(),
         cleanup_on_drop: true,
         input_runtime: Default::default(),
+        reporter: Default::default(),
         stream_storage: Arc::new(tokio::sync::Semaphore::new(crate::MAX_JPEG_VALIDATIONS)),
         snapshot_storage: Arc::new(tokio::sync::Semaphore::new(crate::MAX_JPEG_VALIDATIONS)),
     });
@@ -795,6 +798,7 @@ async fn cancelling_snapshot_read_releases_capacity() {
         video_proven: Default::default(),
         cleanup_on_drop: false,
         input_runtime: Default::default(),
+        reporter: Default::default(),
         stream_storage: Arc::new(tokio::sync::Semaphore::new(crate::MAX_JPEG_VALIDATIONS)),
         snapshot_storage: Arc::new(tokio::sync::Semaphore::new(crate::MAX_JPEG_VALIDATIONS)),
     };
@@ -893,6 +897,7 @@ async fn stream_validation_survives_cancelled_next_frame() {
         video_proven: Default::default(),
         cleanup_on_drop: false,
         input_runtime: Default::default(),
+        reporter: Default::default(),
         stream_storage: Arc::new(tokio::sync::Semaphore::new(crate::MAX_JPEG_VALIDATIONS)),
         snapshot_storage: Arc::new(tokio::sync::Semaphore::new(crate::MAX_JPEG_VALIDATIONS)),
     };
@@ -959,6 +964,7 @@ async fn concurrent_snapshots_exhaust_and_recover_storage() {
         video_proven: Default::default(),
         cleanup_on_drop: false,
         input_runtime: Default::default(),
+        reporter: Default::default(),
         stream_storage: Arc::new(tokio::sync::Semaphore::new(crate::MAX_JPEG_VALIDATIONS)),
         snapshot_storage: Arc::new(tokio::sync::Semaphore::new(crate::MAX_JPEG_VALIDATIONS)),
     });
@@ -1292,6 +1298,7 @@ async fn cancelled_partial_frame_can_resume() {
         video_proven: Default::default(),
         cleanup_on_drop: false,
         input_runtime: Default::default(),
+        reporter: Default::default(),
         stream_storage: Arc::new(tokio::sync::Semaphore::new(crate::MAX_JPEG_VALIDATIONS)),
         snapshot_storage: Arc::new(tokio::sync::Semaphore::new(crate::MAX_JPEG_VALIDATIONS)),
     };
@@ -1366,6 +1373,7 @@ async fn relogin_waits_for_video_establishment() {
         video_proven: Default::default(),
         cleanup_on_drop: false,
         input_runtime: Default::default(),
+        reporter: Default::default(),
         stream_storage: Arc::new(tokio::sync::Semaphore::new(crate::MAX_JPEG_VALIDATIONS)),
         snapshot_storage: Arc::new(tokio::sync::Semaphore::new(crate::MAX_JPEG_VALIDATIONS)),
     });
@@ -1440,6 +1448,7 @@ async fn coalesced_http_response_delivers_multiple_frames() {
         video_proven: Default::default(),
         cleanup_on_drop: false,
         input_runtime: Default::default(),
+        reporter: Default::default(),
         stream_storage: Arc::new(tokio::sync::Semaphore::new(crate::MAX_JPEG_VALIDATIONS)),
         snapshot_storage: Arc::new(tokio::sync::Semaphore::new(crate::MAX_JPEG_VALIDATIONS)),
     };
@@ -1525,6 +1534,7 @@ async fn maximum_frame_with_maximum_headers_and_boundary() {
         video_proven: Default::default(),
         cleanup_on_drop: false,
         input_runtime: Default::default(),
+        reporter: Default::default(),
         stream_storage: Arc::new(tokio::sync::Semaphore::new(crate::MAX_JPEG_VALIDATIONS)),
         snapshot_storage: Arc::new(tokio::sync::Semaphore::new(crate::MAX_JPEG_VALIDATIONS)),
     };

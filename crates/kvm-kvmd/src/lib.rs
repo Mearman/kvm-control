@@ -328,6 +328,7 @@ pub struct Kvmd {
     video_proven: Arc<AtomicBool>,
     cleanup_on_drop: bool,
     input_runtime: Arc<std::sync::Mutex<Option<tokio::runtime::Handle>>>,
+    reporter: Reporter,
     // Releases owed by abandoned presses. A dropped future may have no runtime and cannot await the input lock, so it queues here and the next lock holder sends them.
     owed: Arc<std::sync::Mutex<VecDeque<Owed>>>,
     #[cfg(test)]
@@ -365,6 +366,16 @@ struct Owed {
     kind: Held,
     name: String,
     sequence: u64,
+}
+
+/// Where input diagnostics with no caller to return them to are reported: standard error, or a capture installed by tests.
+#[derive(Clone)]
+struct Reporter(Arc<dyn Fn(&str) + Send + Sync>);
+
+impl Default for Reporter {
+    fn default() -> Self {
+        Self(Arc::new(|message| eprintln!("{message}")))
+    }
 }
 
 /// An input that stays held until released: a keyboard key or a mouse button.
@@ -520,7 +531,7 @@ impl Drop for Collect<'_> {
             return;
         };
         if let Err(error) = result {
-            report_abandoned(&error);
+            self.device.report_abandoned(&error);
         }
         let Some(owed) = owed else {
             return;
@@ -606,6 +617,7 @@ impl Kvmd {
             video_proven: Arc::new(AtomicBool::new(false)),
             cleanup_on_drop: true,
             input_runtime: Arc::new(std::sync::Mutex::new(None)),
+            reporter: Default::default(),
             owed: Default::default(),
             #[cfg(test)]
             stream_storage: Arc::new(tokio::sync::Semaphore::new(MAX_JPEG_VALIDATIONS)),
@@ -942,12 +954,25 @@ impl Kvmd {
             video_proven: self.video_proven.clone(),
             cleanup_on_drop: false,
             input_runtime: self.input_runtime.clone(),
+            reporter: self.reporter.clone(),
             owed: self.owed.clone(),
             #[cfg(test)]
             stream_storage: self.stream_storage.clone(),
             #[cfg(test)]
             snapshot_storage: self.snapshot_storage.clone(),
         }
+    }
+
+    /// Reports an input diagnostic that has no caller to return it to.
+    fn report(&self, message: &str) {
+        (self.reporter.0)(message);
+    }
+
+    /// Reports a failed input outcome whose caller abandoned the request, since no caller will see it.
+    fn report_abandoned(&self, error: &Error) {
+        self.report(&format!(
+            "Input outcome uncertain for an abandoned request: {error}"
+        ));
     }
 
     fn capture_input_runtime(&self) {
@@ -1003,8 +1028,8 @@ impl Kvmd {
         let mut inputs = self.inputs.lock().await;
         self.settle_owed(&mut inputs).await;
         if self.release_held(&mut inputs).await {
-            eprintln!(
-                "Input cleanup uncertain: a release sent by a dropped owner was not confirmed"
+            self.report(
+                "Input cleanup uncertain: a release sent by a dropped owner was not confirmed",
             );
         }
     }
@@ -1025,8 +1050,8 @@ impl Kvmd {
     async fn settle_owed(&self, inputs: &mut Inputs) {
         // Only a failure of the finishing release is new; one already known was reported to the call that saw it, or printed when that call had been abandoned.
         if inputs.release_pending && self.release_held(inputs).await {
-            eprintln!(
-                "Input cleanup uncertain: a release finishing an interrupted release was not confirmed"
+            self.report(
+                "Input cleanup uncertain: a release finishing an interrupted release was not confirmed",
             );
         }
         loop {
@@ -1053,7 +1078,7 @@ impl Kvmd {
                     inputs.cleaned.push((kind, name));
                 }
                 Ok(()) => {}
-                Err(error) => eprintln!("Input cleanup uncertain: {error}"),
+                Err(error) => self.report(&format!("Input cleanup uncertain: {error}")),
             }
         }
     }
@@ -1160,7 +1185,7 @@ impl Kvmd {
             };
             if let Err((result, owed)) = result_tx.send((result, owes)) {
                 if let Err(error) = &result {
-                    report_abandoned(error);
+                    worker.report_abandoned(error);
                 }
                 if let Some(owed) = owed {
                     worker
@@ -1203,11 +1228,6 @@ impl Kvmd {
         }
         Ok(())
     }
-}
-
-/// Reports a failed input outcome whose caller abandoned the request, since no caller will see it.
-fn report_abandoned(error: &Error) {
-    eprintln!("Input outcome uncertain for an abandoned request: {error}");
 }
 
 fn hid_capability(state: &serde_json::Value, device: &str) -> Capability {
@@ -1316,7 +1336,7 @@ impl Device for Kvmd {
         tokio::spawn(async move {
             let result = worker.settled_move(inputs, x, y, &result_tx).await;
             if let Err(Err(error)) = result_tx.send(result) {
-                report_abandoned(&error);
+                worker.report_abandoned(&error);
             }
         });
         result_rx
@@ -1756,6 +1776,7 @@ mod tests {
             video_proven: Default::default(),
             cleanup_on_drop: false,
             input_runtime: Default::default(),
+            reporter: Default::default(),
             owed: Default::default(),
             stream_storage: Arc::new(tokio::sync::Semaphore::new(MAX_JPEG_VALIDATIONS)),
             snapshot_storage: Arc::new(tokio::sync::Semaphore::new(MAX_JPEG_VALIDATIONS)),
@@ -1804,6 +1825,7 @@ mod tests {
             video_proven: Default::default(),
             cleanup_on_drop: false,
             input_runtime: Default::default(),
+            reporter: Default::default(),
             owed: Default::default(),
             stream_storage: Arc::new(tokio::sync::Semaphore::new(MAX_JPEG_VALIDATIONS)),
             snapshot_storage: Arc::new(tokio::sync::Semaphore::new(MAX_JPEG_VALIDATIONS)),
