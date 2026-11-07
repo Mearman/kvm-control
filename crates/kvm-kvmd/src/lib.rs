@@ -1181,13 +1181,8 @@ impl Kvmd {
         let mut inputs = self.inputs.clone().lock_owned().await;
         // Recorded once the lock is held, as every lock holder other than a dropped owner's release does, so cleanup scheduled later targets a runtime that has recently run.
         self.capture_input_runtime();
-        let worker = self.input_worker();
-        tokio::spawn(async move {
-            worker.settle_owed(&mut inputs).await;
-            inputs
-        })
-        .await
-        .map_err(|_| Error::AmbiguousInput("input cleanup task failed".into()))
+        self.settle_owed(&mut inputs).await;
+        Ok(inputs)
     }
 
     /// Submits a press or release on a task that holds the input lock until the outcome is recorded and delivered, not until it is collected. A release of an input whose owed release cleanup confirmed since the previous key or button request, a login that replaced the session or a completed approval is not sent again; an input with any earlier unconfirmed press or release is never recorded as cleaned, so its release is sent.
