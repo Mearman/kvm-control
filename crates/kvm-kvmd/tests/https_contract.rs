@@ -35,7 +35,8 @@ async fn gated_input(State(calls): State<Calls>, uri: Uri) -> impl IntoResponse 
     calls.0.lock().unwrap().push(uri.to_string());
     calls.3.notify_one();
     calls.4.notified().await;
-    if uri.query().unwrap().contains("ambiguous") {
+    let query = uri.query().unwrap();
+    if query.contains("ambiguous") && query.contains("state=false") {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({"ok": false})),
@@ -641,6 +642,18 @@ where
     tokio::spawn(future)
 }
 
+/// Completes `future`, letting every gated request reach the device in the order it arrives.
+async fn drive<F: std::future::Future>(calls: &Calls, future: F) -> F::Output {
+    let mut future = std::pin::pin!(future);
+    loop {
+        tokio::select! {
+            biased;
+            output = &mut future => return output,
+            () = calls.3.notified() => calls.4.notify_one(),
+        }
+    }
+}
+
 #[tokio::test]
 async fn cancelled_cleanup_precedes_later_input_and_explicit_release() {
     let (mut endpoint, ca, calls, server) = fixture().await;
@@ -812,14 +825,16 @@ async fn cancelled_ambiguous_release_is_not_replayed() {
     let (mut endpoint, ca, calls, server) = fixture().await;
     endpoint.set_path("/gated/");
     let device = Arc::new(client(endpoint, Some(ca)));
+    drive(&calls, device.key("ambiguous", true)).await.unwrap();
     let sender = device.clone();
     let task = tokio::spawn(async move { sender.key("ambiguous", false).await });
     calls.3.notified().await;
     task.abort();
     assert!(task.await.unwrap_err().is_cancelled());
     calls.4.notify_one();
+    // The ambiguous release must not be resent by the abandoned request's cleanup or by the explicit release.
     assert!(matches!(
-        device.release_inputs().await,
+        drive(&calls, device.release_inputs()).await,
         Err(Error::AmbiguousInput(_))
     ));
     assert_eq!(
@@ -830,7 +845,7 @@ async fn cancelled_ambiguous_release_is_not_replayed() {
             .iter()
             .filter(|v| v.contains("/hid/events/"))
             .count(),
-        1
+        2
     );
     server.abort();
 }
