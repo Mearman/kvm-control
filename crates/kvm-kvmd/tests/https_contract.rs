@@ -1612,6 +1612,43 @@ async fn approval_that_changes_nothing_keeps_the_record_of_cleaned_releases() {
     server.abort();
 }
 
+#[test]
+fn owner_dropped_on_a_runtime_without_drivers_releases_on_the_last_runtime() {
+    let server_runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let (mut endpoint, ca, calls, server) = server_runtime.block_on(fixture());
+    endpoint.set_path("/gated/");
+    let device = client(endpoint, Some(ca));
+    // The last runtime to take the input lock is driven only when the test blocks on it, so a release scheduled there waits.
+    let last_runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    last_runtime
+        .block_on(drive(&calls, device.key("KeyA", true)))
+        .unwrap();
+    let bare_runtime = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
+    bare_runtime.block_on(async move {
+        drop(device);
+        // A current-thread runtime runs every task already queued before it polls a yielded block_on future again, so a release started here would run and fail now.
+        tokio::task::yield_now().await;
+    });
+    drop(bare_runtime);
+    last_runtime.block_on(async {
+        arrival(&calls).await;
+        calls.4.notify_one();
+    });
+    assert_eq!(
+        input_events(&calls),
+        ["key=KeyA&state=true", "key=KeyA&state=false"]
+    );
+    server.abort();
+}
+
 #[tokio::test]
 async fn expired_session_requires_explicit_reauthentication() {
     let (endpoint, ca, calls, server) = fixture().await;

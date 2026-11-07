@@ -313,7 +313,7 @@ impl reqwest::cookie::CookieStore for SessionCookies {
 
 /// A KVMD connection with an explicitly authenticated session.
 ///
-/// Input requests already submitted continue after caller cancellation. A key or button press dropped before its outcome is collected, including outside a runtime, owes the release of its own input and nothing else, and owes nothing when the input was already held before it was sent, since an earlier press holds it: if the outcome was not yet delivered the request sends that release before giving up the input lock, and otherwise the release is queued for the next holder of the input lock and scheduled on the runtime the request ran on. Every later input, movement, explicit release, login or approval sends owed releases before its own work, including one already waiting for the lock, on a task that finishes them even if that caller is cancelled, so cleanup never interleaves with later inputs. An owed release is skipped once a later request has pressed or released the same input, so an input whose request reported success is never undone by cleanup. A completed request does not hold the input lock while its outcome waits to be collected, and a release of an input that cleanup has just confirmed released is not sent again unless an earlier press of it was ambiguous or a login or approval came between. Ambiguous outcomes permanently render cleanup indeterminate because a server may apply a timed-out request later. A request interrupted by runtime shutdown counts as ambiguous: an interrupted press owes its release as above, and an interrupted explicit release is finished by the next lock holder. An ambiguous release is not replayed automatically. Dropping the last owner attempts to release tracked inputs on the current runtime and on the runtime that last took the input lock; process termination, or a runtime shutdown with no later holder of the input lock, provides no cleanup guarantee.
+/// Input requests already submitted continue after caller cancellation. A key or button press dropped before its outcome is collected, including outside a runtime, owes the release of its own input and nothing else, and owes nothing when the input was already held before it was sent, since an earlier press holds it: if the outcome was not yet delivered the request sends that release before giving up the input lock, and otherwise the release is queued for the next holder of the input lock and scheduled on the runtime the request ran on. Every later input, movement, explicit release, login or approval sends owed releases before its own work, including one already waiting for the lock, on a task that finishes them even if that caller is cancelled, so cleanup never interleaves with later inputs. An owed release is skipped once a later request has pressed or released the same input, so an input whose request reported success is never undone by cleanup. A completed request does not hold the input lock while its outcome waits to be collected, and a release of an input that cleanup has just confirmed released is not sent again unless an earlier press of it was ambiguous or a login or approval came between. Ambiguous outcomes permanently render cleanup indeterminate because a server may apply a timed-out request later. A request interrupted by runtime shutdown counts as ambiguous: an interrupted press owes its release as above, and an interrupted explicit release is finished by the next lock holder. An ambiguous release is not replayed automatically. Dropping the last owner attempts to release tracked inputs on the runtime that last took the input lock, or on the current runtime if that one cannot run the release; process termination, or a runtime shutdown with no later holder of the input lock, provides no cleanup guarantee.
 ///
 /// Cookies are accepted only from login or approval responses. Later `Set-Cookie` headers, including rotation and expiry updates, are ignored. The inspected [PiKVM](https://github.com/pikvm/kvmd/blob/fcb903eb3be70d8eee4aee99e5fcc1c743e3ccef/kvmd/apps/kvmd/api/auth.py) and [GLKVM](https://github.com/gl-inet/glkvm/blob/3e8dd23c4bd638a4650433664cc3b0f3b4d29395/kvmd/apps/kvmd/api/auth.py) revisions issue authentication cookies on login, and GLKVM also issues them on approval. Other firmware requiring cookie rotation is not supported. Server-side expiry or revocation can return an authentication error; call `login` again with fresh credentials and complete any approval. Consequential and input requests are never automatically replayed, and ambiguous outcomes require observation before a caller decides what to do.
 pub struct Kvmd {
@@ -979,8 +979,8 @@ impl Kvmd {
         result
     }
 
-    /// Releases every tracked input, the caller holding the input lock. A failed release is tracked as uncertain and never resent. `release_pending` stays set until every release has been attempted, so a release interrupted by runtime shutdown is finished by the next lock holder.
-    async fn release_all(&self, inputs: &mut Inputs) -> Result<()> {
+    /// Sends a release for every tracked input, the caller holding the input lock, and returns whether any of them failed. `release_pending` stays set until every release has been attempted.
+    async fn release_held(&self, inputs: &mut Inputs) -> bool {
         inputs.release_pending = true;
         let mut failed = false;
         for kind in [Held::Key, Held::Button] {
@@ -989,6 +989,23 @@ impl Kvmd {
             }
         }
         inputs.release_pending = false;
+        failed
+    }
+
+    /// Releases tracked inputs for a dropped owner, reporting only a release that fails here: an earlier failure was already reported to the call that saw it.
+    async fn release_for_drop(&self) {
+        let mut inputs = self.inputs.lock().await;
+        self.settle_owed(&mut inputs).await;
+        if self.release_held(&mut inputs).await {
+            eprintln!(
+                "Input cleanup uncertain: a release sent by a dropped owner was not confirmed"
+            );
+        }
+    }
+
+    /// Releases every tracked input, the caller holding the input lock. A failed release is tracked as uncertain and never resent. `release_pending` stays set until every release has been attempted, so a release interrupted by runtime shutdown is finished by the next lock holder.
+    async fn release_all(&self, inputs: &mut Inputs) -> Result<()> {
+        let failed = self.release_held(inputs).await;
         if failed || inputs.indeterminate {
             Err(Error::AmbiguousInput(
                 "input session remains indeterminate after an ambiguous operation".into(),
@@ -1000,10 +1017,11 @@ impl Kvmd {
 
     /// Sends cleanup owed to earlier requests, the caller holding the input lock: finishes an interrupted explicit release, then releases each input an abandoned press still holds unless a later request changed it. A confirmed owed release is recorded in `inputs.cleaned` unless the input is tracked as uncertain, since an earlier ambiguous press may still be applied after the release. An owed release interrupted by runtime shutdown is recorded as ambiguous by `send_held`, so it is never resent.
     async fn settle_owed(&self, inputs: &mut Inputs) {
-        if inputs.release_pending
-            && let Err(error) = self.release_all(inputs).await
-        {
-            eprintln!("Input cleanup uncertain: {error}");
+        // Only a failure of the finishing release is new; one already known left the session indeterminate and was reported to the call that saw it.
+        if inputs.release_pending && self.release_held(inputs).await {
+            eprintln!(
+                "Input cleanup uncertain: a release finishing an interrupted release was not confirmed"
+            );
         }
         loop {
             let next = self
@@ -1436,7 +1454,7 @@ impl Device for Kvmd {
 
 impl Drop for Kvmd {
     fn drop(&mut self) {
-        // Only a connection that has taken the input lock has inputs to release. The release is scheduled on the runtime the owner is dropped on and, when that differs, also on the runtime that last took the input lock: a runtime that is shutting down still reports itself current but discards new tasks, and a second release finds nothing held.
+        // Only a connection that has taken the input lock has inputs to release. The release runs on the runtime that last took the input lock, which has performed input requests. When the owner is dropped on another runtime, a task there waits for that release and performs it only if the last runtime could not run it (shut down, or panicked); waiting needs no IO or time driver, so a current runtime without them never starts a release, and one that is shutting down discards its task while the last runtime still releases.
         let last = self
             .input_runtime
             .lock()
@@ -1448,11 +1466,13 @@ impl Drop for Kvmd {
             let current = tokio::runtime::Handle::try_current()
                 .ok()
                 .filter(|current| current.id() != last.id());
-            for runtime in current.into_iter().chain([last]) {
+            let worker = self.input_worker();
+            let released = last.spawn(async move { worker.release_for_drop().await });
+            if let Some(current) = current {
                 let worker = self.input_worker();
-                runtime.spawn(async move {
-                    if let Err(error) = worker.release_inputs().await {
-                        eprintln!("Input cleanup uncertain: {error}");
+                current.spawn(async move {
+                    if released.await.is_err() {
+                        worker.release_for_drop().await;
                     }
                 });
             }
