@@ -1,6 +1,9 @@
 use clap::{Parser, ValueEnum};
-use kvm_core::DeviceProfile;
-use kvm_kvmd::{Config, Kvmd, LoginState};
+use kvm_core::{
+    AuthScheme, Connected, Connector, Credentials, Device, DeviceProfile, Endpoint, LoginState,
+    ServerTrust,
+};
+use kvm_kvmd::KvmdConnector;
 use std::{
     io::{self, Write},
     path::{Path, PathBuf},
@@ -70,8 +73,8 @@ enum Profile {
 /// # Errors
 ///
 /// Returns a message naming `--ca` and the path when the file cannot be read; the file's contents never appear in it.
-fn read_ca(path: &Path) -> Result<Vec<u8>, String> {
-    std::fs::read(path)
+fn read_ca(path: &Path) -> Result<String, String> {
+    std::fs::read_to_string(path)
         .map_err(|error| format!("cannot read --ca certificate {}: {error}", path.display()))
 }
 
@@ -111,37 +114,49 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if args.insecure_tls {
         eprintln!("Warning: TLS certificate verification is disabled");
     }
-    let device = Kvmd::new(Config {
-        endpoint,
+    let endpoint = Endpoint {
+        label: None,
+        address: endpoint,
         profile: match profile {
             Profile::Pikvm => DeviceProfile::PiKvm,
             Profile::Glkvm => DeviceProfile::GlKvm,
         },
-        trusted_ca_pem,
-        insecure_tls: args.insecure_tls,
+        auth: AuthScheme::Session,
+        trust: if args.insecure_tls {
+            ServerTrust::Disabled
+        } else {
+            ServerTrust::Verified {
+                additional_ca_pem: trusted_ca_pem,
+            }
+        },
         timeout: Duration::from_secs(15),
-    })?;
-    let totp = if args.totp {
-        Some(zeroize::Zeroizing::new(rpassword::prompt_password(
-            "TOTP code: ",
-        )?))
-    } else {
-        None
     };
-    let mut state = device
-        .login_with_totp(&username, &password, totp.as_deref().map(String::as_str))
-        .await?;
-    drop(totp);
-    drop(password);
-    while let LoginState::ApprovalPending { expires_in } = state {
-        eprintln!(
-            "Device approval required (expiry: {expires_in:?} seconds). Approve on the device, then press Enter; type q to cancel."
-        );
-        if prompt("Continue")?.eq_ignore_ascii_case("q") {
-            return Err("device approval cancelled".into());
-        }
-        state = device.complete_approval().await?;
+    let mut credentials = Credentials::new(username, password);
+    if args.totp {
+        credentials = credentials.with_totp(zeroize::Zeroizing::new(rpassword::prompt_password(
+            "TOTP code: ",
+        )?));
     }
-    kvm_tui::run(std::sync::Arc::new(device)).await?;
+    let connection = match KvmdConnector.connect(endpoint, credentials).await? {
+        Connected::Authenticated(connection) => connection,
+        Connected::ApprovalPending {
+            connection,
+            expires_in,
+        } => {
+            let mut state = LoginState::ApprovalPending { expires_in };
+            while let LoginState::ApprovalPending { expires_in } = state {
+                eprintln!(
+                    "Device approval required (expiry: {expires_in:?} seconds). Approve on the device, then press Enter; type q to cancel."
+                );
+                if prompt("Continue")?.eq_ignore_ascii_case("q") {
+                    return Err("device approval cancelled".into());
+                }
+                state = connection.complete_approval().await?;
+            }
+            connection
+        }
+    };
+    let device: std::sync::Arc<dyn Device> = connection;
+    kvm_tui::run(device).await?;
     Ok(())
 }

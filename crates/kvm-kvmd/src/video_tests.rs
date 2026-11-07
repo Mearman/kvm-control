@@ -1,6 +1,8 @@
-use crate::{Config, Kvmd};
+use crate::Kvmd;
 use futures_util::StreamExt;
-use kvm_core::{Device, DeviceProfile};
+use kvm_core::{
+    AuthScheme, Authenticate, Credentials, Device, DeviceProfile, Endpoint, LoginState, ServerTrust,
+};
 use std::{sync::Arc, time::Duration};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -101,18 +103,21 @@ async fn device(body: impl Into<Vec<u8>>) -> (Kvmd, Arc<Notify>, tokio::task::Jo
             video: client,
             cookies: Default::default(),
         })),
-        config: Config {
-            endpoint: Url::parse(&format!("http://{address}/proxy/")).unwrap(),
+        config: Endpoint {
+            label: None,
+            address: Url::parse(&format!("http://{address}/proxy/")).unwrap(),
             profile: DeviceProfile::PiKvm,
-            trusted_ca_pem: None,
-            insecure_tls: false,
+            auth: AuthScheme::Session,
+            trust: ServerTrust::Verified {
+                additional_ca_pem: None,
+            },
             timeout: VIDEO_TIMEOUT,
         },
         endpoint: Url::parse(&format!("http://{address}/proxy/")).unwrap(),
         profile: DeviceProfile::PiKvm,
         inputs: Default::default(),
         owed: Default::default(),
-        auth_headers: Default::default(),
+        auth: Default::default(),
         approval_token: Default::default(),
         snapshot_proven: Default::default(),
         video_proven: Default::default(),
@@ -190,18 +195,21 @@ fn video_device(address: std::net::SocketAddr, profile: DeviceProfile) -> Kvmd {
             video: client,
             cookies: Default::default(),
         })),
-        config: Config {
-            endpoint: endpoint.clone(),
+        config: Endpoint {
+            label: None,
+            address: endpoint.clone(),
             profile,
-            trusted_ca_pem: None,
-            insecure_tls: false,
+            auth: AuthScheme::Session,
+            trust: ServerTrust::Verified {
+                additional_ca_pem: None,
+            },
             timeout: VIDEO_TIMEOUT,
         },
         endpoint,
         profile,
         inputs: Default::default(),
         owed: Default::default(),
-        auth_headers: Default::default(),
+        auth: Default::default(),
         approval_token: Default::default(),
         snapshot_proven: Default::default(),
         video_proven: Default::default(),
@@ -226,18 +234,21 @@ fn input_device(address: std::net::SocketAddr) -> Kvmd {
             video: client,
             cookies: Default::default(),
         })),
-        config: Config {
-            endpoint: endpoint.clone(),
+        config: Endpoint {
+            label: None,
+            address: endpoint.clone(),
             profile: DeviceProfile::PiKvm,
-            trusted_ca_pem: None,
-            insecure_tls: false,
+            auth: AuthScheme::Session,
+            trust: ServerTrust::Verified {
+                additional_ca_pem: None,
+            },
             timeout: INPUT_TIMEOUT,
         },
         endpoint,
         profile: DeviceProfile::PiKvm,
         inputs: Default::default(),
         owed: Default::default(),
-        auth_headers: Default::default(),
+        auth: Default::default(),
         approval_token: Default::default(),
         snapshot_proven: Default::default(),
         video_proven: Default::default(),
@@ -499,7 +510,7 @@ async fn relogin_cannot_discard_authentication_with_held_input() {
     });
     device.key("KeyA", true).await.unwrap();
     assert!(matches!(
-        device.login("test", "test").await,
+        device.login(Credentials::new("test", "test")).await,
         Err(kvm_core::Error::AmbiguousInput(_))
     ));
     device.release_inputs().await.unwrap();
@@ -1355,18 +1366,21 @@ async fn cancelling_snapshot_read_releases_capacity() {
             video: client,
             cookies: Default::default(),
         })),
-        config: Config {
-            endpoint: endpoint.clone(),
+        config: Endpoint {
+            label: None,
+            address: endpoint.clone(),
             profile: DeviceProfile::PiKvm,
-            trusted_ca_pem: None,
-            insecure_tls: false,
+            auth: AuthScheme::Session,
+            trust: ServerTrust::Verified {
+                additional_ca_pem: None,
+            },
             timeout: VIDEO_TIMEOUT,
         },
         endpoint,
         profile: DeviceProfile::PiKvm,
         inputs: Default::default(),
         owed: Default::default(),
-        auth_headers: Default::default(),
+        auth: Default::default(),
         approval_token: Default::default(),
         snapshot_proven: Default::default(),
         video_proven: Default::default(),
@@ -1461,18 +1475,21 @@ async fn stream_validation_survives_cancelled_next_frame() {
             video: client,
             cookies: Default::default(),
         })),
-        config: Config {
-            endpoint: endpoint.clone(),
+        config: Endpoint {
+            label: None,
+            address: endpoint.clone(),
             profile: DeviceProfile::PiKvm,
-            trusted_ca_pem: None,
-            insecure_tls: false,
+            auth: AuthScheme::Session,
+            trust: ServerTrust::Verified {
+                additional_ca_pem: None,
+            },
             timeout: VIDEO_TIMEOUT,
         },
         endpoint,
         profile: DeviceProfile::PiKvm,
         inputs: Default::default(),
         owed: Default::default(),
-        auth_headers: Default::default(),
+        auth: Default::default(),
         approval_token: Default::default(),
         snapshot_proven: Default::default(),
         video_proven: Default::default(),
@@ -1528,18 +1545,21 @@ async fn concurrent_snapshots_exhaust_and_recover_storage() {
             video: client,
             cookies: Default::default(),
         })),
-        config: Config {
-            endpoint: endpoint.clone(),
+        config: Endpoint {
+            label: None,
+            address: endpoint.clone(),
             profile: DeviceProfile::PiKvm,
-            trusted_ca_pem: None,
-            insecure_tls: false,
+            auth: AuthScheme::Session,
+            trust: ServerTrust::Verified {
+                additional_ca_pem: None,
+            },
             timeout: VIDEO_TIMEOUT,
         },
         endpoint,
         profile: DeviceProfile::PiKvm,
         inputs: Default::default(),
         owed: Default::default(),
-        auth_headers: Default::default(),
+        auth: Default::default(),
         approval_token: Default::default(),
         snapshot_proven: Default::default(),
         video_proven: Default::default(),
@@ -1693,15 +1713,21 @@ async fn trusted_tls_login_cookie_reaches_lease_and_stream() {
         stream.write_all(&part(&jpeg(), true, true)).await.unwrap();
         watcher.await.unwrap();
     });
-    let device = Kvmd::new(Config {
-        endpoint: Url::parse(&format!("https://localhost:{}/proxy/", address.port())).unwrap(),
+    let device = Kvmd::new(Endpoint {
+        label: None,
+        address: Url::parse(&format!("https://localhost:{}/proxy/", address.port())).unwrap(),
         profile: DeviceProfile::PiKvm,
-        trusted_ca_pem: Some(cert.pem().into_bytes()),
-        insecure_tls: false,
+        auth: AuthScheme::Session,
+        trust: ServerTrust::Verified {
+            additional_ca_pem: Some(cert.pem()),
+        },
         timeout: VIDEO_TIMEOUT,
     })
     .unwrap();
-    device.login("test", "synthetic").await.unwrap();
+    device
+        .login(Credentials::new("test", "synthetic"))
+        .await
+        .unwrap();
     let mut video = device.video().await.unwrap();
     assert_eq!(video.next_frame().await.unwrap().unwrap().jpeg, jpeg());
     assert!(video.next_frame().await.unwrap().is_none());
@@ -1788,19 +1814,28 @@ async fn video_auth_headers(basic: bool) {
         stream.write_all(&part(&jpeg(), true, true)).await.unwrap();
         watcher.await.unwrap();
     });
-    let config = Config {
-        endpoint: Url::parse(&format!("https://localhost:{}/proxy/", address.port())).unwrap(),
+    let config = Endpoint {
+        label: None,
+        address: Url::parse(&format!("https://localhost:{}/proxy/", address.port())).unwrap(),
         profile: DeviceProfile::PiKvm,
-        trusted_ca_pem: Some(cert.pem().into_bytes()),
-        insecure_tls: false,
+        auth: if basic {
+            AuthScheme::Basic
+        } else {
+            AuthScheme::Header
+        },
+        trust: ServerTrust::Verified {
+            additional_ca_pem: Some(cert.pem()),
+        },
         timeout: VIDEO_TIMEOUT,
     };
-    let device = if basic {
-        Kvmd::with_basic_auth(config, "user", "pass")
-    } else {
-        Kvmd::with_header_auth(config, "user", "pass")
-    }
-    .unwrap();
+    let device = Kvmd::new(config).unwrap();
+    assert_eq!(
+        device
+            .login(Credentials::new("user", "pass"))
+            .await
+            .unwrap(),
+        LoginState::Unverified
+    );
     let mut video = device.video().await.unwrap();
     assert_eq!(video.next_frame().await.unwrap().unwrap().jpeg, jpeg());
     assert!(video.next_frame().await.unwrap().is_none());
@@ -1854,18 +1889,21 @@ async fn cancelled_partial_frame_can_resume() {
             video: client,
             cookies: Default::default(),
         })),
-        config: Config {
-            endpoint: Url::parse(&format!("http://{address}/proxy/")).unwrap(),
+        config: Endpoint {
+            label: None,
+            address: Url::parse(&format!("http://{address}/proxy/")).unwrap(),
             profile: DeviceProfile::PiKvm,
-            trusted_ca_pem: None,
-            insecure_tls: false,
+            auth: AuthScheme::Session,
+            trust: ServerTrust::Verified {
+                additional_ca_pem: None,
+            },
             timeout: VIDEO_TIMEOUT,
         },
         endpoint: Url::parse(&format!("http://{address}/proxy/")).unwrap(),
         profile: DeviceProfile::PiKvm,
         inputs: Default::default(),
         owed: Default::default(),
-        auth_headers: Default::default(),
+        auth: Default::default(),
         approval_token: Default::default(),
         snapshot_proven: Default::default(),
         video_proven: Default::default(),
@@ -1936,18 +1974,21 @@ async fn relogin_waits_for_video_establishment() {
             video: client,
             cookies: Default::default(),
         })),
-        config: Config {
-            endpoint: endpoint.clone(),
+        config: Endpoint {
+            label: None,
+            address: endpoint.clone(),
             profile: DeviceProfile::PiKvm,
-            trusted_ca_pem: None,
-            insecure_tls: false,
+            auth: AuthScheme::Session,
+            trust: ServerTrust::Verified {
+                additional_ca_pem: None,
+            },
             timeout: VIDEO_TIMEOUT,
         },
         endpoint,
         profile: DeviceProfile::PiKvm,
         inputs: Default::default(),
         owed: Default::default(),
-        auth_headers: Default::default(),
+        auth: Default::default(),
         approval_token: Default::default(),
         snapshot_proven: Default::default(),
         video_proven: Default::default(),
@@ -1964,7 +2005,8 @@ async fn relogin_waits_for_video_establishment() {
         .unwrap()
         .unwrap();
     let login_device = device.clone();
-    let login_task = tokio::spawn(async move { login_device.login("user", "pass").await });
+    let login_task =
+        tokio::spawn(async move { login_device.login(Credentials::new("user", "pass")).await });
     tokio::task::yield_now().await;
     assert!(
         tokio::time::timeout(Duration::from_millis(30), &mut login_wait)
@@ -2014,18 +2056,21 @@ async fn coalesced_http_response_delivers_multiple_frames() {
             video: client,
             cookies: Default::default(),
         })),
-        config: Config {
-            endpoint: Url::parse(&format!("http://{address}/proxy/")).unwrap(),
+        config: Endpoint {
+            label: None,
+            address: Url::parse(&format!("http://{address}/proxy/")).unwrap(),
             profile: DeviceProfile::PiKvm,
-            trusted_ca_pem: None,
-            insecure_tls: false,
+            auth: AuthScheme::Session,
+            trust: ServerTrust::Verified {
+                additional_ca_pem: None,
+            },
             timeout: VIDEO_TIMEOUT,
         },
         endpoint: Url::parse(&format!("http://{address}/proxy/")).unwrap(),
         profile: DeviceProfile::PiKvm,
         inputs: Default::default(),
         owed: Default::default(),
-        auth_headers: Default::default(),
+        auth: Default::default(),
         approval_token: Default::default(),
         snapshot_proven: Default::default(),
         video_proven: Default::default(),
@@ -2088,18 +2133,21 @@ async fn maximum_frame_with_maximum_headers_and_boundary() {
             video: client,
             cookies: Default::default(),
         })),
-        config: Config {
-            endpoint: endpoint.clone(),
+        config: Endpoint {
+            label: None,
+            address: endpoint.clone(),
             profile: DeviceProfile::PiKvm,
-            trusted_ca_pem: None,
-            insecure_tls: false,
+            auth: AuthScheme::Session,
+            trust: ServerTrust::Verified {
+                additional_ca_pem: None,
+            },
             timeout: Duration::from_secs(10),
         },
         endpoint,
         profile: DeviceProfile::PiKvm,
         inputs: Default::default(),
         owed: Default::default(),
-        auth_headers: Default::default(),
+        auth: Default::default(),
         approval_token: Default::default(),
         snapshot_proven: Default::default(),
         video_proven: Default::default(),

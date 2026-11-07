@@ -32,7 +32,7 @@ pub(crate) enum Read {
 }
 
 impl Kvmd {
-    /// Reads every state route with GET requests only, so reading status sends no input or control request. A connection failure (no connection or TLS session established within `Config::timeout`) fails the whole status at once, including after earlier routes were read, since the device can no longer be reached. A route that did not answer completely by its overall deadline (twice `Config::timeout` from sending), or whose body broke off, failed on its own, like one answering an error status; how such outcomes combine is described at [`parse`].
+    /// Reads every state route with GET requests only, so reading status sends no input or control request. A connection failure (no connection or TLS session established within `Endpoint::timeout`) fails the whole status at once, including after earlier routes were read, since the device can no longer be reached. A route that did not answer completely by its overall deadline (twice `Endpoint::timeout` from sending), or whose body broke off, failed on its own, like one answering an error status; how such outcomes combine is described at [`parse`].
     ///
     /// The session's read lock is held for the whole read, so every route is read with one session's credentials and the status describes one session. A login waits behind it, at most seven routes' deadlines; the read is not cut short sooner, because that would drop the slow routes of a healthy device. A login waiting there already holds the inputs lock, so key and mouse calls and `release_inputs` wait behind it too; that blocks no input in progress, since a login is refused while keys or buttons are held.
     pub(crate) async fn read_status(&self) -> Result<DeviceStatus> {

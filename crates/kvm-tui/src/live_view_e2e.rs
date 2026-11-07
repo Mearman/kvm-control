@@ -1,4 +1,4 @@
-//! Live view end to end: the real `kvm_kvmd::Kvmd` adapter talks TLS, cookie authentication, the
+//! Live view end to end: the real `kvm_kvmd::Kvmd` adapter, connected through `kvm_core::Connector`, talks TLS, cookie authentication, the
 //! WebSocket lease and the multipart JPEG stream to a synthetic device, and `run_loop` renders the
 //! frames it yields into a `TestBackend` buffer using the character-cell (halfblocks) fallback.
 //!
@@ -14,8 +14,10 @@ use axum::{
     routing::{get, post},
 };
 use axum_server::tls_rustls::RustlsConfig;
-use kvm_core::DeviceProfile;
-use kvm_kvmd::{Config, Kvmd, LoginState};
+use kvm_core::{
+    AuthScheme, Connected, Connection, Connector, Credentials, DeviceProfile, Endpoint, ServerTrust,
+};
+use kvm_kvmd::KvmdConnector;
 use ratatui::{backend::TestBackend, style::Color};
 use serde_json::json;
 use std::{
@@ -140,7 +142,7 @@ async fn stream(State(fixture): State<Fixture>) -> impl IntoResponse {
 }
 
 struct SyntheticDevice {
-    adapter: std::sync::Arc<Kvmd>,
+    adapter: std::sync::Arc<dyn Connection>,
     calls: Arc<Mutex<Vec<String>>>,
     frames: UnboundedSender<Vec<u8>>,
     server: tokio::task::JoinHandle<()>,
@@ -192,20 +194,27 @@ async fn synthetic_device() -> SyntheticDevice {
             .await
             .unwrap();
     });
-    let adapter = Kvmd::new(Config {
-        endpoint: Url::parse(&format!("https://localhost:{port}/")).unwrap(),
-        profile: DeviceProfile::PiKvm,
-        trusted_ca_pem: Some(ca),
-        insecure_tls: false,
-        timeout: Duration::from_secs(5),
-    })
-    .unwrap();
-    assert_eq!(
-        adapter.login("test-user", "test-password").await.unwrap(),
-        LoginState::Authenticated
-    );
+    let connected = KvmdConnector
+        .connect(
+            Endpoint {
+                label: None,
+                address: Url::parse(&format!("https://localhost:{port}/")).unwrap(),
+                profile: DeviceProfile::PiKvm,
+                auth: AuthScheme::Session,
+                trust: ServerTrust::Verified {
+                    additional_ca_pem: Some(String::from_utf8(ca).unwrap()),
+                },
+                timeout: Duration::from_secs(5),
+            },
+            Credentials::new("test-user", "test-password"),
+        )
+        .await
+        .unwrap();
+    let Connected::Authenticated(adapter) = connected else {
+        panic!("the synthetic device requires no approval");
+    };
     SyntheticDevice {
-        adapter: std::sync::Arc::new(adapter),
+        adapter,
         calls,
         frames,
         server,

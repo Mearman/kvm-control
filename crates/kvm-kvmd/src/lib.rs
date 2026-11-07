@@ -24,8 +24,10 @@ mod video_tests;
 
 use async_trait::async_trait;
 use kvm_core::{
-    Capabilities, Capability, Confirmation, Control, ControlOutcome, Device, DeviceProfile,
-    DeviceStatus, Error, MouseMode, PowerAction, Result, Snapshot,
+    AuthScheme, Authenticate, CallerIdentity, Capabilities, Capability, Confirmation, Connection,
+    Connector, Control, ControlOutcome, Credentials, Device, DeviceIdentity, DeviceProfile,
+    DeviceStatus, Endpoint, Error, LoginState, MouseMode, PowerAction, Result, Secret, ServerTrust,
+    Snapshot,
 };
 use reqwest::{Client, Method, StatusCode};
 use tokio::sync::{Mutex, RwLock};
@@ -242,7 +244,7 @@ fn validate_jpeg(bytes: &[u8]) -> Result<Vec<u8>> {
     Ok(stripped)
 }
 
-/// A failed request, with whether the connection itself failed (no connection or no TLS session could be established within `Config::timeout`) rather than this one request (an error status, no complete response by the request's overall deadline, a body that broke off or could not be parsed, or a reused connection that had closed).
+/// A failed request, with whether the connection itself failed (no connection or no TLS session could be established within `Endpoint::timeout`) rather than this one request (an error status, no complete response by the request's overall deadline, a body that broke off or could not be parsed, or a reused connection that had closed).
 pub(crate) struct RequestFailure {
     pub(crate) error: Error,
     pub(crate) connection: bool,
@@ -276,23 +278,18 @@ fn request_error(context: &'static str, error: &reqwest::Error) -> Error {
     Error::Transport(format!("{context}: {kind}"))
 }
 
-/// Connection parameters. Credentials are supplied separately and are never formatted for logs.
-#[derive(Clone)]
-pub struct Config {
-    /// HTTPS device origin or reverse-proxy prefix; the adapter appends `api/`.
-    pub endpoint: Url,
-    pub profile: DeviceProfile,
-    pub trusted_ca_pem: Option<Vec<u8>>,
-    pub insecure_tls: bool,
-    /// The connection (TCP and TLS) must be established within this, and the whole request, response included, ends within twice it, measured from when it is sent. A response on a connection that is reused, or one that was quick to establish, can therefore take up to twice this. Live video has no overall deadline. Bounding the connection on its own is what lets a device that cannot be reached be told apart from one that is slow to answer.
-    pub timeout: Duration,
+/// The credentials the current session sends with each request, and the caller they belong to. Replaced as a whole while the session's write lock is held, so a request holding the read lock sees one session's credentials.
+#[derive(Default)]
+struct SessionAuth {
+    /// KVMD or HTTP Basic authentication headers under a per-request scheme; empty under session login, whose credential is the cookie.
+    headers: reqwest::header::HeaderMap,
+    caller: Option<CallerIdentity>,
 }
 
-/// Result of the device's explicit two-step login response.
-#[derive(Debug, PartialEq, Eq)]
-pub enum LoginState {
-    Authenticated,
-    ApprovalPending { expires_in: Option<u64> },
+/// A login the device holds for approval: the temporary token, which is never exposed, and the caller to record once it is approved.
+struct PendingApproval {
+    token: String,
+    caller: CallerIdentity,
 }
 
 // Bounds memory consumed by untrusted JSON responses while allowing device inventory data.
@@ -359,12 +356,13 @@ impl reqwest::cookie::CookieStore for SessionCookies {
 /// Cookies are accepted only from login or approval responses. Later `Set-Cookie` headers, including rotation and expiry updates, are ignored. The inspected [PiKVM](https://github.com/pikvm/kvmd/blob/fcb903eb3be70d8eee4aee99e5fcc1c743e3ccef/kvmd/apps/kvmd/api/auth.py) and [GLKVM](https://github.com/gl-inet/glkvm/blob/3e8dd23c4bd638a4650433664cc3b0f3b4d29395/kvmd/apps/kvmd/api/auth.py) revisions issue authentication cookies on login, and GLKVM also issues them on approval. Other firmware requiring cookie rotation is not supported. Server-side expiry or revocation can return an authentication error; call `login` again with fresh credentials and complete any approval. Consequential and input requests are never automatically replayed, and ambiguous outcomes require observation before a caller decides what to do.
 pub struct Kvmd {
     client: Arc<RwLock<Session>>,
-    config: Config,
+    /// The endpoint the adapter was opened with. Its timeout bounds the connection (TCP and TLS), which must be established within it, and the whole request, response included, which ends within twice it, measured from when it is sent; a response on a connection that is reused, or one that was quick to establish, can therefore take up to twice it. Live video has no overall deadline. Bounding the connection on its own is what lets a device that cannot be reached be told apart from one that is slow to answer.
+    config: Endpoint,
     endpoint: Url,
     profile: DeviceProfile,
     inputs: Arc<Mutex<Inputs>>,
-    auth_headers: reqwest::header::HeaderMap,
-    approval_token: Mutex<Option<String>>,
+    auth: Arc<std::sync::RwLock<SessionAuth>>,
+    approval_token: Mutex<Option<PendingApproval>>,
     snapshot_proven: AtomicBool,
     video_proven: Arc<AtomicBool>,
     cleanup_on_drop: bool,
@@ -680,28 +678,31 @@ impl Kvmd {
         Ok(Snapshot { jpeg })
     }
 
-    /// Builds a client without contacting the device. TLS verification is enabled unless explicitly disabled.
-    pub fn new(config: Config) -> Result<Self> {
-        if config.endpoint.scheme() != "https"
-            || config.endpoint.host_str().is_none()
-            || !config.endpoint.username().is_empty()
-            || config.endpoint.password().is_some()
-            || config.endpoint.query().is_some()
-            || config.endpoint.fragment().is_some()
+    /// Builds an adapter for `endpoint` without contacting the device. TLS verification is enabled unless the endpoint's trust is `ServerTrust::Disabled`.
+    ///
+    /// The address must be an HTTPS URL without credentials, a query or a fragment, and an additional CA must be a valid PEM certificate; anything else is `Error::InvalidResponse`. The adapter is unauthenticated until [`Authenticate::login`] succeeds. Every [`AuthScheme`] is supported.
+    pub fn new(endpoint: Endpoint) -> Result<Self> {
+        let address = &endpoint.address;
+        if address.scheme() != "https"
+            || address.host_str().is_none()
+            || !address.username().is_empty()
+            || address.password().is_some()
+            || address.query().is_some()
+            || address.fragment().is_some()
         {
             return Err(Error::InvalidResponse(
                 "endpoint must be an HTTPS URL without credentials, query or fragment".into(),
             ));
         }
-        let client = Self::build_client(&config)?;
+        let client = Self::build_client(&endpoint)?;
         client.cookies.sealed.store(true, Ordering::Release);
         Ok(Self {
             client: Arc::new(RwLock::new(client)),
-            endpoint: config.endpoint.clone(),
-            profile: config.profile,
-            config,
+            endpoint: endpoint.address.clone(),
+            profile: endpoint.profile,
+            config: endpoint,
             inputs: Arc::new(Mutex::new(Inputs::default())),
-            auth_headers: reqwest::header::HeaderMap::new(),
+            auth: Default::default(),
             approval_token: Mutex::new(None),
             snapshot_proven: AtomicBool::new(false),
             video_proven: Arc::new(AtomicBool::new(false)),
@@ -716,7 +717,11 @@ impl Kvmd {
         })
     }
 
-    fn build_client(config: &Config) -> Result<Session> {
+    fn build_client(config: &Endpoint) -> Result<Session> {
+        let (insecure, additional_ca_pem) = match &config.trust {
+            ServerTrust::Verified { additional_ca_pem } => (false, additional_ca_pem.as_deref()),
+            ServerTrust::Disabled => (true, None),
+        };
         let cookies = Arc::new(SessionCookies::default());
         let build = |limited: bool| -> Result<Client> {
             let mut builder = Client::builder()
@@ -725,13 +730,13 @@ impl Kvmd {
                 .http1_only()
                 .retry(reqwest::retry::never())
                 .redirect(reqwest::redirect::Policy::none())
-                .danger_accept_invalid_certs(config.insecure_tls);
+                .danger_accept_invalid_certs(insecure);
             if limited {
                 // Twice the connect deadline: reqwest starts this deadline when the request is sent, before connecting, so equal deadlines would let it fire first and report a stalled connection as an ordinary timeout.
                 builder = builder.timeout(config.timeout.saturating_add(config.timeout));
             }
-            if let Some(pem) = &config.trusted_ca_pem {
-                let ca = reqwest::Certificate::from_pem(pem)
+            if let Some(pem) = additional_ca_pem {
+                let ca = reqwest::Certificate::from_pem(pem.as_bytes())
                     .map_err(|_| Error::InvalidResponse("invalid CA certificate".into()))?;
                 builder = builder.add_root_certificate(ca);
             }
@@ -746,66 +751,105 @@ impl Kvmd {
         })
     }
 
-    /// Builds a client with credentials sent in KVMD's authentication headers.
-    pub fn with_header_auth(config: Config, username: &str, password: &str) -> Result<Self> {
+    /// The authentication headers the current session sends with each request.
+    fn auth_headers(&self) -> reqwest::header::HeaderMap {
+        self.auth
+            .read()
+            .expect("authentication lock poisoned")
+            .headers
+            .clone()
+    }
+
+    /// Replaces the session's credentials; called with the session's write lock held.
+    fn set_auth(&self, auth: SessionAuth) {
+        *self.auth.write().expect("authentication lock poisoned") = auth;
+    }
+
+    /// Refuses a one-time code under a per-request scheme, which would send the same expiring code with every request.
+    fn per_request(credentials: &Credentials) -> Result<()> {
+        if credentials.totp.is_some() {
+            return Err(Error::InvalidResponse(
+                "a one-time code requires session login; per-request credentials would reuse it"
+                    .into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// KVMD's authentication headers for `credentials`, marked sensitive so they are not formatted in debug output.
+    fn header_credentials(credentials: &Credentials) -> Result<reqwest::header::HeaderMap> {
         use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
-        let mut device = Self::new(config)?;
+        Self::per_request(credentials)?;
         let mut headers = HeaderMap::new();
-        for (name, value) in [("x-kvmd-user", username), ("x-kvmd-passwd", password)] {
+        for (name, value) in [
+            ("x-kvmd-user", credentials.caller.username.as_str()),
+            ("x-kvmd-passwd", credentials.password.expose()),
+        ] {
             let mut value = HeaderValue::from_str(value)
                 .map_err(|_| Error::InvalidResponse("invalid authentication header".into()))?;
             value.set_sensitive(true);
             headers.insert(HeaderName::from_static(name), value);
         }
-        // Rebuilding here would lose the configured CA and TLS policy, so headers are held by the device instead.
-        device.auth_headers = headers;
-        Ok(device)
+        Ok(headers)
     }
 
-    /// Builds a client using HTTP Basic authentication over the configured HTTPS connection.
-    pub fn with_basic_auth(config: Config, username: &str, password: &str) -> Result<Self> {
+    /// An HTTP Basic `Authorization` header for `credentials`, marked sensitive.
+    fn basic_credentials(credentials: &Credentials) -> Result<reqwest::header::HeaderMap> {
         use base64::Engine;
+        Self::per_request(credentials)?;
+        let username = credentials.caller.username.as_str();
+        let password = credentials.password.expose();
         if username.contains(':') || password.contains(':') {
             return Err(Error::InvalidResponse(
                 "Basic credentials cannot contain colons".into(),
             ));
         }
-        let mut device = Self::new(config)?;
+        let pair = zeroize::Zeroizing::new(format!("{username}:{password}"));
         let encoded =
-            base64::engine::general_purpose::STANDARD.encode(format!("{username}:{password}"));
-        let mut header = reqwest::header::HeaderValue::from_str(&format!("Basic {encoded}"))
-            .map_err(|_| Error::InvalidResponse("invalid Basic credentials".into()))?;
+            zeroize::Zeroizing::new(base64::engine::general_purpose::STANDARD.encode(&*pair));
+        let mut header =
+            reqwest::header::HeaderValue::from_str(&format!("Basic {}", encoded.as_str()))
+                .map_err(|_| Error::InvalidResponse("invalid Basic credentials".into()))?;
         header.set_sensitive(true);
-        device
-            .auth_headers
-            .insert(reqwest::header::AUTHORIZATION, header);
-        Ok(device)
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(reqwest::header::AUTHORIZATION, header);
+        Ok(headers)
     }
 
-    /// Checks whether the server accepts the configured authentication.
-    pub async fn check_auth(&self) -> Result<()> {
-        self.json("auth/check").await.map(|_| ())
-    }
-
-    /// Returns the explicitly selected device profile.
-    pub fn profile(&self) -> DeviceProfile {
-        self.profile
-    }
-
-    /// Authenticates using KVMD's cookie login. Rejection does not identify whether TOTP is required. Tracked inputs must first be released; an ambiguous release permits reauthentication but leaves the input session indeterminate.
-    pub async fn login(&self, username: &str, password: &str) -> Result<LoginState> {
-        self.login_with_totp(username, password, None).await
-    }
-
-    /// Authenticates with an optional current six-digit TOTP code, appended to the password for KVMD. A fresh code is required for each new login.
-    pub async fn login_with_totp(
+    /// Installs per-request credentials without contacting the device, after the same held-input check as a session login. Any pending approval is discarded.
+    async fn install_headers(
         &self,
-        username: &str,
-        password: &str,
-        totp: Option<&str>,
+        caller: CallerIdentity,
+        headers: reqwest::header::HeaderMap,
     ) -> Result<LoginState> {
-        let mut credential = zeroize::Zeroizing::new(password.to_owned());
-        if let Some(code) = totp {
+        let mut inputs = self.settled_inputs().await?;
+        if !inputs.keys.is_empty() || !inputs.buttons.is_empty() {
+            return Err(Error::AmbiguousInput(
+                "release tracked inputs before changing authentication".into(),
+            ));
+        }
+        let mut pending = self.approval_token.lock().await;
+        *pending = None;
+        let _active = self.client.write().await;
+        self.set_auth(SessionAuth {
+            headers,
+            caller: Some(caller),
+        });
+        // A release skipped because cleanup already sent it belongs to the credentials just replaced.
+        inputs.cleaned.clear();
+        Ok(LoginState::Unverified)
+    }
+
+    /// Authenticates using KVMD's cookie login, with a current six-digit TOTP code appended to the password when one is given.
+    async fn session_login(&self, credentials: Credentials) -> Result<LoginState> {
+        let Credentials {
+            caller,
+            password,
+            totp,
+        } = credentials;
+        let mut credential = zeroize::Zeroizing::new(password.expose().to_owned());
+        drop(password);
+        if let Some(code) = totp.as_ref().map(Secret::expose) {
             if code.len() != 6 || !code.bytes().all(|byte| byte.is_ascii_digit()) {
                 return Err(Error::InvalidResponse(
                     "TOTP must contain six ASCII digits".into(),
@@ -818,11 +862,7 @@ impl Kvmd {
                 ));
             }
         }
-        if !self.auth_headers.is_empty() {
-            return Err(Error::InvalidResponse(
-                "cookie login cannot replace configured header credentials".into(),
-            ));
-        }
+        drop(totp);
         let mut inputs = self.settled_inputs().await?;
         if !inputs.keys.is_empty() || !inputs.buttons.is_empty() {
             return Err(Error::AmbiguousInput(
@@ -835,6 +875,7 @@ impl Kvmd {
         let empty = Self::build_client(&self.config)?;
         empty.cookies.sealed.store(true, Ordering::Release);
         *active = empty;
+        self.set_auth(SessionAuth::default());
         // A release skipped because cleanup already sent it belongs to the session just replaced.
         inputs.cleaned.clear();
         let candidate = Self::build_client(&self.config)?;
@@ -842,7 +883,10 @@ impl Kvmd {
         let response = candidate
             .client
             .post(url)
-            .form(&[("user", username), ("passwd", credential.as_str())])
+            .form(&[
+                ("user", caller.username.as_str()),
+                ("passwd", credential.as_str()),
+            ])
             .send()
             .await
             .map_err(|error| request_error("login", &error))?;
@@ -873,7 +917,10 @@ impl Kvmd {
                 .get("expires_in")
                 .and_then(serde_json::Value::as_u64)
                 .ok_or_else(|| Error::InvalidResponse("missing approval expiry".into()))?;
-            *pending = Some(token.to_owned());
+            *pending = Some(PendingApproval {
+                token: token.to_owned(),
+                caller,
+            });
             return Ok(LoginState::ApprovalPending {
                 expires_in: Some(expires_in),
             });
@@ -881,61 +928,10 @@ impl Kvmd {
         candidate.cookies.sealed.store(true, Ordering::Release);
         self.verify_client(&candidate.client).await?;
         *active = candidate;
-        Ok(LoginState::Authenticated)
-    }
-
-    /// Checks a pending GLKVM approval without exposing its temporary token.
-    pub async fn complete_approval(&self) -> Result<LoginState> {
-        if self.profile != DeviceProfile::GlKvm {
-            return Err(Error::Unsupported(
-                "device approval requires the GLKVM profile".into(),
-            ));
-        }
-        let mut inputs = self.settled_inputs().await?;
-        if !inputs.keys.is_empty() || !inputs.buttons.is_empty() {
-            return Err(Error::AmbiguousInput(
-                "release tracked inputs before changing authentication".into(),
-            ));
-        }
-        let mut pending = self.approval_token.lock().await;
-        let token = pending
-            .as_ref()
-            .ok_or_else(|| Error::InvalidResponse("no approval is pending".into()))?;
-        let mut active = self.client.write().await;
-        let candidate = Self::build_client(&self.config)?;
-        let response = candidate
-            .client
-            .post(self.url("auth/two_step_complete")?)
-            .form(&[("two_step_token", token)])
-            .send()
-            .await
-            .map_err(|error| request_error("approval", &error))?;
-        Self::check(response.status())?;
-        let body = bounded_json(response).await?;
-        if body.get("ok").and_then(serde_json::Value::as_bool) != Some(true) {
-            return Err(Error::Authentication);
-        }
-        let result = body
-            .get("result")
-            .ok_or_else(|| Error::InvalidResponse("missing approval result".into()))?;
-        if result.get("status").and_then(serde_json::Value::as_str) == Some("pending") {
-            return Ok(LoginState::ApprovalPending { expires_in: None });
-        }
-        if result
-            .get("token")
-            .and_then(serde_json::Value::as_str)
-            .is_none_or(str::is_empty)
-        {
-            return Err(Error::InvalidResponse(
-                "missing approved session token".into(),
-            ));
-        }
-        candidate.cookies.sealed.store(true, Ordering::Release);
-        self.verify_client(&candidate.client).await?;
-        *active = candidate;
-        *pending = None;
-        // A release skipped because cleanup already sent it belongs to the session just replaced.
-        inputs.cleaned.clear();
+        self.set_auth(SessionAuth {
+            headers: reqwest::header::HeaderMap::new(),
+            caller: Some(caller),
+        });
         Ok(LoginState::Authenticated)
     }
 
@@ -990,7 +986,7 @@ impl Kvmd {
     ) -> std::result::Result<reqwest::Response, RequestFailure> {
         let response = active
             .get(self.url(path).map_err(RequestFailure::request)?)
-            .headers(self.auth_headers.clone())
+            .headers(self.auth_headers())
             .send()
             .await
             .map_err(|error| RequestFailure::sending("device request", &error))?;
@@ -1062,7 +1058,7 @@ impl Kvmd {
             endpoint: self.endpoint.clone(),
             profile: self.profile,
             inputs: self.inputs.clone(),
-            auth_headers: self.auth_headers.clone(),
+            auth: self.auth.clone(),
             approval_token: Mutex::new(None),
             snapshot_proven: AtomicBool::new(false),
             video_proven: self.video_proven.clone(),
@@ -1328,7 +1324,7 @@ impl Kvmd {
     ) -> Result<()> {
         let response = active
             .request(Method::POST, self.url(path)?)
-            .headers(self.auth_headers.clone())
+            .headers(self.auth_headers())
             .query(params)
             .send()
             .await
@@ -1381,6 +1377,132 @@ fn mouse_mode(state: &serde_json::Value) -> MouseMode {
         Some(true) => MouseMode::Absolute,
         Some(false) => MouseMode::Relative,
         None => MouseMode::Unknown,
+    }
+}
+
+/// KVMD authentication under the endpoint's [`AuthScheme`].
+///
+/// `Session` is KVMD's cookie login, with an optional six-digit TOTP code appended to the password and, under the GLKVM profile, a device approval flow; rejection does not identify whether TOTP is required, and a fresh code is required for each login. `Header` and `Basic` install credentials that are sent with every request, without contacting the device, so their login returns `LoginState::Unverified` until `check_auth` confirms them; neither accepts a one-time code.
+///
+/// Every login first sends releases owed to earlier interrupted or abandoned presses, and is refused with `Error::AmbiguousInput` while tracked inputs are held; an ambiguous release permits reauthentication but leaves the input session indeterminate. Once its local checks and the held-input check pass, a login discards the current session and any pending approval before sending its request, so a login that fails after that point leaves the adapter unauthenticated; one rejected by those checks, such as for a malformed TOTP code or held inputs, keeps the old session.
+#[async_trait]
+impl Authenticate for Kvmd {
+    async fn login(&self, credentials: Credentials) -> Result<LoginState> {
+        match self.config.auth {
+            AuthScheme::Session => self.session_login(credentials).await,
+            AuthScheme::Header => {
+                let headers = Self::header_credentials(&credentials)?;
+                self.install_headers(credentials.caller, headers).await
+            }
+            AuthScheme::Basic => {
+                let headers = Self::basic_credentials(&credentials)?;
+                self.install_headers(credentials.caller, headers).await
+            }
+        }
+    }
+
+    /// Checks a pending GLKVM approval without exposing its temporary token.
+    async fn complete_approval(&self) -> Result<LoginState> {
+        if self.profile != DeviceProfile::GlKvm {
+            return Err(Error::Unsupported(
+                "device approval requires the GLKVM profile".into(),
+            ));
+        }
+        if self.config.auth != AuthScheme::Session {
+            return Err(Error::Unsupported(
+                "device approval requires session login".into(),
+            ));
+        }
+        let mut inputs = self.settled_inputs().await?;
+        if !inputs.keys.is_empty() || !inputs.buttons.is_empty() {
+            return Err(Error::AmbiguousInput(
+                "release tracked inputs before changing authentication".into(),
+            ));
+        }
+        let mut pending = self.approval_token.lock().await;
+        let approval = pending
+            .as_ref()
+            .ok_or_else(|| Error::InvalidResponse("no approval is pending".into()))?;
+        let mut active = self.client.write().await;
+        let candidate = Self::build_client(&self.config)?;
+        let response = candidate
+            .client
+            .post(self.url("auth/two_step_complete")?)
+            .form(&[("two_step_token", approval.token.as_str())])
+            .send()
+            .await
+            .map_err(|error| request_error("approval", &error))?;
+        Self::check(response.status())?;
+        let body = bounded_json(response).await?;
+        if body.get("ok").and_then(serde_json::Value::as_bool) != Some(true) {
+            return Err(Error::Authentication);
+        }
+        let result = body
+            .get("result")
+            .ok_or_else(|| Error::InvalidResponse("missing approval result".into()))?;
+        if result.get("status").and_then(serde_json::Value::as_str) == Some("pending") {
+            return Ok(LoginState::ApprovalPending { expires_in: None });
+        }
+        if result
+            .get("token")
+            .and_then(serde_json::Value::as_str)
+            .is_none_or(str::is_empty)
+        {
+            return Err(Error::InvalidResponse(
+                "missing approved session token".into(),
+            ));
+        }
+        candidate.cookies.sealed.store(true, Ordering::Release);
+        self.verify_client(&candidate.client).await?;
+        *active = candidate;
+        self.set_auth(SessionAuth {
+            headers: reqwest::header::HeaderMap::new(),
+            caller: pending.take().map(|approval| approval.caller),
+        });
+        // A release skipped because cleanup already sent it belongs to the session just replaced.
+        inputs.cleaned.clear();
+        Ok(LoginState::Authenticated)
+    }
+
+    /// Checks whether the device accepts the current credentials or session with a read of its authentication check route.
+    async fn check_auth(&self) -> Result<()> {
+        self.json("auth/check").await.map(|_| ())
+    }
+
+    fn caller(&self) -> Option<CallerIdentity> {
+        self.auth
+            .read()
+            .expect("authentication lock poisoned")
+            .caller
+            .clone()
+    }
+}
+
+#[async_trait]
+impl Connection for Kvmd {
+    fn endpoint(&self) -> &Endpoint {
+        &self.config
+    }
+
+    /// Reads status and combines its reported serial number and host name with the endpoint. The address counts as verified when TLS verification is enabled, since every request then authenticated the server's certificate for the address's host.
+    async fn identity(&self) -> Result<DeviceIdentity> {
+        let status = self.status().await?;
+        Ok(DeviceIdentity::observe(
+            &self.config,
+            matches!(self.config.trust, ServerTrust::Verified { .. }),
+            &status,
+        ))
+    }
+}
+
+/// Opens [`Kvmd`] connections: `open` is [`Kvmd::new`], which validates the endpoint and builds the HTTPS clients without contacting the device.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct KvmdConnector;
+
+#[async_trait]
+impl Connector for KvmdConnector {
+    async fn open(&self, endpoint: Endpoint) -> Result<Arc<dyn Connection>> {
+        Ok(Arc::new(Kvmd::new(endpoint)?))
     }
 }
 
@@ -1910,17 +2032,20 @@ mod tests {
                 video: client,
                 cookies: Default::default(),
             })),
-            config: Config {
-                endpoint: endpoint.clone(),
+            config: Endpoint {
+                label: None,
+                address: endpoint.clone(),
                 profile: DeviceProfile::PiKvm,
-                trusted_ca_pem: None,
-                insecure_tls: false,
+                auth: AuthScheme::Session,
+                trust: ServerTrust::Verified {
+                    additional_ca_pem: None,
+                },
                 timeout: Duration::from_secs(3),
             },
             endpoint,
             profile: DeviceProfile::PiKvm,
             inputs: Default::default(),
-            auth_headers: Default::default(),
+            auth: Default::default(),
             approval_token: Default::default(),
             snapshot_proven: Default::default(),
             video_proven: Default::default(),
@@ -1969,7 +2094,7 @@ mod tests {
             endpoint,
             profile: DeviceProfile::PiKvm,
             inputs: Default::default(),
-            auth_headers: Default::default(),
+            auth: Default::default(),
             approval_token: Default::default(),
             snapshot_proven: Default::default(),
             video_proven: Default::default(),
@@ -1994,12 +2119,15 @@ mod tests {
         server.await.unwrap();
     }
 
-    fn config(endpoint: &str) -> Config {
-        Config {
-            endpoint: Url::parse(endpoint).unwrap(),
+    fn config(endpoint: &str) -> Endpoint {
+        Endpoint {
+            label: None,
+            address: Url::parse(endpoint).unwrap(),
             profile: DeviceProfile::PiKvm,
-            trusted_ca_pem: None,
-            insecure_tls: false,
+            auth: AuthScheme::Session,
+            trust: ServerTrust::Verified {
+                additional_ca_pem: None,
+            },
             timeout: Duration::from_secs(5),
         }
     }

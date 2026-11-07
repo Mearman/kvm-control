@@ -5,19 +5,22 @@ use std::{
     time::Duration,
 };
 
-use kvm_core::{Capability, DeviceProfile, MouseMode};
+use kvm_core::{AuthScheme, Capability, DeviceProfile, Endpoint, MouseMode, ServerTrust};
 use proptest::{collection::vec, prelude::*};
 use serde_json::{Value, json};
 use url::Url;
 
-use super::{Config, Held, InFlight, Inputs, Kvmd, hid_capability, mouse_mode};
+use super::{Held, InFlight, Inputs, Kvmd, hid_capability, mouse_mode};
 
-fn config(endpoint: Url) -> Config {
-    Config {
-        endpoint,
+fn config(endpoint: Url) -> Endpoint {
+    Endpoint {
+        label: None,
+        address: endpoint,
         profile: DeviceProfile::PiKvm,
-        trusted_ca_pem: None,
-        insecure_tls: false,
+        auth: AuthScheme::Session,
+        trust: ServerTrust::Verified {
+            additional_ca_pem: None,
+        },
         timeout: Duration::from_secs(5),
     }
 }
