@@ -1034,11 +1034,65 @@ impl Drop for InputCleanup {
     }
 }
 
-fn terminal_capabilities() -> io::Result<(ratatui_image::picker::Picker, bool)> {
-    use ratatui_image::picker::{Picker, ProtocolType};
+struct ImagePicker {
+    cell_size: (u16, u16),
+    protocol: ratatui_image::picker::ProtocolType,
+    tmux: bool,
+}
+
+impl ImagePicker {
+    #[cfg(test)]
+    fn halfblocks() -> Self {
+        Self {
+            cell_size: (10, 20),
+            protocol: ratatui_image::picker::ProtocolType::Halfblocks,
+            tmux: false,
+        }
+    }
+
+    fn new_resize_protocol(
+        &self,
+        image: image::DynamicImage,
+    ) -> ratatui_image::protocol::StatefulProtocol {
+        use ratatui_image::picker::ProtocolType;
+        use ratatui_image::protocol::{ImageSource, StatefulProtocol, StatefulProtocolType};
+        let kind = match self.protocol {
+            ProtocolType::Halfblocks => StatefulProtocolType::Halfblocks(Default::default()),
+            ProtocolType::Sixel => {
+                StatefulProtocolType::Sixel(ratatui_image::protocol::sixel::Sixel {
+                    is_tmux: self.tmux,
+                    ..Default::default()
+                })
+            }
+            ProtocolType::Iterm2 => {
+                StatefulProtocolType::ITerm2(ratatui_image::protocol::iterm2::Iterm2 {
+                    is_tmux: self.tmux,
+                    ..Default::default()
+                })
+            }
+            ProtocolType::Kitty => {
+                static NEXT_ID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
+                let id = NEXT_ID
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                    .wrapping_add(std::process::id().rotate_left(16));
+                StatefulProtocolType::Kitty(ratatui_image::protocol::kitty::StatefulKitty::new(
+                    id, self.tmux,
+                ))
+            }
+        };
+        StatefulProtocol::new(
+            ImageSource::new(image, self.cell_size, image::Rgba([0, 0, 0, 0])),
+            self.cell_size,
+            kind,
+        )
+    }
+}
+
+fn terminal_capabilities() -> io::Result<(ImagePicker, bool)> {
+    use ratatui_image::picker::ProtocolType;
     let term = std::env::var("TERM").unwrap_or_default();
     let program = std::env::var("TERM_PROGRAM").unwrap_or_default();
-    let tmux = std::env::var_os("TMUX").is_some();
+    let tmux = std::env::var_os("TMUX").is_some() || term.starts_with("tmux") || program == "tmux";
     let protocol = match std::env::var("KVM_TUI_IMAGE_PROTOCOL").as_deref() {
         Ok("halfblocks") => ProtocolType::Halfblocks,
         Ok("kitty") => ProtocolType::Kitty,
@@ -1053,21 +1107,26 @@ fn terminal_capabilities() -> io::Result<(ratatui_image::picker::Picker, bool)> 
         Err(_) => return Err(io::Error::other("invalid KVM_TUI_IMAGE_PROTOCOL encoding")),
     };
     let enhanced = !tmux && matches!(term.as_str(), "xterm-kitty" | "xterm-ghostty" | "wezterm");
-    // Pixel dimensions are optional in the terminal ioctl; the library's halfblock picker supplies its default cell size when absent.
-    let mut picker = match crossterm::terminal::window_size() {
+    // Terminal ioctls may omit pixel dimensions; use the image library's default cell size in that case.
+    let cell_size = match crossterm::terminal::window_size() {
         Ok(size)
             if size.columns > 0
                 && size.rows > 0
                 && size.width >= size.columns
                 && size.height >= size.rows =>
         {
-            #[allow(deprecated)]
-            Picker::from_fontsize((size.width / size.columns, size.height / size.rows))
+            (size.width / size.columns, size.height / size.rows)
         }
-        _ => Picker::halfblocks(),
+        _ => (10, 20),
     };
-    picker.set_protocol_type(protocol);
-    Ok((picker, enhanced))
+    Ok((
+        ImagePicker {
+            cell_size,
+            protocol,
+            tmux,
+        },
+        enhanced,
+    ))
 }
 
 /// Runs the TUI for an already authenticated device. Cancellation schedules best-effort input release while the runtime remains active.
@@ -1138,7 +1197,7 @@ async fn wait_for_termination<F: std::future::Future<Output = io::Result<()>>>(
 async fn run_loop<B: Backend>(
     terminal: &mut Terminal<B>,
     device: &dyn Device,
-    picker: &ratatui_image::picker::Picker,
+    picker: &ImagePicker,
     enhanced: bool,
     mut next_event: impl FnMut(&Terminal<B>) -> io::Result<Option<Event>>,
 ) -> io::Result<()>
@@ -1147,7 +1206,7 @@ where
 {
     let mut app = App {
         enhanced_keyboard: enhanced,
-        cell_size: picker.font_size(),
+        cell_size: picker.cell_size,
         ..App::default()
     };
     app.refresh(device).await;
@@ -1161,6 +1220,7 @@ where
         }
     }
     let mut stream: Option<StreamTask> = None;
+    let mut image_protocol: Option<ratatui_image::protocol::StatefulProtocol> = None;
     let mut control_request: Option<
         std::pin::Pin<
             Box<dyn std::future::Future<Output = kvm_core::Result<kvm_core::ControlOutcome>> + '_>,
@@ -1212,7 +1272,11 @@ where
                         image::ImageFormat::Jpeg,
                     ) {
                         Ok(image) => {
-                            app.video = Some(image.to_rgb8());
+                            let image = image.to_rgb8();
+                            image_protocol = Some(picker.new_resize_protocol(
+                                image::DynamicImage::ImageRgb8(image.clone()),
+                            ));
+                            app.video = Some(image);
                             app.message = "Live video (character-cell fallback)".into();
                         }
                         Err(error) => {
@@ -1242,14 +1306,14 @@ where
                     if let Some(area) =
                         video_viewport(areas[1], image.width(), image.height(), app.cell_size)
                     {
-                        let mut protocol = picker
-                            .new_resize_protocol(image::DynamicImage::ImageRgb8(image.clone()));
-                        frame.render_stateful_widget(
-                            ratatui_image::StatefulImage::default()
-                                .resize(ratatui_image::Resize::Scale(None)),
-                            area.cells,
-                            &mut protocol,
-                        );
+                        if let Some(protocol) = &mut image_protocol {
+                            frame.render_stateful_widget(
+                                ratatui_image::StatefulImage::default()
+                                    .resize(ratatui_image::Resize::Scale(None)),
+                                area.cells,
+                                protocol,
+                            );
+                        }
                     }
                 }
             })
@@ -1495,7 +1559,7 @@ mod tests {
         run_loop(
             &mut terminal,
             &device,
-            &ratatui_image::picker::Picker::halfblocks(),
+            &ImagePicker::halfblocks(),
             false,
             |_| {
                 count += 1;
@@ -1547,7 +1611,7 @@ mod tests {
             run_loop(
                 &mut terminal,
                 &device,
-                &ratatui_image::picker::Picker::halfblocks(),
+                &ImagePicker::halfblocks(),
                 false,
                 |terminal| {
                     rounds += 1;
@@ -1606,7 +1670,7 @@ mod tests {
         run_loop(
             &mut terminal,
             &device,
-            &ratatui_image::picker::Picker::halfblocks(),
+            &ImagePicker::halfblocks(),
             false,
             |_| {
                 if let Some(c) = events.next() {
@@ -1664,7 +1728,7 @@ mod tests {
         run_loop(
             &mut terminal,
             &device,
-            &ratatui_image::picker::Picker::halfblocks(),
+            &ImagePicker::halfblocks(),
             false,
             |_| {
                 Ok(Some(match events.next().expect("quit") {
@@ -1696,7 +1760,7 @@ mod tests {
         run_loop(
             &mut terminal,
             &device,
-            &ratatui_image::picker::Picker::halfblocks(),
+            &ImagePicker::halfblocks(),
             false,
             |_| {
                 let c = events.next().expect("quit event");
@@ -1736,7 +1800,7 @@ mod tests {
         run_loop(
             &mut terminal,
             &device,
-            &ratatui_image::picker::Picker::halfblocks(),
+            &ImagePicker::halfblocks(),
             false,
             |_| {
                 count += 1;
@@ -1868,7 +1932,7 @@ mod tests {
         run_loop(
             &mut terminal,
             &device,
-            &ratatui_image::picker::Picker::halfblocks(),
+            &ImagePicker::halfblocks(),
             false,
             |_| {
                 step += 1;
@@ -2981,6 +3045,48 @@ mod tests {
         }
     }
 
+    #[test]
+    fn kitty_protocol_transmits_once_and_reencodes_on_resize() {
+        use ratatui::widgets::StatefulWidget;
+        let picker = ImagePicker {
+            cell_size: (10, 20),
+            protocol: ratatui_image::picker::ProtocolType::Kitty,
+            tmux: false,
+        };
+        let image = image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+            40,
+            40,
+            image::Rgb([2, 3, 4]),
+        ));
+        let mut state = picker.new_resize_protocol(image);
+        let area = ratatui::layout::Rect::new(0, 0, 4, 2);
+        let mut buffer = ratatui::buffer::Buffer::empty(area);
+        ratatui_image::StatefulImage::default().render(area, &mut buffer, &mut state);
+        assert!(
+            buffer
+                .content()
+                .iter()
+                .any(|cell| cell.symbol().contains("\x1b_G"))
+        );
+        let mut second = ratatui::buffer::Buffer::empty(area);
+        ratatui_image::StatefulImage::default().render(area, &mut second, &mut state);
+        assert!(
+            !second
+                .content()
+                .iter()
+                .any(|cell| cell.symbol().contains("\x1b_G"))
+        );
+        let resized = ratatui::layout::Rect::new(0, 0, 2, 2);
+        let mut third = ratatui::buffer::Buffer::empty(resized);
+        ratatui_image::StatefulImage::default().render(resized, &mut third, &mut state);
+        assert!(
+            third
+                .content()
+                .iter()
+                .any(|cell| cell.symbol().contains("\x1b_G"))
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn startup_process_restores_pty_on_sigterm() {
@@ -2995,10 +3101,15 @@ mod tests {
             return;
         }
         let script = r#"
-import os, pty, select, signal, subprocess, sys, termios, time
+import os, pty, select, signal, subprocess, sys, termios, time, tempfile
+sandbox = tempfile.TemporaryDirectory()
+marker = os.path.join(sandbox.name, 'called')
+with open(os.path.join(sandbox.name, 'tmux'), 'w') as f:
+    f.write('#!/bin/sh\nprintf called > ' + marker + '\n')
+os.chmod(os.path.join(sandbox.name, 'tmux'), 0o700)
 master, slave = pty.openpty()
 before = termios.tcgetattr(slave)
-env = dict(os.environ, KVM_STARTUP_PTY_CHILD='1', TERM='xterm', KVM_TUI_IMAGE_PROTOCOL='halfblocks')
+env = dict(os.environ, KVM_STARTUP_PTY_CHILD='1', TERM='tmux-256color', TERM_PROGRAM='tmux', TMUX='/nonexistent', PATH=sandbox.name, KVM_TUI_IMAGE_PROTOCOL='halfblocks')
 proc = subprocess.Popen([sys.argv[1], '--exact', 'tests::startup_process_restores_pty_on_sigterm', '--nocapture'], stdin=slave, stdout=slave, stderr=slave, env=env)
 data = b''
 deadline = time.monotonic() + 10
@@ -3017,6 +3128,7 @@ try:
     while select.select([master], [], [], 0)[0]:
         data += os.read(master, 65536)
     assert proc.returncode == 0, (proc.returncode, data)
+    assert not os.path.exists(marker), 'startup invoked tmux'
     assert b'\x1b[?1049l' in data, data
     after = termios.tcgetattr(slave)
     # Darwin may set PENDIN transiently when canonical mode is restored.
