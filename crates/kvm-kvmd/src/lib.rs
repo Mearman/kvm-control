@@ -34,8 +34,9 @@ const MAX_DECODED_BYTES: u64 = MAX_IMAGE_PIXELS * 4;
 const MAX_JPEG_WORKING_BYTES: u64 = MAX_DECODED_BYTES * 2;
 const MAX_JPEG_VALIDATIONS: usize = 2;
 
-fn jpeg_frame_safe(bytes: &[u8]) -> bool {
+fn jpeg_frame_safe(bytes: &[u8], stripped: &mut Vec<u8>) -> bool {
     let mut pos = 2;
+    let mut copied = 0;
     let mut frame = false;
     let mut scan = false;
     let mut in_entropy = false;
@@ -47,6 +48,7 @@ fn jpeg_frame_safe(bytes: &[u8]) -> bool {
             pos += 1;
             continue;
         }
+        let marker_start = pos;
         while pos < bytes.len() && bytes[pos] == 0xff {
             pos += 1;
         }
@@ -56,7 +58,13 @@ fn jpeg_frame_safe(bytes: &[u8]) -> bool {
         pos += 1;
         match marker {
             0x00 | 0xd0..=0xd7 if in_entropy => continue,
-            0xd9 => return frame && scan && pos == bytes.len(),
+            0xd9 => {
+                if !frame || !scan || pos != bytes.len() {
+                    return false;
+                }
+                stripped.extend_from_slice(&bytes[copied..pos]);
+                return true;
+            }
             0xd8 | 0x00 | 0x01 | 0xd0..=0xd7 => return false,
             _ => {}
         }
@@ -69,6 +77,11 @@ fn jpeg_frame_safe(bytes: &[u8]) -> bool {
             return false;
         }
         let segment = &bytes[pos + 2..pos + length];
+        // zune-jpeg retains APP1, APP2 and APP13 metadata, including per-segment vectors. These segments do not affect its pixel decoding; retain the original JPEG for delivery.
+        if matches!(marker, 0xe1 | 0xe2 | 0xed) {
+            stripped.extend_from_slice(&bytes[copied..marker_start]);
+            copied = pos + length;
+        }
         if matches!(marker, 0xc0..=0xc3 | 0xc5..=0xc7 | 0xc9..=0xcb | 0xcd..=0xcf) {
             if frame || scan || !matches!(marker, 0xc0..=0xc2) || segment.len() < 6 {
                 return false;
@@ -110,7 +123,7 @@ fn jpeg_frame_safe(bytes: &[u8]) -> bool {
             let row_buffers =
                 count as u64 * stride * (4 * 8 + 2 * 4 + 4 * 16 + 16 * 2 * 8 + 4 * 8 * 2) * 2 * 2
                     + stride * 8 * 2;
-            // Output is at most four bytes per pixel. image copies the compressed input and zune metadata retains bounded copies of segments.
+            // The original, filtered input, image's input copy and temporary Vec growth are bounded by the compressed input length. APP1, APP2 and APP13 never reach the decoder.
             let input_and_metadata = bytes.len() as u64 * 8;
             let working = coefficients + row_buffers + width * height * 4 + input_and_metadata;
             if working > MAX_JPEG_WORKING_BYTES {
@@ -159,10 +172,11 @@ async fn run_jpeg_validation<T: Send + 'static>(
 fn validate_jpeg(bytes: &[u8]) -> Result<()> {
     use image::ImageDecoder;
     let invalid = || Error::InvalidResponse("invalid or oversized JPEG image".into());
-    if !bytes.starts_with(&[0xff, 0xd8]) || !jpeg_frame_safe(bytes) {
+    let mut stripped = Vec::with_capacity(bytes.len());
+    if !bytes.starts_with(&[0xff, 0xd8]) || !jpeg_frame_safe(bytes, &mut stripped) {
         return Err(invalid());
     }
-    let mut decoder = image::codecs::jpeg::JpegDecoder::new(std::io::Cursor::new(bytes))
+    let mut decoder = image::codecs::jpeg::JpegDecoder::new(std::io::Cursor::new(&stripped))
         .map_err(|_| invalid())?;
     let mut limits = image::Limits::default();
     limits.max_image_width = Some(MAX_IMAGE_DIMENSION);
@@ -1212,17 +1226,45 @@ mod tests {
         let length = usize::from(u16::from_be_bytes([image[sof + 2], image[sof + 3]])) + 2;
         let mut duplicate = image.clone();
         duplicate.splice(sof..sof, image[sof..sof + length].iter().copied());
-        assert!(!jpeg_frame_safe(&duplicate));
+        assert!(!jpeg_frame_safe(&duplicate, &mut Vec::new()));
         let mut bad_length = image.clone();
         bad_length[sof + 2..sof + 4].copy_from_slice(&[0xff, 0xff]);
-        assert!(!jpeg_frame_safe(&bad_length));
+        assert!(!jpeg_frame_safe(&bad_length, &mut Vec::new()));
         let mut zero_sampling = image.clone();
         zero_sampling[sof + 11] = 0;
-        assert!(!jpeg_frame_safe(&zero_sampling));
+        assert!(!jpeg_frame_safe(&zero_sampling, &mut Vec::new()));
         let mut trailing = image.clone();
         trailing.push(0);
-        assert!(!jpeg_frame_safe(&trailing));
-        assert!(!jpeg_frame_safe(&image[..sof + 4]));
+        assert!(!jpeg_frame_safe(&trailing, &mut Vec::new()));
+        assert!(!jpeg_frame_safe(&image[..sof + 4], &mut Vec::new()));
+    }
+
+    #[test]
+    fn validation_strips_repeated_metadata_without_changing_the_frame() {
+        let mut original = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new(&mut original)
+            .encode(&[64, 128, 192], 1, 1, image::ExtendedColorType::Rgb8)
+            .unwrap();
+        let mut frame = original[..2].to_vec();
+        let mut app2 = b"ICC_PROFILE\0".to_vec();
+        app2.extend_from_slice(&[1, 1, 0]);
+        for _ in 0..1024 {
+            frame.extend_from_slice(&[0xff, 0xe2, 0, 17]);
+            frame.extend_from_slice(&app2);
+        }
+        let mut xmp = b"http://ns.adobe.com/xmp/extension/\0".to_vec();
+        xmp.extend_from_slice(&[b'a'; 32]);
+        xmp.extend_from_slice(&1_u32.to_be_bytes());
+        xmp.extend_from_slice(&0_u32.to_be_bytes());
+        xmp.push(b'x');
+        frame.extend_from_slice(&[0xff, 0xe1]);
+        frame.extend_from_slice(&u16::try_from(xmp.len() + 2).unwrap().to_be_bytes());
+        frame.extend_from_slice(&xmp);
+        frame.extend_from_slice(&original[2..]);
+        let mut stripped = Vec::new();
+        assert!(jpeg_frame_safe(&frame, &mut stripped));
+        assert_eq!(stripped, original);
+        assert!(validate_jpeg(&frame).is_ok());
     }
 
     #[test]
@@ -1252,7 +1294,7 @@ mod tests {
         for i in 0..3 {
             image[sof + 11 + i * 3] = 0x55;
         }
-        assert!(!jpeg_frame_safe(&image));
+        assert!(!jpeg_frame_safe(&image, &mut Vec::new()));
     }
 
     #[test]
