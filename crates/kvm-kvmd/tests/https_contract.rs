@@ -1649,6 +1649,55 @@ fn owner_dropped_on_a_runtime_without_drivers_releases_on_the_last_runtime() {
     server.abort();
 }
 
+#[test]
+fn cleanup_for_an_uncollected_press_records_its_runtime() {
+    let server_runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let (mut endpoint, ca, calls, server) = server_runtime.block_on(fixture());
+    endpoint.set_path("/gated/");
+    let device = client(endpoint, Some(ca));
+    let woken = Arc::new(Woken(tokio::sync::Notify::new()));
+    let mut press = Box::pin(device.key("KeyB", true));
+    server_runtime.block_on(async {
+        poll_once(press.as_mut(), &woken);
+        arrival(&calls).await;
+        calls.4.notify_one();
+        within("the outcome to be delivered", woken.0.notified()).await;
+    });
+    // A later press on a short-lived runtime is the last lock holder to record itself, and that runtime then shuts down.
+    let other_runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    other_runtime
+        .block_on(drive(&calls, device.key("KeyC", true)))
+        .unwrap();
+    drop(other_runtime);
+    // The uncollected press's cleanup runs on its own live runtime and records it before sending the owed release.
+    drop(press);
+    server_runtime.block_on(async {
+        arrival(&calls).await;
+        calls.4.notify_one();
+    });
+    std::thread::spawn(move || drop(device)).join().unwrap();
+    server_runtime.block_on(async {
+        arrival(&calls).await;
+        calls.4.notify_one();
+    });
+    assert_eq!(
+        input_events(&calls),
+        [
+            "key=KeyB&state=true",
+            "key=KeyC&state=true",
+            "key=KeyB&state=false",
+            "key=KeyC&state=false",
+        ]
+    );
+    server.abort();
+}
+
 #[tokio::test]
 async fn expired_session_requires_explicit_reauthentication() {
     let (endpoint, ca, calls, server) = fixture().await;
