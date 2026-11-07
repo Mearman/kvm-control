@@ -62,3 +62,71 @@ For devices requiring TOTP, `--totp` prompts for a current code in the CLI or TU
 `kvm-core` exposes the async `Device` and `VideoStream` traits, status and capability types, input methods and explicitly confirmed control operations. `kvm-kvmd` implements `Device` as `Kvmd`: construct it with `Config`, authenticate with `login` or `login_with_totp` and complete approval if needed, then call the trait methods. Header and HTTP Basic authentication constructors are also available. Inspect `examples/in-process/src/main.rs` for an in-process consumer using a synthetic `Device`; run it with `cargo run --manifest-path examples/in-process/Cargo.toml`. It is not a hardware demonstration.
 
 Library callers should explicitly await `release_inputs()` when ending input and handle its error. A submitted KVMD input request continues if its caller is cancelled; an ambiguous outcome must not be replayed blindly and leaves cleanup indeterminate for that adapter instance. Dropping the adapter attempts asynchronous cleanup on its captured runtime, but does not wait for confirmation and cannot guarantee cleanup after runtime or process termination. Dropping a video stream releases its transport resources. See [security](SECURITY.md) for the client shutdown boundaries.
+
+### Errors
+
+Every fallible call returns `kvm_core::Error`, and the enum's documentation (`cargo doc -p kvm-core --open`) says when each variant occurs and what a caller should do. The variants divide by whether the device may have acted: `Authentication`, `Unsupported`, `Transport`, `Http` and `InvalidResponse` returned by an input or control method mean that call submitted no input or control request, while `AmbiguousInput` and `AmbiguousControl` mean one was, or may have been, submitted with an unknown effect. Never replay an ambiguous operation automatically; observe the device and the controlled host first. An acknowledged control request whose effect could not be observed is not an error but `Ok(ControlOutcome::Unverified)`.
+
+### Using the crates from another project
+
+No crate is published to crates.io or any other registry, and publishing one needs separate authorisation, so another project depends on this repository through Cargo's git dependencies. Pin a release tag, or the commit it points to with `rev`, and use the same reference for every crate from this repository: `kvm-kvmd` takes `kvm-core` from the checkout it was built from, so a tag for one crate and a `rev` for the other, even naming the same commit, gives two distinct `kvm-core` crates whose `Device` trait and `Error` type do not match. The [releases](https://github.com/Mearman/kvm-control/releases) list the tags; `v0.1.0` below stands for the release you have reviewed.
+
+```toml
+[dependencies]
+kvm-core = { git = "https://github.com/Mearman/kvm-control", tag = "v0.1.0" }
+kvm-kvmd = { git = "https://github.com/Mearman/kvm-control", tag = "v0.1.0" }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+url = "2"
+```
+
+To pin by commit, replace `tag = "v0.1.0"` with `rev = "a175eea5286fd495d429eb78c6ac0116788b1b42"`, the commit `v0.1.0` points to, in both lines. `Cargo.lock` records the resolved commit either way; change the reference in `Cargo.toml` to move to another release. The crates use the 2024 edition and declare no minimum supported Rust version, so build them with a current stable toolchain. A project that only consumes or implements the `Device` contract, as [`examples/in-process`](examples/in-process) does, needs `kvm-core` alone, plus `async-trait` to implement the traits.
+
+A minimal consumer of a real device runs the adapter in its own process, like `examples/in-process`, but with `Kvmd` in place of the synthetic device. It reads the password from redirected standard input; the key press types the letter `a` on the controlled host.
+
+```rust
+use std::{io::BufRead, time::Duration};
+
+use kvm_core::{Capability, Device, DeviceProfile};
+use kvm_kvmd::{Config, Kvmd, LoginState};
+use url::Url;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Read the password from redirected standard input, never from arguments or the environment.
+    let mut password = String::new();
+    std::io::stdin().lock().read_line(&mut password)?;
+    let adapter = Kvmd::new(Config {
+        endpoint: Url::parse("https://kvm.example.com/")?,
+        profile: DeviceProfile::PiKvm,
+        trusted_ca_pem: None,
+        insecure_tls: false,
+        timeout: Duration::from_secs(10),
+    })?;
+    let state = adapter
+        .login("operator", password.trim_end_matches(['\r', '\n']))
+        .await?;
+    drop(password);
+    if state != LoginState::Authenticated {
+        return Err("approve the login on the device, then call complete_approval".into());
+    }
+    // Depend on the Device contract, as examples/in-process does.
+    let device: &dyn Device = &adapter;
+    println!("Snapshot: {} bytes", device.snapshot().await?.jpeg.len());
+    if device.capabilities().await?.keyboard == Capability::Supported {
+        let pressed = device.key("KeyA", true).await;
+        // Release even when the press has an ambiguous outcome.
+        let released = device.release_inputs().await;
+        pressed?;
+        released?;
+    }
+    Ok(())
+}
+```
+
+**Runtime and shared state.** Call the adapter from inside a Tokio runtime: input requests and JPEG validation run as tasks on the runtime that made the call, and dropping the adapter schedules its input cleanup on the runtime that last took the input lock, so keep that runtime driven until they finish. `Kvmd` is `Send` and `Sync` but not `Clone`; share one instance between tasks behind an `Arc` (an `Arc<Kvmd>` coerces to `Arc<dyn Device>`). The instance owns the authenticated session, the record of held keys and buttons and whether an ambiguous outcome has made input indeterminate, so a second instance for the same device shares none of that and cannot release what the first pressed. Input calls on one instance run one at a time, in the order they request the input lock. Snapshot and live-video capabilities stay `Unknown` until that instance has received a valid JPEG. The adapter limits how many snapshots and video streams it holds at once, and a call beyond the limit returns `Error::Transport`.
+
+**TLS.** `Config::endpoint` must be an HTTPS URL without credentials, a query or a fragment; `Kvmd::new` rejects anything else with `Error::InvalidResponse`. Certificates are verified against the Mozilla root set the crates bundle through `webpki-roots`, not the operating system's trust store, plus the PEM certificate in `trusted_ca_pem`, which is the way to trust a device's own CA. `insecure_tls: true` disables verification entirely, including the host name check, and exposes the session and credentials to anyone who can intercept the connection. The adapter speaks HTTP/1.1, follows no redirects and retries nothing.
+
+**Secrets.** `Config` holds no credentials. Pass them to `login`, `login_with_totp`, `Kvmd::with_header_auth` or `Kvmd::with_basic_auth`, read from a prompt, a pipe or a secret store, never from command-line arguments, environment variables, the endpoint URL or a configuration file. The adapter keeps its copy of the cookie-login password and code in a buffer that is zeroed when dropped, though copies made while encoding the request are not, and marks header credentials sensitive so they are not formatted in debug output; the caller's own copies are the caller's to clear. A TOTP code is valid for one login, so obtain a fresh one each time. See [security](SECURITY.md).
+
+**API stability.** There is no API stability guarantee, and any release may change the public API. Release versions come from commit messages: below 1.0.0 a commit marked as breaking bumps the minor version and every other releasing commit the patch version (see [compatibility](COMPATIBILITY.md)), but nothing compares the public API between releases, so a breaking change is only recognised when its commit says so. Pin an exact tag or commit, and read the release notes and the crate documentation before moving to another.
