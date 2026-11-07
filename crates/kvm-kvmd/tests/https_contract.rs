@@ -15,10 +15,11 @@ use axum::{
 };
 use axum_server::tls_rustls::RustlsConfig;
 use kvm_core::{
-    Capability, Confirmation, Control, ControlOutcome, Device, DeviceProfile, Error, MouseMode,
-    PowerAction, Reported,
+    AuthScheme, Authenticate, CallerIdentity, Capability, Confirmation, Connected, Connector,
+    Control, ControlOutcome, Credentials, Device, DeviceProfile, Endpoint, Error, LoginState,
+    MouseMode, PowerAction, Reported, ServerTrust,
 };
-use kvm_kvmd::{Config, Kvmd, LoginState};
+use kvm_kvmd::{Kvmd, KvmdConnector};
 use serde_json::json;
 use url::Url;
 
@@ -463,11 +464,24 @@ async fn fixture() -> (Url, Vec<u8>, Calls, tokio::task::JoinHandle<()>) {
     )
 }
 
+/// Opens an adapter for `endpoint`, whose scheme is a per-request one, with the fixture's credentials installed. Installing them sends no request, so the fixture sees only the requests the test makes.
+async fn per_request_client(endpoint: Endpoint) -> Kvmd {
+    let device = Kvmd::new(endpoint).unwrap();
+    assert_eq!(
+        device
+            .login(Credentials::new("test-user", "test-password"))
+            .await
+            .unwrap(),
+        LoginState::Unverified
+    );
+    device
+}
+
 fn client(endpoint: Url, ca: Option<Vec<u8>>) -> Kvmd {
     profile_client(endpoint, ca, DeviceProfile::PiKvm)
 }
 
-/// The fixture client's `Config::timeout`: a connection must be established within it, and a whole request ends within twice it from sending.
+/// The fixture client's `Endpoint::timeout`: a connection must be established within it, and a whole request ends within twice it from sending.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The client's overall deadline for one request, twice `REQUEST_TIMEOUT`.
@@ -492,11 +506,14 @@ async fn arrival(calls: &Calls) {
 }
 
 fn profile_client(endpoint: Url, ca: Option<Vec<u8>>, profile: DeviceProfile) -> Kvmd {
-    Kvmd::new(Config {
-        endpoint,
+    Kvmd::new(Endpoint {
+        label: None,
+        address: endpoint,
         profile,
-        trusted_ca_pem: ca,
-        insecure_tls: false,
+        auth: AuthScheme::Session,
+        trust: ServerTrust::Verified {
+            additional_ca_pem: ca.map(|pem| String::from_utf8(pem).unwrap()),
+        },
         timeout: REQUEST_TIMEOUT,
     })
     .unwrap()
@@ -506,18 +523,17 @@ fn profile_client(endpoint: Url, ca: Option<Vec<u8>>, profile: DeviceProfile) ->
 async fn capabilities_preserve_accessible_features_with_partial_permissions() {
     let (mut endpoint, ca, _, server) = fixture().await;
     endpoint.set_path("/partial/");
-    let device = Kvmd::with_header_auth(
-        Config {
-            endpoint,
-            profile: DeviceProfile::PiKvm,
-            trusted_ca_pem: Some(ca),
-            insecure_tls: false,
-            timeout: Duration::from_secs(5),
+    let device = per_request_client(Endpoint {
+        label: None,
+        address: endpoint,
+        profile: DeviceProfile::PiKvm,
+        auth: AuthScheme::Header,
+        trust: ServerTrust::Verified {
+            additional_ca_pem: Some(String::from_utf8(ca).unwrap()),
         },
-        "test-user",
-        "test-password",
-    )
-    .unwrap();
+        timeout: Duration::from_secs(5),
+    })
+    .await;
     let capabilities = device.capabilities().await.unwrap();
     assert_eq!(capabilities.keyboard, Capability::Supported);
     assert_eq!(capabilities.mouse, Capability::Supported);
@@ -534,22 +550,25 @@ async fn transport_errors_distinguish_timeout_from_untrusted_tls_without_secrets
     let (endpoint, ca, _, server) = fixture().await;
     let untrusted = client(endpoint.clone(), None);
     let tls_error = untrusted
-        .login("synthetic-user", "synthetic-password")
+        .login(Credentials::new("synthetic-user", "synthetic-password"))
         .await
         .unwrap_err()
         .to_string();
     assert_eq!(tls_error, "transport error: login: connection failure");
 
-    let timed = Kvmd::new(Config {
-        endpoint,
+    let timed = Kvmd::new(Endpoint {
+        label: None,
+        address: endpoint,
         profile: DeviceProfile::PiKvm,
-        trusted_ca_pem: Some(ca),
-        insecure_tls: false,
+        auth: AuthScheme::Session,
+        trust: ServerTrust::Verified {
+            additional_ca_pem: Some(String::from_utf8(ca).unwrap()),
+        },
         timeout: Duration::from_millis(50),
     })
     .unwrap();
     let timeout_error = timed
-        .login("synthetic-user", "delay")
+        .login(Credentials::new("synthetic-user", "delay"))
         .await
         .unwrap_err()
         .to_string();
@@ -564,18 +583,17 @@ async fn transport_errors_distinguish_timeout_from_untrusted_tls_without_secrets
 #[tokio::test]
 async fn basic_auth_and_discovered_control_requests() {
     let (endpoint, ca, calls, server) = fixture().await;
-    let device = Kvmd::with_basic_auth(
-        Config {
-            endpoint,
-            profile: DeviceProfile::PiKvm,
-            trusted_ca_pem: Some(ca),
-            insecure_tls: false,
-            timeout: Duration::from_secs(5),
+    let device = per_request_client(Endpoint {
+        label: None,
+        address: endpoint,
+        profile: DeviceProfile::PiKvm,
+        auth: AuthScheme::Basic,
+        trust: ServerTrust::Verified {
+            additional_ca_pem: Some(String::from_utf8(ca).unwrap()),
         },
-        "test-user",
-        "test-password",
-    )
-    .unwrap();
+        timeout: Duration::from_secs(5),
+    })
+    .await;
     device.check_auth().await.unwrap();
     let capabilities = device.capabilities().await.unwrap();
     assert_eq!(
@@ -657,7 +675,10 @@ async fn control_keeps_session_across_concurrent_relogin() {
     let (mut endpoint, ca, calls, server) = fixture().await;
     endpoint.set_path("/proxy/");
     let device = Arc::new(client(endpoint, Some(ca)));
-    device.login("test-user", "test-password").await.unwrap();
+    device
+        .login(Credentials::new("test-user", "test-password"))
+        .await
+        .unwrap();
     let control_device = device.clone();
     let control_task = tokio::spawn(async move {
         control_device
@@ -677,7 +698,11 @@ async fn control_keeps_session_across_concurrent_relogin() {
     })
     .await;
     let login_device = device.clone();
-    let login_task = tokio::spawn(async move { login_device.login("test-user", "bad").await });
+    let login_task = tokio::spawn(async move {
+        login_device
+            .login(Credentials::new("test-user", "bad"))
+            .await
+    });
     assert_eq!(
         control_task.await.unwrap().unwrap(),
         ControlOutcome::ObservedMatching
@@ -698,9 +723,16 @@ async fn request_during_relogin_cannot_use_old_session() {
     let (mut endpoint, ca, calls, server) = fixture().await;
     endpoint.set_path("/proxy/");
     let device = Arc::new(client(endpoint, Some(ca)));
-    device.login("test-user", "test-password").await.unwrap();
+    device
+        .login(Credentials::new("test-user", "test-password"))
+        .await
+        .unwrap();
     let task_device = device.clone();
-    let task = tokio::spawn(async move { task_device.login("test-user", "delay").await });
+    let task = tokio::spawn(async move {
+        task_device
+            .login(Credentials::new("test-user", "delay"))
+            .await
+    });
     within("the delayed login to start", async {
         while !calls
             .0
@@ -727,7 +759,10 @@ async fn cancelled_input_is_cleaned_up_with_a_retained_owner() {
         let (mut endpoint, ca, calls, server) = fixture().await;
         endpoint.set_path("/gated/");
         let device = Arc::new(client(endpoint, Some(ca)));
-        device.login("test-user", "test-password").await.unwrap();
+        device
+            .login(Credentials::new("test-user", "test-password"))
+            .await
+            .unwrap();
         let sender = device.clone();
         let task = tokio::spawn(async move {
             if button {
@@ -1127,7 +1162,10 @@ async fn release_after_cleanup_is_sent_again_in_a_new_login() {
     assert!(press.await.unwrap_err().is_cancelled());
     calls.4.notify_one();
     drive(&calls, async {
-        device.login("test-user", "test-password").await.unwrap();
+        device
+            .login(Credentials::new("test-user", "test-password"))
+            .await
+            .unwrap();
         device.key("KeyA", false).await.unwrap();
     })
     .await;
@@ -1333,7 +1371,10 @@ async fn owed_release_is_sent_before_mouse_movement() {
     let (mut endpoint, ca, calls, server) = fixture().await;
     endpoint.set_path("/gated/");
     let device = client(endpoint, Some(ca));
-    device.login("test-user", "test-password").await.unwrap();
+    device
+        .login(Credentials::new("test-user", "test-password"))
+        .await
+        .unwrap();
     let woken = Arc::new(Woken(tokio::sync::Notify::new()));
     let mut press = Box::pin(device.key("KeyA", true));
     poll_once(press.as_mut(), &woken);
@@ -1359,7 +1400,10 @@ async fn failed_mouse_movement_leaves_the_session_indeterminate() {
     let (mut endpoint, ca, calls, server) = fixture().await;
     endpoint.set_path("/gated/");
     let device = client(endpoint, Some(ca));
-    device.login("test-user", "test-password").await.unwrap();
+    device
+        .login(Credentials::new("test-user", "test-password"))
+        .await
+        .unwrap();
     assert!(matches!(
         drive(&calls, device.mouse_move(-1, 2)).await,
         Err(Error::AmbiguousInput(_))
@@ -1381,7 +1425,7 @@ fn mouse_movement_interrupted_by_runtime_shutdown_leaves_the_session_indetermina
     endpoint.set_path("/gated/");
     let device = client(endpoint, Some(ca));
     server_runtime
-        .block_on(device.login("test-user", "test-password"))
+        .block_on(device.login(Credentials::new("test-user", "test-password")))
         .unwrap();
     let input_runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -1521,9 +1565,12 @@ async fn login_sends_owed_releases_before_checking_tracked_inputs() {
     calls.4.notify_one();
     within("the outcome to be delivered", woken.0.notified()).await;
     drop(press);
-    drive(&calls, device.login("test-user", "test-password"))
-        .await
-        .unwrap();
+    drive(
+        &calls,
+        device.login(Credentials::new("test-user", "test-password")),
+    )
+    .await
+    .unwrap();
     assert_eq!(
         input_events(&calls),
         ["key=KeyA&state=true", "key=KeyA&state=false"]
@@ -1537,7 +1584,10 @@ async fn release_after_cleanup_is_sent_again_after_approval() {
     endpoint.set_path("/glgated/");
     let device = Arc::new(profile_client(endpoint, Some(ca), DeviceProfile::GlKvm));
     assert!(matches!(
-        device.login("test-user", "test-password").await.unwrap(),
+        device
+            .login(Credentials::new("test-user", "test-password"))
+            .await
+            .unwrap(),
         LoginState::ApprovalPending { .. }
     ));
     let sender = device.clone();
@@ -1584,7 +1634,7 @@ async fn login_cancelled_during_settlement_still_sends_the_owed_release() {
     let device = client(endpoint, Some(ca));
     owe_key_a_release(&calls, &device).await;
     let woken = Arc::new(Woken(tokio::sync::Notify::new()));
-    let mut login = Box::pin(device.login_with_totp("test-user", "test-password", None));
+    let mut login = Box::pin(device.login(Credentials::new("test-user", "test-password")));
     poll_once(login.as_mut(), &woken);
     drop(login);
     drive(&calls, device.key("KeyC", true)).await.unwrap();
@@ -1606,7 +1656,10 @@ async fn approval_cancelled_during_settlement_still_sends_the_owed_release() {
     endpoint.set_path("/glgated/");
     let device = profile_client(endpoint, Some(ca), DeviceProfile::GlKvm);
     assert!(matches!(
-        device.login("test-user", "test-password").await.unwrap(),
+        device
+            .login(Credentials::new("test-user", "test-password"))
+            .await
+            .unwrap(),
         LoginState::ApprovalPending { .. }
     ));
     owe_key_a_release(&calls, &device).await;
@@ -1678,7 +1731,7 @@ fn owner_dropped_outside_a_runtime_uses_the_runtime_a_login_last_locked_on() {
     drop(input_runtime);
     // A login on a live runtime takes the input lock after the press's runtime has shut down.
     assert!(matches!(
-        server_runtime.block_on(device.login("test-user", "test-password")),
+        server_runtime.block_on(device.login(Credentials::new("test-user", "test-password"))),
         Err(Error::AmbiguousInput(_))
     ));
     std::thread::spawn(move || drop(device)).join().unwrap();
@@ -1812,7 +1865,10 @@ async fn movement_abandoned_during_owed_cleanup_is_not_sent() {
     let (mut endpoint, ca, calls, server) = fixture().await;
     endpoint.set_path("/gated/");
     let device = Arc::new(client(endpoint, Some(ca)));
-    device.login("test-user", "test-password").await.unwrap();
+    device
+        .login(Credentials::new("test-user", "test-password"))
+        .await
+        .unwrap();
     let woken = Arc::new(Woken(tokio::sync::Notify::new()));
     let mut press = Box::pin(device.key("KeyA", true));
     poll_once(press.as_mut(), &woken);
@@ -1842,7 +1898,10 @@ async fn movement_abandoned_during_owed_cleanup_is_not_sent() {
 async fn expired_session_requires_explicit_reauthentication() {
     let (endpoint, ca, calls, server) = fixture().await;
     let device = client(endpoint, Some(ca));
-    device.login("test-user", "test-password").await.unwrap();
+    device
+        .login(Credentials::new("test-user", "test-password"))
+        .await
+        .unwrap();
     calls.1.store(true, Ordering::SeqCst);
     assert!(matches!(
         device.key("KeyA", true).await,
@@ -1871,7 +1930,10 @@ async fn expired_session_requires_explicit_reauthentication() {
             "/api/hid/events/send_key?key=KeyA&state=false"
         ]
     );
-    device.login("test-user", "test-password").await.unwrap();
+    device
+        .login(Credentials::new("test-user", "test-password"))
+        .await
+        .unwrap();
     device.check_auth().await.unwrap();
     assert!(matches!(
         device.release_inputs().await,
@@ -1900,19 +1962,28 @@ async fn failed_or_pending_relogin_does_not_reuse_previous_cookie() {
     let (mut endpoint, ca, _, server) = fixture().await;
     endpoint.set_path("/proxy/");
     let device = profile_client(endpoint, Some(ca), DeviceProfile::GlKvm);
-    device.login("test-user", "test-password").await.unwrap();
+    device
+        .login(Credentials::new("test-user", "test-password"))
+        .await
+        .unwrap();
     device.check_auth().await.unwrap();
     assert!(matches!(
-        device.login("test-user", "bad").await,
+        device.login(Credentials::new("test-user", "bad")).await,
         Err(Error::Authentication)
     ));
     assert!(matches!(
         device.check_auth().await,
         Err(Error::Authentication)
     ));
-    device.login("test-user", "test-password").await.unwrap();
+    device
+        .login(Credentials::new("test-user", "test-password"))
+        .await
+        .unwrap();
     assert!(matches!(
-        device.login("test-user", "pending").await.unwrap(),
+        device
+            .login(Credentials::new("test-user", "pending"))
+            .await
+            .unwrap(),
         LoginState::ApprovalPending { .. }
     ));
     assert!(matches!(
@@ -1930,14 +2001,17 @@ async fn oversized_json_is_rejected_for_length_and_chunked_responses() {
         url.set_path(&format!("/{prefix}/"));
         let device = client(url, Some(ca.clone()));
         assert!(
-            matches!(device.login("test-user", "test-password").await, Err(Error::InvalidResponse(message)) if message.contains("size limit"))
+            matches!(device.login(Credentials::new("test-user", "test-password")).await, Err(Error::InvalidResponse(message)) if message.contains("size limit"))
         );
     }
     let mut url = endpoint.clone();
     url.set_path("/bigapproval/");
     let device = profile_client(url, Some(ca.clone()), DeviceProfile::GlKvm);
     assert!(matches!(
-        device.login("test-user", "test-password").await.unwrap(),
+        device
+            .login(Credentials::new("test-user", "test-password"))
+            .await
+            .unwrap(),
         LoginState::ApprovalPending { .. }
     ));
     assert!(
@@ -1957,7 +2031,10 @@ async fn oversized_json_is_rejected_for_length_and_chunked_responses() {
 async fn absolute_move_rechecks_firmware_mouse_mode() {
     let (endpoint, ca, calls, server) = fixture().await;
     let device = client(endpoint, Some(ca));
-    device.login("test-user", "test-password").await.unwrap();
+    device
+        .login(Credentials::new("test-user", "test-password"))
+        .await
+        .unwrap();
     assert_eq!(
         device.capabilities().await.unwrap().mouse_mode,
         MouseMode::Absolute
@@ -1988,7 +2065,10 @@ async fn ordinary_response_cannot_replace_login_cookie() {
     let (mut endpoint, ca, _, server) = fixture().await;
     endpoint.set_path("/poison/");
     let device = client(endpoint, Some(ca));
-    device.login("test-user", "test-password").await.unwrap();
+    device
+        .login(Credentials::new("test-user", "test-password"))
+        .await
+        .unwrap();
     device.status().await.unwrap();
     device.check_auth().await.unwrap();
     server.abort();
@@ -2000,7 +2080,10 @@ async fn approval_token_without_usable_cookie_is_rejected() {
     endpoint.set_path("/nocookie/");
     let device = profile_client(endpoint, Some(ca), DeviceProfile::GlKvm);
     assert!(matches!(
-        device.login("test-user", "test-password").await.unwrap(),
+        device
+            .login(Credentials::new("test-user", "test-password"))
+            .await
+            .unwrap(),
         LoginState::ApprovalPending { .. }
     ));
     assert!(matches!(
@@ -2018,7 +2101,7 @@ async fn approval_token_without_usable_cookie_is_rejected() {
 async fn switch_observation_uses_profile_semantics_and_rejects_unknown_ports() {
     let (endpoint, ca, calls, server) = fixture().await;
     for profile in [DeviceProfile::GlKvm, DeviceProfile::PiKvm] {
-        let device = header_client(endpoint.clone(), &ca, profile);
+        let device = header_client(endpoint.clone(), &ca, profile).await;
         let outcome = device
             .control(Control::Switch { port: 0 }, Confirmation::new())
             .await
@@ -2156,7 +2239,9 @@ async fn pikvm_rejects_gl_approval_response() {
     endpoint.set_path("/gl/");
     let device = client(endpoint, Some(ca));
     assert!(matches!(
-        device.login("test-user", "test-password").await,
+        device
+            .login(Credentials::new("test-user", "test-password"))
+            .await,
         Err(Error::InvalidResponse(_))
     ));
     assert!(matches!(
@@ -2172,7 +2257,10 @@ async fn gl_approval_is_not_reported_as_authenticated() {
     endpoint.set_path("/gl/");
     let device = profile_client(endpoint, Some(ca), DeviceProfile::GlKvm);
     assert_eq!(
-        device.login("test-user", "test-password").await.unwrap(),
+        device
+            .login(Credentials::new("test-user", "test-password"))
+            .await
+            .unwrap(),
         LoginState::ApprovalPending {
             expires_in: Some(60)
         }
@@ -2187,18 +2275,17 @@ async fn gl_approval_is_not_reported_as_authenticated() {
 #[tokio::test]
 async fn video_capabilities_require_successful_operations() {
     let (endpoint, ca, calls, server) = fixture().await;
-    let device = Kvmd::with_header_auth(
-        Config {
-            endpoint,
-            profile: DeviceProfile::PiKvm,
-            trusted_ca_pem: Some(ca),
-            insecure_tls: false,
-            timeout: Duration::from_secs(3),
+    let device = per_request_client(Endpoint {
+        label: None,
+        address: endpoint,
+        profile: DeviceProfile::PiKvm,
+        auth: AuthScheme::Header,
+        trust: ServerTrust::Verified {
+            additional_ca_pem: Some(String::from_utf8(ca).unwrap()),
         },
-        "test-user",
-        "test-password",
-    )
-    .unwrap();
+        timeout: Duration::from_secs(3),
+    })
+    .await;
     let initial = device.capabilities().await.unwrap();
     assert_eq!(initial.snapshot, Capability::Unknown);
     assert_eq!(initial.live_video, Capability::Unknown);
@@ -2224,24 +2311,27 @@ async fn video_capabilities_require_successful_operations() {
 async fn gl_totp_can_precede_device_approval() {
     let (mut endpoint, ca, calls, server) = fixture().await;
     endpoint.set_path("/gltotp/");
-    let device = Kvmd::new(Config {
-        endpoint,
+    let device = Kvmd::new(Endpoint {
+        label: None,
+        address: endpoint,
         profile: DeviceProfile::GlKvm,
-        trusted_ca_pem: Some(ca),
-        insecure_tls: false,
+        auth: AuthScheme::Session,
+        trust: ServerTrust::Verified {
+            additional_ca_pem: Some(String::from_utf8(ca).unwrap()),
+        },
         timeout: Duration::from_secs(5),
     })
     .unwrap();
     assert!(matches!(
         device
-            .login_with_totp("test-user", &"x".repeat(58), Some("012345"))
+            .login(Credentials::new("test-user", "x".repeat(58).as_str()).with_totp("012345"))
             .await,
         Err(Error::InvalidResponse(_))
     ));
     assert!(calls.0.lock().unwrap().is_empty());
     assert_eq!(
         device
-            .login_with_totp("test-user", "test-password", Some("012345"))
+            .login(Credentials::new("test-user", "test-password").with_totp("012345"))
             .await
             .unwrap(),
         LoginState::ApprovalPending {
@@ -2268,18 +2358,17 @@ async fn snapshot_rejects_oversized_response() {
 #[tokio::test]
 async fn header_auth_over_verified_tls() {
     let (endpoint, ca, _, server) = fixture().await;
-    let device = Kvmd::with_header_auth(
-        Config {
-            endpoint,
-            profile: DeviceProfile::PiKvm,
-            trusted_ca_pem: Some(ca),
-            insecure_tls: false,
-            timeout: Duration::from_secs(5),
+    let device = per_request_client(Endpoint {
+        label: None,
+        address: endpoint,
+        profile: DeviceProfile::PiKvm,
+        auth: AuthScheme::Header,
+        trust: ServerTrust::Verified {
+            additional_ca_pem: Some(String::from_utf8(ca).unwrap()),
         },
-        "test-user",
-        "test-password",
-    )
-    .unwrap();
+        timeout: Duration::from_secs(5),
+    })
+    .await;
     device.check_auth().await.unwrap();
     assert_eq!(
         device.status().await.unwrap().hid.capability(),
@@ -2295,7 +2384,7 @@ async fn totp_is_validated_and_appended_to_cookie_login() {
     for code in ["12345", "12345x", "１２３４５６"] {
         assert!(matches!(
             device
-                .login_with_totp("test-user", "test-password", Some(code))
+                .login(Credentials::new("test-user", "test-password").with_totp(code))
                 .await,
             Err(Error::InvalidResponse(_))
         ));
@@ -2303,7 +2392,7 @@ async fn totp_is_validated_and_appended_to_cookie_login() {
     assert!(calls.0.lock().unwrap().is_empty());
     assert_eq!(
         device
-            .login_with_totp("test-user", "test-password", Some("012345"))
+            .login(Credentials::new("test-user", "test-password").with_totp("012345"))
             .await
             .unwrap(),
         LoginState::Authenticated
@@ -2324,12 +2413,17 @@ async fn cookie_login_and_status_over_verified_tls() {
     let (endpoint, ca, calls, server) = fixture().await;
     let untrusted = client(endpoint.clone(), None);
     assert!(matches!(
-        untrusted.login("test-user", "test-password").await,
+        untrusted
+            .login(Credentials::new("test-user", "test-password"))
+            .await,
         Err(Error::Transport(_))
     ));
     let device = client(endpoint, Some(ca));
     assert!(matches!(device.status().await, Err(Error::Authentication)));
-    device.login("test-user", "test-password").await.unwrap();
+    device
+        .login(Credentials::new("test-user", "test-password"))
+        .await
+        .unwrap();
     let status = device.status().await.unwrap();
     let hid = status.hid.value().unwrap();
     assert_eq!(hid.online, Reported::Supported(true));
@@ -2355,26 +2449,25 @@ async fn cookie_login_and_status_over_verified_tls() {
 
 const STATUS_ROUTES: [&str; 7] = ["info", "hid", "streamer", "atx", "switch", "gpio", "msd"];
 
-fn status_client(endpoint: &Url, ca: &[u8], prefix: &str, profile: DeviceProfile) -> Kvmd {
+async fn status_client(endpoint: &Url, ca: &[u8], prefix: &str, profile: DeviceProfile) -> Kvmd {
     let mut endpoint = endpoint.clone();
     endpoint.set_path(&format!("/{prefix}/"));
-    header_client(endpoint, ca, profile)
+    header_client(endpoint, ca, profile).await
 }
 
 /// A client authenticating with KVMD headers, which the fixture accepts on every request without a login.
-fn header_client(endpoint: Url, ca: &[u8], profile: DeviceProfile) -> Kvmd {
-    Kvmd::with_header_auth(
-        Config {
-            endpoint,
-            profile,
-            trusted_ca_pem: Some(ca.to_vec()),
-            insecure_tls: false,
-            timeout: REQUEST_TIMEOUT,
+async fn header_client(endpoint: Url, ca: &[u8], profile: DeviceProfile) -> Kvmd {
+    per_request_client(Endpoint {
+        label: None,
+        address: endpoint,
+        profile,
+        auth: AuthScheme::Header,
+        trust: ServerTrust::Verified {
+            additional_ca_pem: Some(String::from_utf8(ca.to_vec()).unwrap()),
         },
-        "test-user",
-        "test-password",
-    )
-    .unwrap()
+        timeout: REQUEST_TIMEOUT,
+    })
+    .await
 }
 
 #[tokio::test]
@@ -2385,6 +2478,7 @@ async fn typed_status_reads_every_subsystem_with_get_requests_only() {
         ("glstatus", DeviceProfile::GlKvm),
     ] {
         let status = status_client(&endpoint, &ca, prefix, profile)
+            .await
             .status()
             .await
             .unwrap();
@@ -2443,6 +2537,7 @@ async fn typed_status_reads_every_subsystem_with_get_requests_only() {
 async fn status_reports_absent_subsystems_as_unsupported() {
     let (endpoint, ca, calls, server) = fixture().await;
     let status = status_client(&endpoint, &ca, "corestatus", DeviceProfile::PiKvm)
+        .await
         .status()
         .await
         .unwrap();
@@ -2468,6 +2563,7 @@ async fn status_reports_absent_subsystems_as_unsupported() {
 async fn a_failing_route_leaves_the_other_subsystems_readable() {
     let (endpoint, ca, calls, server) = fixture().await;
     let status = status_client(&endpoint, &ca, "failstatus", DeviceProfile::PiKvm)
+        .await
         .status()
         .await
         .unwrap();
@@ -2490,6 +2586,7 @@ async fn a_failing_route_leaves_the_other_subsystems_readable() {
 async fn unreadable_routes_are_unknown_and_an_unreadable_device_fails() {
     let (endpoint, ca, _, server) = fixture().await;
     let status = status_client(&endpoint, &ca, "badstatus", DeviceProfile::PiKvm)
+        .await
         .status()
         .await
         .unwrap();
@@ -2508,12 +2605,14 @@ async fn unreadable_routes_are_unknown_and_an_unreadable_device_fails() {
     // A proxy whose daemon is stopped, and a page that is not the API, are failures, not an all-unknown status.
     assert!(matches!(
         status_client(&endpoint, &ca, "downstatus", DeviceProfile::PiKvm)
+            .await
             .status()
             .await,
         Err(Error::Http(502))
     ));
     assert!(matches!(
         status_client(&endpoint, &ca, "htmlstatus", DeviceProfile::GlKvm)
+            .await
             .status()
             .await,
         Err(Error::InvalidResponse(_))
@@ -2526,6 +2625,7 @@ async fn a_timed_out_route_is_unknown_and_the_others_are_kept() {
     let (endpoint, ca, calls, server) = fixture().await;
     // The ATX route never answers; only the request's overall deadline, twice `REQUEST_TIMEOUT` from sending, ends it, and every other route answers at once.
     let status = status_client(&endpoint, &ca, "slowstatus", DeviceProfile::PiKvm)
+        .await
         .status()
         .await
         .unwrap();
@@ -2549,7 +2649,7 @@ async fn a_timed_out_route_is_unknown_and_the_others_are_kept() {
     server.abort();
 }
 
-/// The stalled-device client's `Config::timeout`, its connect deadline. A stalled TLS handshake is ended by it, well inside the test's own `REQUEST_BOUND`.
+/// The stalled-device client's `Endpoint::timeout`, its connect deadline. A stalled TLS handshake is ended by it, well inside the test's own `REQUEST_BOUND`.
 const STALL_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// A device that completes `served` connections (TLS, one KVMD response each, then closes) and then accepts every later TCP connection without ever speaking TLS, as a device that stops answering mid-read does. Returns its URL, CA and the count of accepted connections.
@@ -2610,19 +2710,18 @@ async fn stalling_device(served: usize) -> (Url, Vec<u8>, Arc<std::sync::atomic:
     )
 }
 
-fn stall_client(endpoint: Url, ca: Vec<u8>) -> Kvmd {
-    Kvmd::with_header_auth(
-        Config {
-            endpoint,
-            profile: DeviceProfile::PiKvm,
-            trusted_ca_pem: Some(ca),
-            insecure_tls: false,
-            timeout: STALL_TIMEOUT,
+async fn stall_client(endpoint: Url, ca: Vec<u8>) -> Kvmd {
+    per_request_client(Endpoint {
+        label: None,
+        address: endpoint,
+        profile: DeviceProfile::PiKvm,
+        auth: AuthScheme::Header,
+        trust: ServerTrust::Verified {
+            additional_ca_pem: Some(String::from_utf8(ca).unwrap()),
         },
-        "test-user",
-        "test-password",
-    )
-    .unwrap()
+        timeout: STALL_TIMEOUT,
+    })
+    .await
 }
 
 // Breaks if a stalled TLS handshake is reported as an ordinary timeout of one route: the read would then go on to open a connection for every later route.
@@ -2631,7 +2730,7 @@ async fn a_stalled_connection_fails_the_whole_status_at_once() {
     let (endpoint, ca, accepted) = stalling_device(0).await;
     let result = within(
         "a status read from a stalled device",
-        stall_client(endpoint, ca).status(),
+        stall_client(endpoint, ca).await.status(),
     )
     .await;
     // The connect deadline ended the stalled handshake, which reqwest reports as a timeout.
@@ -2648,7 +2747,7 @@ async fn a_connection_lost_after_earlier_routes_fails_the_whole_status() {
     let (endpoint, ca, accepted) = stalling_device(2).await;
     let result = within(
         "a status read that loses the device",
-        stall_client(endpoint, ca).status(),
+        stall_client(endpoint, ca).await.status(),
     )
     .await;
     // The connect deadline ended the stalled handshake, which reqwest reports as a timeout.
@@ -2663,7 +2762,7 @@ async fn a_connection_lost_after_earlier_routes_fails_the_whole_status() {
 #[tokio::test]
 async fn ch9329_integer_online_flags_reach_status_and_capabilities() {
     let (endpoint, ca, _, server) = fixture().await;
-    let device = status_client(&endpoint, &ca, "ch9329status", DeviceProfile::PiKvm);
+    let device = status_client(&endpoint, &ca, "ch9329status", DeviceProfile::PiKvm).await;
     let status = device.status().await.unwrap();
     let hid = status.hid.value().unwrap();
     assert_eq!(hid.online, Reported::Supported(true));
@@ -2682,23 +2781,136 @@ async fn an_untrusted_certificate_fails_the_whole_status() {
     let (mut endpoint, _, calls, server) = fixture().await;
     endpoint.set_path("/pikvmstatus/");
     // Without the fixture's CA the TLS handshake is rejected, a connection failure rather than a failure of one route.
-    let device = Kvmd::with_header_auth(
-        Config {
-            endpoint,
-            profile: DeviceProfile::PiKvm,
-            trusted_ca_pem: None,
-            insecure_tls: false,
-            timeout: REQUEST_TIMEOUT,
+    let device = per_request_client(Endpoint {
+        label: None,
+        address: endpoint,
+        profile: DeviceProfile::PiKvm,
+        auth: AuthScheme::Header,
+        trust: ServerTrust::Verified {
+            additional_ca_pem: None,
         },
-        "test-user",
-        "test-password",
-    )
-    .unwrap();
+        timeout: REQUEST_TIMEOUT,
+    })
+    .await;
     assert!(matches!(
         within("a status read with an untrusted certificate", device.status()).await,
         Err(Error::Transport(message)) if message == "device request: connection failure"
     ));
     // No request was sent over the rejected connection.
+    assert!(calls.0.lock().unwrap().is_empty());
+    server.abort();
+}
+
+// Breaks if the connector skips the login, if a refused login leaves its caller recorded, or if identity takes its label, address or profile from anywhere but the endpoint, or its serial number and host name from anywhere but the device's report.
+#[tokio::test]
+async fn connector_logs_in_and_identity_separates_claims_from_configuration() {
+    let (endpoint, ca, calls, server) = fixture().await;
+    let session = Endpoint {
+        label: Some("bench".into()),
+        address: endpoint.clone(),
+        profile: DeviceProfile::PiKvm,
+        auth: AuthScheme::Session,
+        trust: ServerTrust::Verified {
+            additional_ca_pem: Some(String::from_utf8(ca).unwrap()),
+        },
+        timeout: REQUEST_TIMEOUT,
+    };
+    let Connected::Authenticated(connection) = KvmdConnector
+        .connect(
+            session.clone(),
+            Credentials::new("test-user", "test-password"),
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("the fixture asks for no approval");
+    };
+    assert_eq!(connection.endpoint(), &session);
+    assert_eq!(
+        connection.caller(),
+        Some(CallerIdentity {
+            username: "test-user".into()
+        })
+    );
+    assert!(
+        calls
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|call| call == "/api/auth/login user=test-user&passwd=test-password")
+    );
+    assert!(matches!(
+        connection.login(Credentials::new("test-user", "bad")).await,
+        Err(Error::Authentication)
+    ));
+    assert_eq!(connection.caller(), None);
+
+    let mut address = endpoint;
+    address.set_path("/pikvmstatus/");
+    let header = Endpoint {
+        label: None,
+        address,
+        auth: AuthScheme::Header,
+        ..session
+    };
+    let connection = KvmdConnector.open(header.clone()).await.unwrap();
+    assert_eq!(
+        connection
+            .login(Credentials::new("test-user", "test-password"))
+            .await
+            .unwrap(),
+        LoginState::Unverified
+    );
+    let identity = connection.identity().await.unwrap();
+    assert_eq!(identity.label, None);
+    assert_eq!(identity.address, header.address);
+    assert!(identity.address_verified);
+    assert_eq!(identity.profile, DeviceProfile::PiKvm);
+    assert_eq!(
+        identity.serial,
+        Reported::Supported("0000000000000000".into())
+    );
+    assert_eq!(identity.host, Reported::Supported("pikvm.example".into()));
+    assert_eq!(identity.id().endpoint, header.address.to_string());
+    server.abort();
+}
+
+// Breaks if a per-request scheme accepts a one-time code it would resend with every request, offers device approval, or sends anything while installing credentials.
+#[tokio::test]
+async fn per_request_schemes_refuse_one_time_codes_and_approval() {
+    let (endpoint, ca, calls, server) = fixture().await;
+    for auth in [AuthScheme::Header, AuthScheme::Basic] {
+        let device = Kvmd::new(Endpoint {
+            label: None,
+            address: endpoint.clone(),
+            profile: DeviceProfile::GlKvm,
+            auth,
+            trust: ServerTrust::Verified {
+                additional_ca_pem: Some(String::from_utf8(ca.clone()).unwrap()),
+            },
+            timeout: REQUEST_TIMEOUT,
+        })
+        .unwrap();
+        assert!(matches!(
+            device
+                .login(Credentials::new("test-user", "test-password").with_totp("012345"))
+                .await,
+            Err(Error::InvalidResponse(_))
+        ));
+        assert_eq!(device.caller(), None);
+        assert_eq!(
+            device
+                .login(Credentials::new("test-user", "test-password"))
+                .await
+                .unwrap(),
+            LoginState::Unverified
+        );
+        assert!(matches!(
+            device.complete_approval().await,
+            Err(Error::Unsupported(_))
+        ));
+    }
     assert!(calls.0.lock().unwrap().is_empty());
     server.abort();
 }

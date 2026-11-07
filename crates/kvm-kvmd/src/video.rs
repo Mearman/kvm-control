@@ -251,7 +251,7 @@ pub(crate) async fn open(device: &Kvmd) -> Result<Box<dyn VideoStream>> {
         session
             .video
             .get(ws_url)
-            .headers(device.auth_headers.clone())
+            .headers(device.auth_headers())
             .upgrade()
             .web_socket_config(ws_config)
             .send(),
@@ -307,11 +307,7 @@ pub(crate) async fn open(device: &Kvmd) -> Result<Box<dyn VideoStream>> {
         .map_err(|_| Error::InvalidResponse("invalid stream URL".into()))?;
     let response = tokio::time::timeout(
         device.config.timeout,
-        session
-            .video
-            .get(url)
-            .headers(device.auth_headers.clone())
-            .send(),
+        session.video.get(url).headers(device.auth_headers()).send(),
     )
     .await
     .map_err(|_| Error::Transport("video request timed out".into()))?

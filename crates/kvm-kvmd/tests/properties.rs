@@ -21,9 +21,10 @@ use axum::{
 use axum_server::tls_rustls::RustlsConfig;
 use base64::Engine;
 use kvm_core::{
-    Confirmation, Control, ControlOutcome, Device as _, DeviceProfile, Error, PowerAction,
+    AuthScheme, Authenticate as _, Confirmation, Control, ControlOutcome, Credentials, Device as _,
+    DeviceProfile, Endpoint, Error, LoginState, PowerAction, ServerTrust,
 };
-use kvm_kvmd::{Config, Kvmd, LoginState};
+use kvm_kvmd::Kvmd;
 use proptest::{collection::vec, prelude::*};
 use serde_json::{Value, json};
 use tokio::sync::Notify;
@@ -434,14 +435,17 @@ impl Fixture {
         })
     }
 
-    fn config(&self, profile: DeviceProfile) -> Config {
+    fn config(&self, profile: DeviceProfile) -> Endpoint {
         let mut endpoint = self.endpoint.clone();
         endpoint.set_path(&format!("/g{}/", self.with(|device| device.generation)));
-        Config {
-            endpoint,
+        Endpoint {
+            label: None,
+            address: endpoint,
             profile,
-            trusted_ca_pem: Some(self.ca.clone()),
-            insecure_tls: false,
+            auth: AuthScheme::Session,
+            trust: ServerTrust::Verified {
+                additional_ca_pem: Some(String::from_utf8(self.ca.clone()).unwrap()),
+            },
             timeout: Duration::from_secs(10),
         }
     }
@@ -667,7 +671,12 @@ proptest! {
     ) {
         let fx = fixture!();
         let device = fx.device(DeviceProfile::PiKvm);
-        let result = fx.run(device.login_with_totp(&user, &password, totp.as_deref()));
+        let credentials = Credentials::new(user.as_str(), password.as_str());
+        let credentials = match &totp {
+            Some(code) => credentials.with_totp(code.as_str()),
+            None => credentials,
+        };
+        let result = fx.run(device.login(credentials));
         prop_assert!(matches!(result, Ok(LoginState::Authenticated)));
         let sent = fx.requests_to("/api/auth/login");
         prop_assert_eq!(sent.len(), 1);
@@ -691,7 +700,7 @@ proptest! {
         prop_assert_eq!(password.len() + 6, usize::try_from(63 + slack).unwrap());
         let fx = fixture!();
         let device = fx.device(DeviceProfile::GlKvm);
-        let result = fx.run(device.login_with_totp("user", &password, Some(&totp)));
+        let result = fx.run(device.login(Credentials::new("user", password.as_str()).with_totp(totp.as_str())));
         let sent = fx.requests_to("/api/auth/login");
         if slack > 0 {
             prop_assert!(matches!(result, Err(Error::InvalidResponse(_))));
@@ -713,11 +722,11 @@ proptest! {
         let profile = if gl { DeviceProfile::GlKvm } else { DeviceProfile::PiKvm };
         let device = fx.device(profile);
         let baseline = fx
-            .run(device.login_with_totp("user", "password", Some("x")))
+            .run(device.login(Credentials::new("user", "password").with_totp("x")))
             .err()
             .unwrap()
             .to_string();
-        let result = fx.run(device.login_with_totp("user", &password, Some(&totp)));
+        let result = fx.run(device.login(Credentials::new("user", password.as_str()).with_totp(totp.as_str())));
         prop_assert!(matches!(&result, Err(Error::InvalidResponse(_))));
         prop_assert_eq!(result.err().unwrap().to_string(), baseline);
         prop_assert!(fx.with(|device| device.requests.is_empty()));
@@ -786,7 +795,7 @@ proptest! {
                             _ => LoginMode::Pending,
                         };
                     });
-                    let result = fx.run(device.login("SECRET-user", "SECRET-password"));
+                    let result = fx.run(device.login(Credentials::new("SECRET-user", "SECRET-password")));
                     match step {
                         Step::Accept => {
                             prop_assert!(matches!(result, Ok(LoginState::Authenticated)));
@@ -963,13 +972,14 @@ proptest! {
         name in "[a-z]{1,6}",
     ) {
         let fx = fixture!();
-        let config = fx.config(DeviceProfile::PiKvm);
-        let built = if basic {
-            Kvmd::with_basic_auth(config, &user, &password)
-        } else {
-            Kvmd::with_header_auth(config, &user, &password)
-        };
-        let device = built.unwrap();
+        let device = Kvmd::new(Endpoint {
+            auth: if basic { AuthScheme::Basic } else { AuthScheme::Header },
+            ..fx.config(DeviceProfile::PiKvm)
+        })
+        .unwrap();
+        // Per-request credentials are installed without a request of their own.
+        let installed = fx.run(device.login(Credentials::new(user.as_str(), password.as_str())));
+        prop_assert!(matches!(installed, Ok(LoginState::Unverified)));
         let outcome = fx.run(async {
             device.mouse_move(1, 2).await?;
             device.key(&name, true).await?;
@@ -1006,7 +1016,13 @@ proptest! {
     ) {
         let fx = fixture!();
         fx.with(|device| device.fail_status = Some(code));
-        let device = Kvmd::with_header_auth(fx.config(DeviceProfile::PiKvm), &user, &password).unwrap();
+        let device = Kvmd::new(Endpoint {
+            auth: AuthScheme::Header,
+            ..fx.config(DeviceProfile::PiKvm)
+        })
+        .unwrap();
+        let installed = fx.run(device.login(Credentials::new(user.as_str(), password.as_str())));
+        prop_assert!(matches!(installed, Ok(LoginState::Unverified)));
         let checked = fx.run(device.check_auth());
         let moved = fx.run(device.mouse_move(1, 2));
         for result in [checked, moved] {
@@ -1026,12 +1042,15 @@ proptest! {
     }
 }
 
-fn offline_config() -> Config {
-    Config {
-        endpoint: Url::parse("https://device.example/").unwrap(),
+fn offline_config() -> Endpoint {
+    Endpoint {
+        label: None,
+        address: Url::parse("https://device.example/").unwrap(),
         profile: DeviceProfile::PiKvm,
-        trusted_ca_pem: None,
-        insecure_tls: false,
+        auth: AuthScheme::Session,
+        trust: ServerTrust::Verified {
+            additional_ca_pem: None,
+        },
         timeout: Duration::from_secs(5),
     }
 }
@@ -1039,16 +1058,23 @@ fn offline_config() -> Config {
 proptest! {
     #![proptest_config(cases(64))]
 
-    // Credentials a header or Basic scheme cannot carry are refused at construction, and the refusal must not repeat them. Breaks if a rejected secret is formatted into the error.
+    // Credentials a header or Basic scheme cannot carry are refused by the login before anything is installed or sent, and the refusal must not repeat them. Breaks if a rejected secret is formatted into the error.
     #[test]
     fn unusable_credentials_are_refused_without_being_echoed(
         prefix in "SECRET-[a-z]{0,6}",
         invalid in proptest::sample::select(vec!["\n", "\r", "\0", "\u{7f}"]),
         suffix in "[a-z]{0,6}",
     ) {
-        let header = Kvmd::with_header_auth(offline_config(), "user", &format!("{prefix}{invalid}{suffix}"));
-        let basic = Kvmd::with_basic_auth(offline_config(), "user", &format!("{prefix}:{suffix}"));
-        for result in [header, basic] {
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let attempt = |auth, password: String| {
+            let device = Kvmd::new(Endpoint { auth, ..offline_config() }).unwrap();
+            let result = runtime.block_on(device.login(Credentials::new("user", password)));
+            (result, device.caller().is_none())
+        };
+        let header = attempt(AuthScheme::Header, format!("{prefix}{invalid}{suffix}"));
+        let basic = attempt(AuthScheme::Basic, format!("{prefix}:{suffix}"));
+        for (result, uninstalled) in [header, basic] {
+            prop_assert!(uninstalled);
             prop_assert!(result.is_err());
             if let Err(error) = result {
                 prop_assert!(!rendered(&error).contains("SECRET-"));

@@ -6,8 +6,11 @@ use std::{
 
 use base64::{Engine, engine::general_purpose::STANDARD};
 use clap::{Parser, Subcommand, ValueEnum};
-use kvm_core::{Confirmation, Control, ControlOutcome, Device, DeviceProfile, PowerAction};
-use kvm_kvmd::{Config, Kvmd, LoginState};
+use kvm_core::{
+    AuthScheme, Confirmation, Connected, Connector, Control, ControlOutcome, Credentials, Device,
+    DeviceProfile, Endpoint, LoginState, PowerAction, ServerTrust,
+};
+use kvm_kvmd::KvmdConnector;
 use serde_json::{Value, json};
 use url::Url;
 use zeroize::Zeroizing;
@@ -179,7 +182,7 @@ async fn write_video(
 }
 
 async fn run_control(
-    device: &impl Device,
+    device: &(impl Device + ?Sized),
     operation: Control,
     confirm: bool,
 ) -> Result<Value, String> {
@@ -227,7 +230,11 @@ fn termination_signal() -> io::Result<impl std::future::Future<Output = ()>> {
 }
 
 /// Holds `press` until it completes or `interrupt` resolves, then always releases inputs, and reports the outcome described by [`press_outcome`]. A press result already available when the signal is also ready is used rather than discarded. A signal the runtime has observed by the time the release completes is passed on; one observed later, or after this returns, is not.
-async fn press_and_release<F, S>(device: &impl Device, press: F, interrupt: S) -> Result<(), String>
+async fn press_and_release<F, S>(
+    device: &(impl Device + ?Sized),
+    press: F,
+    interrupt: S,
+) -> Result<(), String>
 where
     F: std::future::Future<Output = kvm_core::Result<()>>,
     S: std::future::Future<Output = ()>,
@@ -298,7 +305,7 @@ fn write_snapshot(
     Ok(())
 }
 
-async fn execute(device: &impl Device, command: Command) -> Result<Value, String> {
+async fn execute(device: &(impl Device + ?Sized), command: Command) -> Result<Value, String> {
     match command {
         Command::Diagnose | Command::Status => {
             Ok(json!({"status": device.status().await.map_err(|e| e.to_string())?}))
@@ -386,76 +393,79 @@ async fn run(cli: Cli) -> Result<Value, String> {
     let ca = cli
         .ca
         .map(|path| {
-            std::fs::read(&path)
+            std::fs::read_to_string(&path)
                 .map_err(|e| format!("cannot read --ca certificate {}: {e}", path.display()))
         })
         .transpose()?;
     if cli.insecure_tls {
         eprintln!("warning: TLS certificate verification is disabled");
     }
-    let config = Config {
-        endpoint: cli.endpoint,
+    let endpoint = Endpoint {
+        label: None,
+        address: cli.endpoint,
         profile: match cli.profile {
             Profile::Pikvm => DeviceProfile::PiKvm,
             Profile::Glkvm => DeviceProfile::GlKvm,
         },
-        trusted_ca_pem: ca,
-        insecure_tls: cli.insecure_tls,
+        auth: match cli.auth {
+            Auth::Cookie => AuthScheme::Session,
+            Auth::Header => AuthScheme::Header,
+        },
+        trust: if cli.insecure_tls {
+            ServerTrust::Disabled
+        } else {
+            ServerTrust::Verified {
+                additional_ca_pem: ca,
+            }
+        },
         timeout: Duration::from_secs(30),
     };
     if cli.totp && matches!(cli.auth, Auth::Header) {
         return Err("TOTP requires cookie authentication; header authentication would reuse an expiring code".into());
     }
-    let secret = Zeroizing::new(password(cli.password_stdin)?);
-    let totp = if cli.totp {
-        Some(Zeroizing::new(
+    let mut credentials =
+        Credentials::new(cli.username, Zeroizing::new(password(cli.password_stdin)?));
+    if cli.totp {
+        credentials = credentials.with_totp(Zeroizing::new(
             rpassword::prompt_password("TOTP code: ")
                 .map_err(|_| "could not read TOTP from terminal")?,
-        ))
-    } else {
-        None
-    };
-    let device = match cli.auth {
-        Auth::Cookie => {
-            let device = Kvmd::new(config).map_err(|e| e.to_string())?;
-            let login = device
-                .login_with_totp(&cli.username, &secret, totp.as_deref().map(String::as_str))
-                .await;
-            drop(totp);
-            drop(secret);
-            let mut state = login.map_err(|e| e.to_string())?;
-            if let LoginState::ApprovalPending { expires_in } = state {
-                eprintln!(
-                    "{}",
-                    json!({"event": "approval_pending", "expires_in": expires_in, "message": "Approve this login on the device"})
-                );
-                let expiry = expires_in.ok_or("approval has no expiry")?;
-                let deadline = tokio::time::Instant::now() + Duration::from_secs(expiry);
-                while matches!(state, LoginState::ApprovalPending { .. }) {
-                    if tokio::time::Instant::now() >= deadline {
-                        return Err("device approval expired".into());
-                    }
-                    tokio::time::timeout_at(deadline, async {
-                        tokio::time::sleep(Duration::from_secs(1)).await;
-                        device.complete_approval().await
-                    })
-                    .await
-                    .map_err(|_| "device approval expired")?
-                    .map(|next| state = next)
-                    .map_err(|e| e.to_string())?;
+        ));
+    }
+    // The credentials are consumed by the login, which drops and so clears them once it has sent them. Under header authentication the connector also checks them with the device.
+    let connection = match KvmdConnector
+        .connect(endpoint, credentials)
+        .await
+        .map_err(|e| e.to_string())?
+    {
+        Connected::Authenticated(connection) => connection,
+        Connected::ApprovalPending {
+            connection,
+            expires_in,
+        } => {
+            eprintln!(
+                "{}",
+                json!({"event": "approval_pending", "expires_in": expires_in, "message": "Approve this login on the device"})
+            );
+            let expiry = expires_in.ok_or("approval has no expiry")?;
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(expiry);
+            let mut state = LoginState::ApprovalPending { expires_in };
+            while matches!(state, LoginState::ApprovalPending { .. }) {
+                if tokio::time::Instant::now() >= deadline {
+                    return Err("device approval expired".into());
                 }
+                tokio::time::timeout_at(deadline, async {
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    connection.complete_approval().await
+                })
+                .await
+                .map_err(|_| "device approval expired")?
+                .map(|next| state = next)
+                .map_err(|e| e.to_string())?;
             }
-            device
-        }
-        Auth::Header => {
-            let device = Kvmd::with_header_auth(config, &cli.username, &secret);
-            drop(secret);
-            let device = device.map_err(|e| e.to_string())?;
-            device.check_auth().await.map_err(|e| e.to_string())?;
-            device
+            connection
         }
     };
-    execute(&device, cli.command).await
+    execute(connection.as_ref(), cli.command).await
 }
 
 #[tokio::main]

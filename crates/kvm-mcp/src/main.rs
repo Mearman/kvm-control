@@ -1,7 +1,10 @@
 use std::{env, error::Error, fs, process::ExitCode, sync::Arc, time::Duration};
 
-use kvm_core::DeviceProfile;
-use kvm_kvmd::{Config, Kvmd, LoginState};
+use kvm_core::{
+    AuthScheme, Connected, Connector, Credentials, Device, DeviceProfile, Endpoint, LoginState,
+    ServerTrust,
+};
+use kvm_kvmd::KvmdConnector;
 use kvm_mcp::Server;
 use rmcp::ServiceExt;
 use url::Url;
@@ -136,40 +139,58 @@ async fn run() -> Result<(), Box<dyn Error>> {
     let ca = env::var("KVM_CA_FILE")
         .ok()
         .map(|path| {
-            fs::read(&path).map_err(|error| format!("cannot read KVM_CA_FILE {path}: {error}"))
+            fs::read_to_string(&path)
+                .map_err(|error| format!("cannot read KVM_CA_FILE {path}: {error}"))
         })
         .transpose()?;
-    let device = Arc::new(Kvmd::new(Config {
-        endpoint,
+    let endpoint = Endpoint {
+        label: None,
+        address: endpoint,
         profile,
-        trusted_ca_pem: ca,
-        insecure_tls,
+        auth: AuthScheme::Session,
+        trust: if insecure_tls {
+            ServerTrust::Disabled
+        } else {
+            ServerTrust::Verified {
+                additional_ca_pem: ca,
+            }
+        },
         timeout: Duration::from_secs(30),
-    })?);
+    };
     let password = read_password(&password_fd)?;
     let totp = env::var("KVM_TOTP_FD")
         .ok()
         .map(|fd| read_password(&fd))
         .transpose()?;
-    let login = device
-        .login_with_totp(&username, &password, totp.as_deref().map(String::as_str))
-        .await?;
-    drop(totp);
-    drop(password);
-    if let LoginState::ApprovalPending { expires_in } = login {
-        let seconds = expires_in.ok_or("device approval expiry is missing")?;
-        eprintln!("Device approval pending; approve the request on the device.");
-        tokio::time::timeout(Duration::from_secs(seconds), async {
-            loop {
-                tokio::time::sleep(Duration::from_secs(1)).await;
-                if matches!(device.complete_approval().await?, LoginState::Authenticated) {
-                    return Ok::<(), kvm_core::Error>(());
-                }
-            }
-        })
-        .await
-        .map_err(|_| "device approval expired")??;
+    let mut credentials = Credentials::new(username, password);
+    if let Some(code) = totp {
+        credentials = credentials.with_totp(code);
     }
+    let connection = match KvmdConnector.connect(endpoint, credentials).await? {
+        Connected::Authenticated(connection) => connection,
+        Connected::ApprovalPending {
+            connection,
+            expires_in,
+        } => {
+            let seconds = expires_in.ok_or("device approval expiry is missing")?;
+            eprintln!("Device approval pending; approve the request on the device.");
+            tokio::time::timeout(Duration::from_secs(seconds), async {
+                loop {
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    if matches!(
+                        connection.complete_approval().await?,
+                        LoginState::Authenticated
+                    ) {
+                        return Ok::<(), kvm_core::Error>(());
+                    }
+                }
+            })
+            .await
+            .map_err(|_| "device approval expired")??;
+            connection
+        }
+    };
+    let device: Arc<dyn Device> = connection;
     let allow_control = env::var("KVM_ALLOW_CONTROL").as_deref() == Ok("1");
     #[cfg(unix)]
     let transport = (
