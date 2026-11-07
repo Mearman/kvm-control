@@ -1087,20 +1087,26 @@ async fn explicit_video_reopen_after_complete_or_interrupted_stream() {
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             for attempt in 0..2 {
-                let (socket, _) = listener.accept().await.unwrap();
-                let mut ws = tokio_tungstenite::accept_hdr_async(
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let request = read_request(&mut socket).await;
+                assert!(request.starts_with("GET /api/ws?stream=true HTTP/1.1\r\n"));
+                let key = request
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("sec-websocket-key")
+                            .then(|| value.trim())
+                    })
+                    .unwrap();
+                let accept =
+                    tokio_tungstenite::tungstenite::handshake::derive_accept_key(key.as_bytes());
+                socket.write_all(format!("HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Accept: {accept}\r\n\r\n").as_bytes()).await.unwrap();
+                let mut ws = tokio_tungstenite::WebSocketStream::from_raw_socket(
                     socket,
-                    |request: &tokio_tungstenite::tungstenite::handshake::server::Request,
-                     response| {
-                        assert_eq!(
-                            request.uri().path_and_query().unwrap().as_str(),
-                            "/api/ws?stream=true"
-                        );
-                        Ok(response)
-                    },
+                    tokio_tungstenite::tungstenite::protocol::Role::Server,
+                    None,
                 )
-                .await
-                .unwrap();
+                .await;
                 let (mut http, _) = listener.accept().await.unwrap();
                 let request = read_request(&mut http).await;
                 assert!(request.starts_with("GET /streamer/stream "));
