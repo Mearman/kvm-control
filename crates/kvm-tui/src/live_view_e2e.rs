@@ -57,14 +57,17 @@ fn dominated_by(colour: Color, channel: usize) -> bool {
     channels[channel] > channels.iter().sum::<u16>() - channels[channel]
 }
 
-fn multipart(jpeg: &[u8]) -> Vec<u8> {
+/// One multipart part, ending with the delimiter that introduces the next one. The adapter yields a
+/// frame only once the delimiter after it has arrived, so a part that left it out would not be
+/// delivered until the following frame was sent.
+fn multipart_part(jpeg: &[u8]) -> Vec<u8> {
     let mut part = format!(
-        "--frame\r\nContent-Type: image/jpeg\r\nContent-Length: {}\r\n\r\n",
+        "Content-Type: image/jpeg\r\nContent-Length: {}\r\n\r\n",
         jpeg.len()
     )
     .into_bytes();
     part.extend_from_slice(jpeg);
-    part.extend_from_slice(b"\r\n");
+    part.extend_from_slice(b"\r\n--frame\r\n");
     part
 }
 
@@ -115,12 +118,16 @@ async fn lease(ws: WebSocketUpgrade) -> impl IntoResponse {
 async fn stream(State(fixture): State<Fixture>) -> impl IntoResponse {
     let frames = fixture.frames.lock().unwrap().take().unwrap();
     let body = axum::body::Body::from_stream(futures_util::stream::unfold(
-        frames,
-        |mut frames| async move {
-            frames
-                .recv()
-                .await
-                .map(|jpeg| (Ok::<_, Infallible>(multipart(&jpeg)), frames))
+        (frames, true),
+        |(mut frames, first)| async move {
+            let jpeg = frames.recv().await?;
+            let mut chunk = if first {
+                b"--frame\r\n".to_vec()
+            } else {
+                Vec::new()
+            };
+            chunk.extend(multipart_part(&jpeg));
+            Some((Ok::<_, Infallible>(chunk), (frames, false)))
         },
     ));
     (
@@ -164,6 +171,7 @@ async fn synthetic_device() -> SyntheticDevice {
     };
     let calls = fixture.calls.clone();
     let app = Router::new()
+        .route("/api/auth/check", get(state))
         .route("/api/info", get(state))
         .route("/api/hid", get(state))
         .route("/api/streamer", get(state))
