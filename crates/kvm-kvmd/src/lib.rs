@@ -515,8 +515,14 @@ impl Drop for Collect<'_> {
             return;
         };
         outcome.close();
-        // Empty or closed: the task sees the failed delivery under the lock and releases its own press, or it was dropped and its lock guard queued that release.
-        let Ok((_, Some(owed))) = outcome.try_recv() else {
+        // Empty or closed: the task sees the failed delivery under the lock, reports a failed outcome and releases its own press, or it was dropped and its lock guard queued that release.
+        let Ok((result, owed)) = outcome.try_recv() else {
+            return;
+        };
+        if let Err(error) = result {
+            report_abandoned(&error);
+        }
+        let Some(owed) = owed else {
             return;
         };
         self.device
@@ -992,7 +998,7 @@ impl Kvmd {
         failed
     }
 
-    /// Releases tracked inputs for a dropped owner, reporting only a release that fails here: an earlier failure was already reported to the call that saw it.
+    /// Releases tracked inputs for a dropped owner, reporting only a release that fails here: an earlier failure was reported to the call that saw it, or printed when that call had been abandoned.
     async fn release_for_drop(&self) {
         let mut inputs = self.inputs.lock().await;
         self.settle_owed(&mut inputs).await;
@@ -1017,7 +1023,7 @@ impl Kvmd {
 
     /// Sends cleanup owed to earlier requests, the caller holding the input lock: finishes an interrupted explicit release, then releases each input an abandoned press still holds unless a later request changed it. A confirmed owed release is recorded in `inputs.cleaned` unless the input is tracked as uncertain, since an earlier ambiguous press may still be applied after the release. An owed release interrupted by runtime shutdown is recorded as ambiguous by `send_held`, so it is never resent.
     async fn settle_owed(&self, inputs: &mut Inputs) {
-        // Only a failure of the finishing release is new; one already known left the session indeterminate and was reported to the call that saw it.
+        // Only a failure of the finishing release is new; one already known was reported to the call that saw it, or printed when that call had been abandoned.
         if inputs.release_pending && self.release_held(inputs).await {
             eprintln!(
                 "Input cleanup uncertain: a release finishing an interrupted release was not confirmed"
@@ -1050,6 +1056,46 @@ impl Kvmd {
                 Err(error) => eprintln!("Input cleanup uncertain: {error}"),
             }
         }
+    }
+
+    /// Sends owed releases, then the movement, the caller having handed over the input lock. A movement whose caller is gone (`caller` closed) once settlement finishes, or by the time it would be submitted, is not sent; the HID state read between them is skipped too in the first case.
+    async fn settled_move(
+        &self,
+        mut inputs: tokio::sync::OwnedMutexGuard<Inputs>,
+        x: i16,
+        y: i16,
+        caller: &tokio::sync::oneshot::Sender<Result<()>>,
+    ) -> Result<()> {
+        self.settle_owed(&mut inputs).await;
+        if caller.is_closed() {
+            return Ok(());
+        }
+        let active = self.client.read().await;
+        let state = self.json_with(&active.client, "hid").await?;
+        if hid_capability(&state, "mouse") != Capability::Supported
+            || mouse_mode(&state) != MouseMode::Absolute
+        {
+            return Err(Error::Unsupported(
+                "absolute mouse movement requires an online absolute-mode mouse".into(),
+            ));
+        }
+        if caller.is_closed() {
+            return Ok(());
+        }
+        // Marked before submission so a task dropped mid-request (runtime shutdown) leaves the session indeterminate.
+        let indeterminate = inputs.indeterminate;
+        inputs.indeterminate = true;
+        let result = self
+            .input_with(
+                &active.client,
+                "hid/events/send_mouse_move",
+                &[("to_x", x.to_string()), ("to_y", y.to_string())],
+            )
+            .await;
+        if result.is_ok() {
+            inputs.indeterminate = indeterminate;
+        }
+        result
     }
 
     /// Takes the input lock and sends owed releases on a task that hands the lock back, so a caller cancelled during settlement cannot interrupt a release: the task finishes it and then unlocks.
@@ -1101,13 +1147,18 @@ impl Kvmd {
                 inputs.owes = owes.clone();
                 worker.send_held(&mut inputs, kind, &name, pressed).await
             };
-            if let Err((_, Some(owed))) = result_tx.send((result, owes)) {
-                worker
-                    .owed
-                    .lock()
-                    .expect("owed releases lock poisoned")
-                    .push_back(owed);
-                worker.settle_owed(&mut inputs).await;
+            if let Err((result, owed)) = result_tx.send((result, owes)) {
+                if let Err(error) = &result {
+                    report_abandoned(error);
+                }
+                if let Some(owed) = owed {
+                    worker
+                        .owed
+                        .lock()
+                        .expect("owed releases lock poisoned")
+                        .push_back(owed);
+                    worker.settle_owed(&mut inputs).await;
+                }
             }
             inputs.settle();
         });
@@ -1141,6 +1192,11 @@ impl Kvmd {
         }
         Ok(())
     }
+}
+
+/// Reports a failed input outcome whose caller abandoned the request, since no caller will see it.
+fn report_abandoned(error: &Error) {
+    eprintln!("Input outcome uncertain for an abandoned request: {error}");
 }
 
 fn hid_capability(state: &serde_json::Value, device: &str) -> Capability {
@@ -1245,35 +1301,16 @@ impl Device for Kvmd {
         let inputs = self.inputs.clone().lock_owned().await;
         self.capture_input_runtime();
         let worker = self.input_worker();
+        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
         tokio::spawn(async move {
-            let mut inputs = inputs;
-            worker.settle_owed(&mut inputs).await;
-            let active = worker.client.read().await;
-            let state = worker.json_with(&active.client, "hid").await?;
-            if hid_capability(&state, "mouse") != Capability::Supported
-                || mouse_mode(&state) != MouseMode::Absolute
-            {
-                return Err(Error::Unsupported(
-                    "absolute mouse movement requires an online absolute-mode mouse".into(),
-                ));
+            let result = worker.settled_move(inputs, x, y, &result_tx).await;
+            if let Err(Err(error)) = result_tx.send(result) {
+                report_abandoned(&error);
             }
-            // Marked before submission so a task dropped mid-request (runtime shutdown) leaves the session indeterminate.
-            let indeterminate = inputs.indeterminate;
-            inputs.indeterminate = true;
-            let result = worker
-                .input_with(
-                    &active.client,
-                    "hid/events/send_mouse_move",
-                    &[("to_x", x.to_string()), ("to_y", y.to_string())],
-                )
-                .await;
-            if result.is_ok() {
-                inputs.indeterminate = indeterminate;
-            }
-            result
-        })
-        .await
-        .map_err(|_| Error::AmbiguousInput("input task failed".into()))?
+        });
+        result_rx
+            .await
+            .map_err(|_| Error::AmbiguousInput("input task failed".into()))?
     }
 
     async fn control(
