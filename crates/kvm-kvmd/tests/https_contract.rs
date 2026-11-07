@@ -125,6 +125,19 @@ async fn gl_complete(body: String) -> impl IntoResponse {
     )
 }
 
+/// Whether a request carries the fixture's session cookie, KVMD headers or Basic credentials, and the session has not been expired by the test.
+fn authorised(calls: &Calls, headers: &HeaderMap) -> bool {
+    let cookie =
+        headers.get(header::COOKIE).and_then(|v| v.to_str().ok()) == Some("auth_token=synthetic");
+    let header_auth = headers.get("x-kvmd-user").and_then(|v| v.to_str().ok()) == Some("test-user")
+        && headers.get("x-kvmd-passwd").and_then(|v| v.to_str().ok()) == Some("test-password");
+    let basic = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        == Some("Basic dGVzdC11c2VyOnRlc3QtcGFzc3dvcmQ=");
+    (cookie || header_auth || basic) && !calls.1.load(Ordering::SeqCst)
+}
+
 async fn status(State(calls): State<Calls>, uri: Uri, headers: HeaderMap) -> impl IntoResponse {
     calls
         .0
@@ -135,15 +148,7 @@ async fn status(State(calls): State<Calls>, uri: Uri, headers: HeaderMap) -> imp
         } else {
             uri.path().to_string()
         });
-    let cookie =
-        headers.get(header::COOKIE).and_then(|v| v.to_str().ok()) == Some("auth_token=synthetic");
-    let header_auth = headers.get("x-kvmd-user").and_then(|v| v.to_str().ok()) == Some("test-user")
-        && headers.get("x-kvmd-passwd").and_then(|v| v.to_str().ok()) == Some("test-password");
-    let basic = headers
-        .get(header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        == Some("Basic dGVzdC11c2VyOnRlc3QtcGFzc3dvcmQ=");
-    if (!cookie && !header_auth && !basic) || calls.1.load(Ordering::SeqCst) {
+    if !authorised(&calls, &headers) {
         return (
             StatusCode::FORBIDDEN,
             Json(json!({"ok": false, "result": {}})),
@@ -206,7 +211,13 @@ async fn poisoning_status() -> impl IntoResponse {
     )
 }
 
-async fn capability(uri: Uri) -> impl IntoResponse {
+async fn capability(State(calls): State<Calls>, uri: Uri, headers: HeaderMap) -> impl IntoResponse {
+    if !authorised(&calls, &headers) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({"ok": false, "result": {}})),
+        );
+    }
     let state = match uri.path() {
         "/api/gpio" => {
             json!({"state": {"outputs": {"lamp": {"online": true, "busy": false, "state": true}, "offline": {"online": false, "busy": false, "state": false}, "busy": {"online": true, "busy": true, "state": false}}}})
@@ -217,7 +228,7 @@ async fn capability(uri: Uri) -> impl IntoResponse {
         "/api/atx" => json!({"enabled": true, "leds": {"power": false}}),
         _ => json!({"enabled": true, "drive": {"connected": true, "image": {"name": "disk.iso"}}}),
     };
-    Json(json!({"ok": true, "result": state}))
+    (StatusCode::OK, Json(json!({"ok": true, "result": state})))
 }
 
 async fn switch_fixture(State(calls): State<Calls>, uri: Uri) -> impl IntoResponse {
@@ -1942,7 +1953,7 @@ async fn approval_token_without_usable_cookie_is_rejected() {
 async fn switch_observation_uses_profile_semantics_and_rejects_unknown_ports() {
     let (endpoint, ca, calls, server) = fixture().await;
     for profile in [DeviceProfile::GlKvm, DeviceProfile::PiKvm] {
-        let device = profile_client(endpoint.clone(), Some(ca.clone()), profile);
+        let device = header_client(endpoint.clone(), &ca, profile);
         let outcome = device
             .control(Control::Switch { port: 0 }, Confirmation::new())
             .await
@@ -2282,6 +2293,11 @@ const STATUS_ROUTES: [&str; 7] = ["info", "hid", "streamer", "atx", "switch", "g
 fn status_client(endpoint: &Url, ca: &[u8], prefix: &str, profile: DeviceProfile) -> Kvmd {
     let mut endpoint = endpoint.clone();
     endpoint.set_path(&format!("/{prefix}/"));
+    header_client(endpoint, ca, profile)
+}
+
+/// A client authenticating with KVMD headers, which the fixture accepts on every request without a login.
+fn header_client(endpoint: Url, ca: &[u8], profile: DeviceProfile) -> Kvmd {
     Kvmd::with_header_auth(
         Config {
             endpoint,
