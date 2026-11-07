@@ -6,9 +6,8 @@ use async_trait::async_trait;
 use kvm_core::{
     AuthScheme, Authenticate, CallerIdentity, Capabilities, Capability, Confirmation, Connected,
     Connection, Connector, Control, ControlOutcome, Credentials, Device, DeviceIdentity,
-    DeviceProfile, DeviceStatus, Endpoint, EndpointName, Error, LoginState, MouseMode,
-    PlatformInfo, Reported, Result, ServerTrust, Snapshot, SwitchPort, SwitchStatus, SystemInfo,
-    VideoStream,
+    DeviceProfile, DeviceStatus, Endpoint, Error, LoginState, MouseMode, PlatformInfo, Reported,
+    Result, ServerTrust, Snapshot, SwitchPort, SwitchStatus, SystemInfo, VideoStream,
 };
 use std::{
     sync::{Arc, Mutex},
@@ -478,6 +477,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kvm_core::EndpointName;
 
     /// The interval between approval checks in tests: short, so the synthetic approval is not waited for.
     const TEST_POLL: Duration = Duration::from_millis(1);
