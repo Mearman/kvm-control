@@ -14,6 +14,10 @@ struct FakeDevice {
     events: Mutex<Vec<String>>,
     /// Reports the switch status unknown, as a device whose switch route failed does.
     switch_unknown: bool,
+    /// Reports the switch's active port unknown, as a device whose switch summary is unreadable does.
+    active_unknown: bool,
+    /// Reports the switch's port list unsupported.
+    no_port_list: bool,
 }
 
 struct FakeVideo(bool);
@@ -54,8 +58,16 @@ impl Device for FakeDevice {
                 Reported::Unknown
             } else {
                 Reported::Supported(SwitchStatus {
-                    ports: Reported::Supported(vec![port(0), port(1)]),
-                    active_port: Reported::Supported(Some(0)),
+                    ports: if self.no_port_list {
+                        Reported::Unsupported
+                    } else {
+                        Reported::Supported(vec![port(0), port(1)])
+                    },
+                    active_port: if self.active_unknown {
+                        Reported::Unknown
+                    } else {
+                        Reported::Supported(Some(0))
+                    },
                     synced: Reported::Supported(true),
                 })
             },
@@ -116,8 +128,10 @@ enum ConsumeError {
     Device(Error),
     /// The device reports that it has no switch.
     NoSwitch,
-    /// The switch status, or its port list, could not be observed, so no port can be chosen safely.
+    /// The switch status, its port list or its active port could not be observed, so no port can be chosen safely.
     SwitchUnknown,
+    /// The device reports a switch but no port list.
+    NoPortList,
     NoOtherPort,
 }
 
@@ -133,6 +147,7 @@ impl std::fmt::Display for ConsumeError {
             Self::Device(error) => error.fmt(formatter),
             Self::NoSwitch => formatter.write_str("the device has no switch"),
             Self::SwitchUnknown => formatter.write_str("the switch status is unknown"),
+            Self::NoPortList => formatter.write_str("the switch reports no port list"),
             Self::NoOtherPort => formatter.write_str("the switch has no other port"),
         }
     }
@@ -150,11 +165,17 @@ async fn consume(device: &dyn Device) -> std::result::Result<ControlOutcome, Con
         Reported::Unsupported => return Err(ConsumeError::NoSwitch),
         Reported::Unknown => return Err(ConsumeError::SwitchUnknown),
     };
-    let active = switch.active_port.value().copied().flatten();
-    let target = switch
-        .ports
-        .value()
-        .ok_or(ConsumeError::SwitchUnknown)?
+    // An unobserved active port is not "no port selected": choosing a target then could pick the active port.
+    let active = match switch.active_port {
+        Reported::Supported(active) => active,
+        Reported::Unsupported | Reported::Unknown => return Err(ConsumeError::SwitchUnknown),
+    };
+    let ports = match &switch.ports {
+        Reported::Supported(ports) => ports,
+        Reported::Unsupported => return Err(ConsumeError::NoPortList),
+        Reported::Unknown => return Err(ConsumeError::SwitchUnknown),
+    };
+    let target = ports
         .iter()
         .find(|port| Some(port.port) != active)
         .ok_or(ConsumeError::NoOtherPort)?
@@ -214,22 +235,41 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_unknown_switch_status_is_reported_as_unknown() {
-        let device = FakeDevice {
-            switch_unknown: true,
-            ..FakeDevice::default()
-        };
-        let error = consume(&device).await.unwrap_err();
-        assert!(matches!(error, ConsumeError::SwitchUnknown));
-        assert_eq!(error.to_string(), "the switch status is unknown");
-        // No switch control was sent without a known port.
-        assert!(
-            !device
-                .events
-                .lock()
-                .unwrap()
-                .iter()
-                .any(|event| event.starts_with("switch"))
-        );
+    async fn an_unobserved_switch_sends_no_control() {
+        for (device, expected) in [
+            (
+                FakeDevice {
+                    switch_unknown: true,
+                    ..FakeDevice::default()
+                },
+                "the switch status is unknown",
+            ),
+            (
+                FakeDevice {
+                    active_unknown: true,
+                    ..FakeDevice::default()
+                },
+                "the switch status is unknown",
+            ),
+            (
+                FakeDevice {
+                    no_port_list: true,
+                    ..FakeDevice::default()
+                },
+                "the switch reports no port list",
+            ),
+        ] {
+            let error = consume(&device).await.unwrap_err();
+            assert_eq!(error.to_string(), expected);
+            // No switch control was sent without a known target.
+            assert!(
+                !device
+                    .events
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|event| event.starts_with("switch"))
+            );
+        }
     }
 }
