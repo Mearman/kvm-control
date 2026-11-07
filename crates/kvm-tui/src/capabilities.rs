@@ -323,45 +323,34 @@ pub(crate) async fn probe(query: &[u8], deadline: Duration) -> io::Result<ProbeR
 
 /// Whether a read of standard input would return without blocking; hang-up and invalid descriptors count as ready so that the following read reports them.
 #[cfg(unix)]
-// A non-blocking readiness check of the raw descriptor needs poll(2), which no dependency wraps safely.
-#[allow(unsafe_code)]
 fn stdin_ready() -> io::Result<bool> {
-    let mut descriptor = libc::pollfd {
-        fd: libc::STDIN_FILENO,
-        events: libc::POLLIN,
-        revents: 0,
+    use rustix::event::{PollFd, PollFlags, Timespec, poll};
+    let stdin = rustix::stdio::stdin();
+    let mut descriptors = [PollFd::from_borrowed_fd(stdin, PollFlags::IN)];
+    let immediately = Timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
     };
-    // SAFETY: `descriptor` is a valid `pollfd` for the duration of the call and the count is one.
-    let ready = unsafe { libc::poll(&mut descriptor, 1, 0) };
-    if ready < 0 {
-        let error = io::Error::last_os_error();
-        return if error.kind() == io::ErrorKind::Interrupted {
-            Ok(false)
-        } else {
-            Err(error)
-        };
+    // poll(2) counts the descriptors whose returned events are non-zero, so with one descriptor a positive count means it reported an event, hang-up and invalid descriptors included; `PollFd::revents` is not read because it panics on an event bit rustix does not define.
+    match poll(&mut descriptors, Some(&immediately)) {
+        Ok(ready) => Ok(ready > 0),
+        Err(rustix::io::Errno::INTR) => Ok(false),
+        Err(error) => Err(error.into()),
     }
-    Ok(ready > 0 && descriptor.revents != 0)
 }
 
 /// Reads what standard input holds; `None` means the read was interrupted or would block and should be retried after the next readiness check.
+///
+/// Reads the descriptor directly: a buffered `std::io::Stdin` could hold back bytes the readiness check cannot see.
 #[cfg(unix)]
-// Reading the raw descriptor without buffering needs read(2): a buffered `Stdin` could hold back bytes the readiness check cannot see.
-#[allow(unsafe_code)]
 fn read_stdin(buffer: &mut [u8]) -> io::Result<Option<usize>> {
-    // SAFETY: the pointer and length describe `buffer`, which outlives the call.
-    let read = unsafe { libc::read(libc::STDIN_FILENO, buffer.as_mut_ptr().cast(), buffer.len()) };
-    match usize::try_from(read) {
+    use rustix::io::Errno;
+    match rustix::io::read(rustix::stdio::stdin(), buffer) {
         Ok(read) => Ok(Some(read)),
-        Err(_) => {
-            let error = io::Error::last_os_error();
-            match error.kind() {
-                io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock => Ok(None),
-                // A descriptor that is no longer open has nothing more to say.
-                _ if error.raw_os_error() == Some(libc::EBADF) => Ok(Some(0)),
-                _ => Err(error),
-            }
-        }
+        Err(Errno::INTR | Errno::AGAIN) => Ok(None),
+        // A descriptor that is no longer open has nothing more to say.
+        Err(Errno::BADF) => Ok(Some(0)),
+        Err(error) => Err(error.into()),
     }
 }
 
