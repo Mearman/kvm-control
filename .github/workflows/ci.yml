@@ -1,0 +1,238 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      abandon_invalid_tag:
+        description: Unreleased invalid tag to abandon without altering it
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+env:
+  CARGO_INCREMENTAL: 0
+  CARGO_PROFILE_DEV_DEBUG: 0
+
+jobs:
+  checks:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - name: Install release test dependency
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo install convco --version 0.7.2 --locked
+      - name: Test release recovery
+        if: matrix.os == 'ubuntu-latest'
+        run: bash .github/scripts/test-release.sh
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: cargo test --workspace --locked
+      - name: Test release version metadata
+        run: bash .github/scripts/test-release-version.sh
+
+  commits:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - run: cargo install convco --version 0.7.2 --locked
+      - name: Check conventional commits
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+        run: convco check "$BASE..$HEAD"
+
+  validate-release-archives:
+    if: github.event_name == 'pull_request' && github.base_ref == 'ci'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+          - os: macos-15
+            target: aarch64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          ref: 7c0eb187aa5d34036ca6827c5f54ab95b3ba1751
+          persist-credentials: false
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          ref: ${{ github.sha }}
+          path: .release-tools
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - name: Set release package version
+        run: bash .release-tools/.github/scripts/set-release-version.sh v0.1.0
+      - name: Build all interfaces
+        env:
+          TARGET: ${{ matrix.target }}
+        run: cargo build --locked --release --target "$TARGET" --workspace --bins --message-format=json > build-messages.json
+      - name: Package and smoke test installed binaries
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          name="kvm-control-v0.1.0-${TARGET}.tar.gz"
+          mkdir -p dist installed
+          jq -r 'select(.reason == "compiler-artifact" and (.target.kind | index("bin")) != null and .executable != null) | .target.name' build-messages.json | sort -u > binaries.txt
+          printf '%s\n' kvm-cli kvm-mcp kvm-tui > expected-binaries.txt
+          diff -u expected-binaries.txt binaries.txt
+          while IFS= read -r binary; do
+            test -x "target/$TARGET/release/$binary"
+          done < binaries.txt
+          tar -czf "dist/$name" -C "target/$TARGET/release" -T "$GITHUB_WORKSPACE/binaries.txt"
+          (cd dist && shasum -a 256 "$name" > "$name.sha256" && shasum -a 256 -c "$name.sha256")
+          tar -xzf "dist/$name" -C installed
+          installed/kvm-cli --help >/dev/null
+          installed/kvm-tui --help >/dev/null
+          if env -i installed/kvm-mcp >mcp.stdout 2>mcp.stderr; then
+            printf 'Expected kvm-mcp to reject missing configuration\n' >&2
+            exit 1
+          fi
+          grep -Fx 'Error: NotPresent' mcp.stderr
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: validation-${{ matrix.target }}
+          path: dist/
+          if-no-files-found: error
+
+  version:
+    if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main'
+    needs: checks
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      plan: ${{ steps.version.outputs.plan }}
+      matrix: ${{ steps.version.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - run: cargo install convco --version 0.7.2 --locked
+      - id: version
+        name: Calculate release version
+        shell: bash
+        env:
+          ATTEMPT: ${{ github.run_attempt }}
+          GH_TOKEN: ${{ github.token }}
+          ABANDON_INVALID_TAG: ${{ inputs.abandon_invalid_tag }}
+        run: bash .github/scripts/version.sh
+      - name: Verify release binaries exist
+        env:
+          PLAN: ${{ steps.version.outputs.plan }}
+        run: bash .github/scripts/check-release-binaries.sh
+      - name: Record release intent
+        env:
+          PLAN: ${{ steps.version.outputs.plan }}
+        run: bash .github/scripts/record-release-intent.sh
+
+  archives:
+    needs: version
+    if: needs.version.outputs.plan != '[]'
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.version.outputs.matrix) }}
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          ref: ${{ matrix.commit }}
+          persist-credentials: false
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          ref: ${{ github.sha }}
+          path: .release-tools
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - name: Set release package version
+        env:
+          TAG: ${{ matrix.tag }}
+        run: bash .release-tools/.github/scripts/set-release-version.sh "$TAG"
+      - name: Build all interfaces
+        env:
+          TARGET: ${{ matrix.target }}
+        run: cargo build --locked --release --target "$TARGET" --workspace --bins --message-format=json > build-messages.json
+      - name: Create and verify archive
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          TAG: ${{ matrix.tag }}
+        run: |
+          set -euo pipefail
+          name="kvm-control-${TAG}-${TARGET}.tar.gz"
+          mkdir -p dist
+          jq -r 'select(.reason == "compiler-artifact" and (.target.kind | index("bin")) != null and .executable != null) | .target.name' build-messages.json | sort -u > binaries.txt
+          test -s binaries.txt
+          while IFS= read -r binary; do
+            test -x "target/$TARGET/release/$binary"
+          done < binaries.txt
+          tar -czf "dist/$name" -C "target/$TARGET/release" -T "$GITHUB_WORKSPACE/binaries.txt"
+          (cd dist && shasum -a 256 "$name" > "$name.sha256" && shasum -a 256 -c "$name.sha256")
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ matrix.tag }}-${{ matrix.target }}
+          path: dist/
+          if-no-files-found: error
+
+  publish:
+    needs: [version, archives]
+    if: needs.version.outputs.plan != '[]' && needs.archives.result == 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          fetch-depth: 0
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          path: dist
+          merge-multiple: true
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - run: cargo install convco --version 0.7.2 --locked
+      - name: Verify assets and publish draft
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PLAN: ${{ needs.version.outputs.plan }}
+        run: bash .github/scripts/publish-plan.sh
