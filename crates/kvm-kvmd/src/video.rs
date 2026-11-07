@@ -37,9 +37,9 @@ pub(crate) const STREAM_STORAGE_BYTES: usize = (crate::MAX_JPEG_VALIDATIONS + 1)
 /// A stream registers as waiting only while a reservation is blocked, and other streams yield to waiting streams so that neither idle nor partly read streams can starve them:
 ///
 /// - a stream with no consumer read outstanding that holds charged storage releases it while any stream waits: its buffer, an unclaimed frame, and a frame waiting for or undergoing validation. Giving up headers loses nothing, since they are kept and read again; a frame or the body of a part is lost, and the stream continues with the part after it, finding that part's start by the given-up part's declared length or by scanning for its delimiter. A final frame given up this way, or a final part it was reading, is reported as an error;
-/// - of two blocked streams that both hold charged storage, the one opened later releases it and restarts its read, so blocked streams never hold storage each other need; a blocked stream holding none waits in the budget's queue for what it needs.
+/// - a blocked stream that holds charged storage gives it up to any older blocked stream, whether or not that one holds storage, and restarts its read; a blocked stream that holds none waits in the budget's queue for what it needs. Blocked streams therefore never hold storage an older one needs.
 ///
-/// The oldest blocked stream holding storage therefore waits only for streams that are reading or validating, which release their storage when their frame is delivered or dropped, the stream ends, or it times out.
+/// The oldest blocked stream therefore waits only for streams that are reading or validating, which release their storage when their frame is delivered or dropped, the stream ends, or it times out, or that queued for storage before it and will read once served.
 pub(crate) struct StreamStorage {
     bytes: Arc<Semaphore>,
     capacity: usize,
@@ -191,6 +191,8 @@ struct Parser {
     last_copy: Option<(bool, bytes::Bytes, usize)>,
     /// Set when the final frame was given up to a waiting stream, which the next read reports.
     final_reclaimed: bool,
+    /// Set when the stream gives up a frame or part of one, and cleared when it next delivers a frame, so the actor can tell that a read it ended at the consumer deadline was still recovering from storage it gave up (dropping a given-up part's body, or scanning past it).
+    lost: bool,
     /// Set while a reservation is blocked waiting for storage. It stays set when the read is dropped there, so the actor can tell that a read it ended at the consumer deadline was starved, and is cleared when the actor sees the read cancelled and at the start of each read.
     starved: bool,
     validation: Option<JoinHandle<Result<Frame>>>,
@@ -487,6 +489,7 @@ impl Mjpeg {
                     _ = pressure.wait_for(|waiting| !waiting.is_empty()), if holds_storage => {
                         parser.discard();
                         if matches!(pending, Some(Ok(Some(_)))) {
+                            parser.lost = true;
                             // A later frame supersedes an unclaimed one, but the final frame has no successor, so its loss is reported.
                             pending = parser.ended.then(|| Err(storage_reclaimed()));
                         }
@@ -499,9 +502,9 @@ impl Mjpeg {
                 let result = match pending.take() {
                     Some(result) => result,
                     None => tokio::select! {
-                        // The read was still outstanding at the consumer deadline; if it was waiting for storage, that is what the consumer is told.
+                        // The read was still outstanding at the consumer deadline; if it was waiting for storage, or recovering from a frame it gave up for lack of storage, that is what the consumer is told.
                         _ = &mut deadline => {
-                            let terminal = if parser.starved { Terminal::Storage } else { Terminal::Idle };
+                            let terminal = if parser.starved || parser.lost { Terminal::Storage } else { Terminal::Idle };
                             let _ = terminal_tx.send(Some(terminal));
                             break;
                         }
@@ -702,6 +705,7 @@ impl Parser {
             skip: 0,
             last_copy: None,
             final_reclaimed: false,
+            lost: false,
             starved: false,
             validation: None,
             scan_offset: 0,
@@ -749,9 +753,13 @@ impl Parser {
     fn discard(&mut self) {
         if let Some(validation) = self.validation.take() {
             validation.abort();
+            self.lost = true;
             if self.ended {
                 self.final_reclaimed = true;
             }
+        }
+        if !matches!(self.part, Part::Head) {
+            self.lost = true;
         }
         let keep_from = match self.part {
             Part::Head | Part::Delimiter => Some(0),
@@ -781,7 +789,7 @@ impl Parser {
         self.release_excess();
     }
 
-    /// Charges the stream for holding `need` bytes in all, waiting at most the read timeout. A reservation that cannot be met at once registers the stream as waiting for as long as it is blocked; other streams yield to waiting streams. Of two blocked streams that both hold charged storage, the one opened later gives it up (returning `Reclaimed`, so the read restarts after the bytes it dropped) and so never holds storage the older one needs; a blocked stream that holds none waits its turn for the storage it needs. A reservation still blocked when the timeout passes fails with "video stream storage exhausted".
+    /// Charges the stream for holding `need` bytes in all, waiting at most the read timeout. A reservation that cannot be met at once registers the stream as waiting for as long as it is blocked; other streams yield to waiting streams. A blocked stream that holds charged storage gives it up to any older blocked stream (returning `Reclaimed`, so the read restarts after the bytes it dropped) and so never holds storage an older one needs; a blocked stream that holds none waits in the budget's queue for the storage it needs. A reservation still blocked when the timeout passes fails with "video stream storage exhausted".
     async fn reserve(&mut self, need: usize) -> Read<()> {
         let result = self.reserve_blocking(need).await;
         self.starved = false;
@@ -976,6 +984,9 @@ impl Parser {
     async fn next_charged(&mut self) -> Result<Option<Frame>> {
         self.starved = false;
         let result = self.read_frame().await;
+        if matches!(result, Ok(Some(_))) {
+            self.lost = false;
+        }
         if result.is_err() || self.ended {
             self.ended = true;
             self.lease.abort();
@@ -2044,12 +2055,20 @@ mod tests {
         assert_eq!(storage.available(), storage.capacity());
     }
 
-    /// Reads a stream whose bytes end at `cut`, gives up what the stream holds as an idle or deferred stream would, then sends `rest`, and returns how many received bytes the discard kept and the next read's result.
-    async fn read_after_discard_at(cut: &[u8], rest: &[u8]) -> (usize, Result<Option<Snapshot>>) {
+    /// A parser that has read a stream whose bytes end at `cut` and then given up what it holds, as an idle or deferred stream would, with the socket the rest is sent through and the receiver of the parser's copy totals.
+    struct Discarded {
+        video: Parser,
+        socket: TcpStream,
+        copied: tokio::sync::mpsc::UnboundedReceiver<usize>,
+        storage: Arc<StreamStorage>,
+        _lease: watch::Sender<bool>,
+    }
+
+    async fn discarded_at(cut: &[u8]) -> Discarded {
         let storage = StreamStorage::new(STREAM_STORAGE_BYTES);
         let (response, mut socket) = multipart().await;
         socket.write_all(cut).await.unwrap();
-        let (mut video, _lease) = parser(response, storage.clone());
+        let (mut video, lease) = parser(response, storage.clone());
         let (copied_tx, mut copied) = tokio::sync::mpsc::unbounded_channel();
         video.copied = Some(copied_tx);
         {
@@ -2064,15 +2083,40 @@ mod tests {
         assert!(video.holds_storage());
         video.discard();
         assert!(!video.holds_storage());
-        let kept = video.carry.len();
-        socket.write_all(rest).await.unwrap();
-        drop(socket);
-        let result = to_snapshot(
-            tokio::time::timeout(BOUND, video.next_charged())
-                .await
-                .unwrap(),
-        );
-        (kept, result)
+        Discarded {
+            video,
+            socket,
+            copied,
+            storage,
+            _lease: lease,
+        }
+    }
+
+    impl Discarded {
+        /// Sends `rest` in one write, ends the stream, and returns the next `reads` results.
+        async fn finish(mut self, rest: &[u8], reads: usize) -> Vec<Result<Option<Snapshot>>> {
+            self.socket.write_all(rest).await.unwrap();
+            drop(self.socket);
+            let mut results = Vec::new();
+            for _ in 0..reads {
+                results.push(to_snapshot(
+                    tokio::time::timeout(BOUND, self.video.next_charged())
+                        .await
+                        .unwrap(),
+                ));
+            }
+            drop(self.video);
+            assert_eq!(self.storage.available(), self.storage.capacity());
+            results
+        }
+    }
+
+    /// Reads a stream whose bytes end at `cut`, gives up what the stream holds as an idle or deferred stream would, then sends `rest`, and returns how many received bytes the discard kept and the next read's result.
+    async fn read_after_discard_at(cut: &[u8], rest: &[u8]) -> (usize, Result<Option<Snapshot>>) {
+        let discarded = discarded_at(cut).await;
+        let kept = discarded.video.carry.len();
+        let mut results = discarded.finish(rest, 1).await;
+        (kept, results.remove(0))
     }
 
     #[tokio::test]
@@ -2287,7 +2331,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancelled_starved_read_then_slow_device_reports_idle_timeout() {
+    async fn idle_stream_still_dropping_given_up_part_at_deadline_reports_storage_exhausted() {
         let frame = padded_jpeg([64, 128, 192], 64 * 1024);
         let body = part(&frame, true, true);
         let headers = body.len() - frame.len() - b"\r\n--frame--\r\n".len();
@@ -2324,7 +2368,7 @@ mod tests {
                 }
             }
         }
-        // Another stream waits, so the idle stream gives up its part, and its next read only drops the part's body from a device that sends nothing more.
+        // Another stream waits, so the idle stream gives up its part, and its next read only drops the part's body from a device that sends nothing more; the frame was lost to storage, which is what the consumer is told.
         let waiter = Waiting::new(storage.clone(), u64::MAX);
         eventually("idle stream kept its part", || {
             storage.available() == 2 * MAX_HEADER
@@ -2333,7 +2377,7 @@ mod tests {
         drop(waiter);
         assert!(matches!(
             tokio::time::timeout(BOUND, stream.next_frame()).await.unwrap(),
-            Err(Error::Transport(message)) if message == "video consumer idle timeout"
+            Err(Error::Transport(message)) if message == "video stream storage exhausted"
         ));
         drop(hold);
     }
@@ -2355,6 +2399,263 @@ mod tests {
             stream.next_frame().await,
             Err(Error::Transport(message)) if message == "video stream storage exhausted"
         ));
+    }
+
+    #[tokio::test]
+    async fn deferred_stream_still_dropping_given_up_part_at_deadline_reports_storage_exhausted() {
+        let frame = padded_jpeg([64, 128, 192], 64 * 1024);
+        let body = part(&frame, true, true);
+        let headers = body.len() - frame.len() - b"\r\n--frame--\r\n".len();
+        let storage = StreamStorage::new(STREAM_STORAGE_BYTES);
+        // An older stream stays blocked throughout, and the headers fit but the part does not.
+        let older = Ledger::new(storage.clone());
+        let _waiter = Waiting::new(storage.clone(), older.id);
+        let _hold = hold_all_but(&storage, 2 * MAX_HEADER);
+        assert!(part_end(&frame) > 2 * MAX_HEADER);
+        let (response, mut socket) = multipart().await;
+        // The headers and more body than the header buffer holds; the rest of the body never arrives.
+        socket
+            .write_all(&body[..headers + MAX_HEADER + 1])
+            .await
+            .unwrap();
+        let (video, _lease) = parser(response, storage.clone());
+        // The read and storage timeout is the bound, so only the consumer deadline, half of it, can end the read within the bound. The stream gives its part up to the older one and is still dropping the part's body then.
+        let mut stream = Mjpeg::start(video, BOUND / 2);
+        assert!(matches!(
+            tokio::time::timeout(BOUND, stream.next_frame()).await.unwrap(),
+            Err(Error::Transport(message)) if message == "video stream storage exhausted"
+        ));
+        assert_eq!(storage.yielded.load(Ordering::Acquire), 1);
+    }
+
+    #[tokio::test]
+    async fn frame_delivered_after_a_give_up_clears_the_loss() {
+        let next = jpeg_colour([200, 20, 50]);
+        let mut stream = part(&jpeg(), true, false);
+        let headers = stream.len() - jpeg().len() - b"\r\n".len();
+        stream.extend_from_slice(&part(&next, true, true));
+        let cut = headers + 2;
+        let mut discarded = discarded_at(&stream[..cut]).await;
+        assert!(discarded.video.lost);
+        discarded.socket.write_all(&stream[cut..]).await.unwrap();
+        let result = tokio::time::timeout(BOUND, discarded.video.next_charged())
+            .await
+            .unwrap();
+        assert_eq!(to_snapshot(result).unwrap().unwrap().jpeg, next);
+        assert!(!discarded.video.lost);
+
+        // Giving up headers loses nothing.
+        let body = part(&jpeg(), true, true);
+        let discarded = discarded_at(&body[..b"--frame\r\nContent".len()]).await;
+        assert!(!discarded.video.lost);
+    }
+
+    /// An unlengthed part of a large padded frame followed by `after`, and the offset of the given-up part's closing delimiter.
+    fn unlengthed_then(after: &[u8]) -> (Vec<u8>, usize) {
+        let mut stream = part(&padded_jpeg([64, 128, 192], 64 * 1024), false, false);
+        let delimiter = stream.len() - b"\r\n".len();
+        stream.extend_from_slice(after);
+        (stream, delimiter)
+    }
+
+    #[tokio::test]
+    async fn unlengthed_part_given_up_mid_body_resumes_at_its_delimiter() {
+        let next = jpeg_colour([200, 20, 50]);
+        let (stream, delimiter) = unlengthed_then(&part(&next, true, true));
+        let headers = part(&jpeg(), false, false).len() - jpeg().len() - b"\r\n".len();
+        // Cuts just inside the body, part way through it, and just before the delimiter: the rest of the body is longer than a header buffer in the first two, so resynchronising drains and refills it.
+        for cut in [headers + 2, headers + 1000, delimiter - 1] {
+            let (kept, result) = read_after_discard_at(&stream[..cut], &stream[cut..]).await;
+            assert!(kept < b"\r\n--frame".len(), "kept {kept} bytes at {cut}");
+            assert_eq!(result.unwrap().unwrap().jpeg, next, "cut at {cut}");
+        }
+    }
+
+    #[tokio::test]
+    async fn resynchronising_finds_a_delimiter_received_one_byte_at_a_time() {
+        let next = jpeg_colour([200, 20, 50]);
+        let (stream, delimiter) = unlengthed_then(&part(&next, true, true));
+        let cut = delimiter - 100;
+        let mut discarded = discarded_at(&stream[..cut]).await;
+        // Resynchronising copies the kept bytes, then every byte received, once each.
+        let mut expected =
+            discarded.video.copied_total + discarded.video.carry.len() + (delimiter - cut);
+        discarded
+            .socket
+            .write_all(&stream[cut..delimiter])
+            .await
+            .unwrap();
+        let read = discarded.video.next_charged();
+        tokio::pin!(read);
+        // Each delimiter byte is sent only once the parser has copied everything before it, so each arrives in a chunk of its own.
+        for index in delimiter..delimiter + b"\r\n--frame\r\n".len() {
+            let copied = &mut discarded.copied;
+            let caught_up = async { while copied.recv().await.unwrap() < expected {} };
+            tokio::select! {
+                result = &mut read => panic!("read finished before the delimiter: {:?}", result.is_ok()),
+                result = tokio::time::timeout(BOUND, caught_up) => result.expect("bytes were not copied"),
+            }
+            discarded
+                .socket
+                .write_all(&stream[index..=index])
+                .await
+                .unwrap();
+            expected += 1;
+        }
+        discarded
+            .socket
+            .write_all(&stream[delimiter + b"\r\n--frame\r\n".len()..])
+            .await
+            .unwrap();
+        let result = tokio::time::timeout(BOUND, read).await.unwrap();
+        assert_eq!(to_snapshot(result).unwrap().unwrap().jpeg, next);
+    }
+
+    #[tokio::test]
+    async fn resynchronising_skips_a_delimiter_with_a_bad_suffix() {
+        let next = jpeg_colour([200, 20, 50]);
+        let mut frame = jpeg();
+        let fake = b"\r\n--frameX";
+        let mut segment = vec![0xff, 0xfe];
+        segment.extend_from_slice(&u16::try_from(fake.len() + 2).unwrap().to_be_bytes());
+        segment.extend_from_slice(fake);
+        frame.splice(2..2, segment);
+        let mut stream = part(&frame, false, false);
+        let headers = stream.len() - frame.len() - b"\r\n".len();
+        stream.extend_from_slice(&part(&next, true, true));
+        // Given up before the delimiter-like bytes, so resynchronising meets them first.
+        let cut = headers + 2;
+        let (_, result) = read_after_discard_at(&stream[..cut], &stream[cut..]).await;
+        assert_eq!(result.unwrap().unwrap().jpeg, next);
+    }
+
+    #[tokio::test]
+    async fn resynchronising_copy_holding_the_next_parts_returns_the_rest() {
+        let second = jpeg_colour([200, 20, 50]);
+        let third = jpeg_colour([20, 200, 50]);
+        let mut stream = part(&jpeg(), false, false);
+        let headers = stream.len() - jpeg().len() - b"\r\n".len();
+        stream.extend_from_slice(&part(&second, true, false));
+        stream.extend_from_slice(&part(&third, true, true));
+        // The rest of the given-up part, the whole second part and the third arrive in one write, so resynchronising's copy can hold the second part and the start of the third; the bytes after the second part's delimiter return from that copy.
+        let cut = headers + 2;
+        let results = discarded_at(&stream[..cut])
+            .await
+            .finish(&stream[cut..], 3)
+            .await;
+        let mut results = results.into_iter();
+        assert_eq!(results.next().unwrap().unwrap().unwrap().jpeg, second);
+        assert_eq!(results.next().unwrap().unwrap().unwrap().jpeg, third);
+        assert!(results.next().unwrap().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn given_up_part_longer_or_shorter_than_declared_is_rejected() {
+        let frame = jpeg();
+        let next = part(&jpeg_colour([200, 20, 50]), true, true);
+        for (declared, extra) in [
+            (frame.len(), b"extra".as_slice()),
+            (frame.len() + 5, b"".as_slice()),
+        ] {
+            let mut stream = format!(
+                "--frame\r\nContent-Type: image/jpeg\r\nContent-Length: {declared}\r\n\r\n"
+            )
+            .into_bytes();
+            let headers = stream.len();
+            stream.extend_from_slice(&frame);
+            stream.extend_from_slice(extra);
+            stream.extend_from_slice(b"\r\n");
+            stream.extend_from_slice(&next);
+            let cut = headers + 2;
+            let (_, result) = read_after_discard_at(&stream[..cut], &stream[cut..]).await;
+            assert!(
+                matches!(&result, Err(Error::InvalidResponse(message)) if message == "invalid frame boundary"),
+                "declared {declared}: {result:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn second_discard_while_dropping_a_given_up_body_changes_nothing() {
+        let next = jpeg_colour([200, 20, 50]);
+        let mut stream = part(&jpeg(), true, false);
+        let headers = stream.len() - jpeg().len() - b"\r\n".len();
+        stream.extend_from_slice(&part(&next, true, true));
+        let cut = headers + 2;
+        let mut discarded = discarded_at(&stream[..cut]).await;
+        let skip = discarded.video.skip;
+        assert!(skip > 0);
+        discarded.video.discard();
+        assert_eq!(discarded.video.skip, skip);
+        assert!(discarded.video.carry.is_empty());
+        assert_eq!(discarded.video.ledger.held.num_permits(), 0);
+        let results = discarded.finish(&stream[cut..], 1).await;
+        assert_eq!(results[0].as_ref().unwrap().as_ref().unwrap().jpeg, next);
+    }
+
+    #[tokio::test]
+    async fn discard_of_a_partial_delimiter_keeps_it_ahead_of_received_bytes() {
+        let next = jpeg_colour([200, 20, 50]);
+        let mut rest = b"ame\r\n".to_vec();
+        rest.extend_from_slice(&part(&next, true, true)[b"--frame\r\n".len()..]);
+        let (response, _socket) = multipart().await;
+        let storage = StreamStorage::new(STREAM_STORAGE_BYTES);
+        let (mut video, _lease) = parser(response, storage.clone());
+        // The stream has dropped a given-up body and copied the start of its delimiter, and the rest is already received.
+        video.first = false;
+        video.part = Part::Delimiter;
+        video.buffer = b"\r\n--fr".to_vec();
+        video.carry = bytes::Bytes::copy_from_slice(&rest[..2]);
+        video.incoming = bytes::Bytes::copy_from_slice(&rest[2..]);
+        video.discard();
+        assert!(video.buffer.is_empty());
+        assert_eq!(&video.carry[..], b"\r\n--fram");
+        assert_eq!(
+            to_snapshot(video.next_charged().await)
+                .unwrap()
+                .unwrap()
+                .jpeg,
+            next
+        );
+        drop(video);
+        assert_eq!(storage.available(), storage.capacity());
+    }
+
+    #[tokio::test]
+    async fn headers_discarded_again_are_kept_once() {
+        let next = jpeg_colour([200, 20, 50]);
+        let mut stream = part(&jpeg(), true, false);
+        stream.extend_from_slice(&part(&next, true, true));
+        let opening = b"--frame\r\n".len();
+        let headers = part(&jpeg(), true, false).len() - jpeg().len() - b"\r\n".len();
+        let (response, _socket) = multipart().await;
+        let storage = StreamStorage::new(STREAM_STORAGE_BYTES);
+        let (mut video, _lease) = parser(response, storage.clone());
+        // Headers an earlier discard kept, partly copied into the buffer again.
+        video.first = false;
+        video.buffer = stream[opening..opening + 10].to_vec();
+        video.carry = bytes::Bytes::copy_from_slice(&stream[opening + 10..headers]);
+        video.incoming = bytes::Bytes::copy_from_slice(&stream[headers..]);
+        video.discard();
+        assert_eq!(&video.carry[..], &stream[opening..headers]);
+        assert!(video.carry.len() <= MAX_HEADER);
+        assert_eq!(video.ledger.held.num_permits(), 0);
+        assert_eq!(
+            to_snapshot(video.next_charged().await)
+                .unwrap()
+                .unwrap()
+                .jpeg,
+            jpeg()
+        );
+        assert_eq!(
+            to_snapshot(video.next_charged().await)
+                .unwrap()
+                .unwrap()
+                .jpeg,
+            next
+        );
+        drop(video);
+        assert_eq!(storage.available(), storage.capacity());
     }
 
     struct BlockedSink;
