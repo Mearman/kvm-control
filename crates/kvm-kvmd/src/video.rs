@@ -175,6 +175,12 @@ fn absorb_chunk(
     Ok(())
 }
 
+fn next_scan_offset(buffer_len: usize, delimiter_len: usize, body_start: usize) -> usize {
+    buffer_len
+        .saturating_sub(delimiter_len.saturating_sub(1))
+        .max(body_start)
+}
+
 fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack
         .windows(needle.len())
@@ -290,12 +296,13 @@ impl VideoStream for Mjpeg {
         }
         let body_start = end + 4;
         let delimiter = [b"\r\n".as_slice(), self.boundary.as_slice()].concat();
+        let frame_limit = body_start + MAX_FRAME + delimiter.len() + 2;
         let size = if let Some(length) = length {
             if length > MAX_FRAME {
                 return Err(Error::InvalidResponse("frame exceeds limit".into()));
             }
             while self.buffer.len() < body_start + length + delimiter.len() + 2 {
-                if !self.fill(MAX_FRAME + MAX_HEADER).await? {
+                if !self.fill(frame_limit).await? {
                     return Err(Error::InvalidResponse("truncated frame".into()));
                 }
             }
@@ -309,7 +316,7 @@ impl VideoStream for Mjpeg {
                 if let Some(relative) = find(&self.buffer[offset..], &delimiter) {
                     let pos = offset + relative;
                     while self.buffer.len() < pos + delimiter.len() + 2 {
-                        if !self.fill(MAX_FRAME + MAX_HEADER).await? {
+                        if !self.fill(frame_limit).await? {
                             return Err(Error::InvalidResponse("truncated boundary".into()));
                         }
                     }
@@ -319,10 +326,11 @@ impl VideoStream for Mjpeg {
                     }
                     offset = pos + 1;
                 } else {
-                    if self.buffer.len() >= body_start + MAX_FRAME + delimiter.len() + 2 {
+                    if self.buffer.len() >= frame_limit {
                         return Err(Error::InvalidResponse("frame exceeds limit".into()));
                     }
-                    if !self.fill(MAX_FRAME + MAX_HEADER).await? {
+                    offset = next_scan_offset(self.buffer.len(), delimiter.len(), body_start);
+                    if !self.fill(frame_limit).await? {
                         return Err(Error::InvalidResponse("truncated frame".into()));
                     }
                 }
@@ -431,6 +439,29 @@ mod tests {
             result.is_err(),
             "saturated socket unexpectedly accepted unlimited websocket messages"
         );
+    }
+
+    #[test]
+    fn fragmented_scan_work_is_linear_and_finds_split_delimiters() {
+        let delimiter = b"\r\n--boundary";
+        let mut data = Vec::new();
+        let mut offset = 0;
+        let mut work = 0;
+        for _ in 0..4096 {
+            data.extend_from_slice(b"abcdefgh");
+            work += data.len() - offset;
+            assert!(find(&data[offset..], delimiter).is_none());
+            offset = next_scan_offset(data.len(), delimiter.len(), 0);
+        }
+        data.extend_from_slice(&delimiter[..delimiter.len() - 1]);
+        assert!(find(&data[offset..], delimiter).is_none());
+        offset = next_scan_offset(data.len(), delimiter.len(), 0);
+        data.push(delimiter[delimiter.len() - 1]);
+        assert_eq!(
+            offset + find(&data[offset..], delimiter).unwrap(),
+            data.len() - delimiter.len()
+        );
+        assert!(work <= 4096 * (8 + delimiter.len()));
     }
 
     #[test]

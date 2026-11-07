@@ -484,6 +484,66 @@ async fn coalesced_http_response_delivers_multiple_frames() {
 }
 
 #[tokio::test]
+async fn maximum_frame_with_maximum_headers_and_boundary() {
+    const FRAME: usize = 16 * 1024 * 1024;
+    const HEADERS: usize = 16 * 1024;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        let mut ws = tokio_tungstenite::accept_async(socket).await.unwrap();
+        let watcher = tokio::spawn(async move {
+            while let Some(message) = ws.next().await {
+                if message.is_err() {
+                    break;
+                }
+            }
+        });
+        let (mut http, _) = listener.accept().await.unwrap();
+        let mut request = [0; 4096];
+        assert!(http.read(&mut request).await.unwrap() > 0);
+        let boundary = "x".repeat(70);
+        let mut headers = format!("Content-Type: image/jpeg\r\nContent-Length: {FRAME}\r\nX-Pad: ");
+        headers.push_str(&"a".repeat(HEADERS - headers.len() - 4));
+        headers.push_str("\r\n\r\n");
+        http.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: multipart/x-mixed-replace; boundary={boundary}\r\n\r\n--{boundary}\r\n{headers}").as_bytes()).await.unwrap();
+        let mut frame = vec![0; FRAME];
+        frame[..2].copy_from_slice(&[0xff, 0xd8]);
+        frame[FRAME - 2..].copy_from_slice(&[0xff, 0xd9]);
+        http.write_all(&frame).await.unwrap();
+        http.write_all(format!("\r\n--{boundary}--\r\n").as_bytes())
+            .await
+            .unwrap();
+        watcher.await.unwrap();
+    });
+    let client = reqwest::Client::builder().http1_only().build().unwrap();
+    let endpoint = Url::parse(&format!("http://{address}/proxy/")).unwrap();
+    let device = Kvmd {
+        client: tokio::sync::RwLock::new(crate::Session {
+            client: client.clone(),
+            video: client,
+            cookies: Default::default(),
+        }),
+        config: Config {
+            endpoint: endpoint.clone(),
+            profile: DeviceProfile::PiKvm,
+            trusted_ca_pem: None,
+            insecure_tls: false,
+            timeout: Duration::from_secs(10),
+        },
+        endpoint,
+        profile: DeviceProfile::PiKvm,
+        inputs: Default::default(),
+        auth_headers: Default::default(),
+        approval_token: Default::default(),
+    };
+    let mut video = device.video().await.unwrap();
+    assert_eq!(video.next_frame().await.unwrap().unwrap().jpeg.len(), FRAME);
+    assert!(video.next_frame().await.unwrap().is_none());
+    server.await.unwrap();
+}
+
+#[tokio::test]
 async fn continuous_frames_and_drop_close_lease() {
     let body = b"--frame\r\nContent-Type: image/jpeg\r\nContent-Length: 5\r\n\r\n\xff\xd8a\xff\xd9\r\n--frame\r\nContent-Type: image/jpeg\r\n\r\n\xff\xd8b\xff\xd9\r\n--frame\r\n";
     let (device, closed, server) = device(body).await;
