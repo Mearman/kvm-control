@@ -40,6 +40,26 @@ pub struct App {
     pending: Option<kvm_core::Control>,
     command: Option<String>,
     submitted: Option<kvm_core::Control>,
+    /// Set by the refresh key; the event loop starts the read in the background so input keeps being handled while it runs.
+    refresh_requested: bool,
+}
+
+/// The outcome of reading capabilities and status, applied to an [`App`] by [`App::apply_refresh`].
+pub struct Refresh {
+    capabilities: kvm_core::Result<Capabilities>,
+    status: kvm_core::Result<DeviceStatus>,
+}
+
+impl Refresh {
+    /// Reads capabilities and then status. Status is read whatever the status capability says, since each subsystem reports its own support. It changes no interface state, so it can run while input is handled.
+    pub async fn read(device: &dyn Device) -> Self {
+        let capabilities = device.capabilities().await;
+        let status = device.status().await;
+        Self {
+            capabilities,
+            status,
+        }
+    }
 }
 
 impl Default for App {
@@ -59,6 +79,7 @@ impl Default for App {
             pending: None,
             command: None,
             submitted: None,
+            refresh_requested: false,
         }
     }
 }
@@ -74,15 +95,22 @@ impl App {
         self.drag_modifiers.clear();
     }
 
-    /// Refreshes capability and status information through the shared device API. Status is read whatever the status capability says, since each subsystem reports its own support; a failure of either read is shown as the message.
+    /// Refreshes capability and status information through the shared device API, waiting for the read; the event loop instead runs [`Refresh::read`] in the background and applies it with [`App::apply_refresh`].
     pub async fn refresh(&mut self, device: &dyn Device) {
-        let capabilities = device.capabilities().await;
-        let status = device.status().await;
+        self.apply_refresh(Refresh::read(device).await);
+    }
+
+    /// Shows a completed read; a failure of either part is shown as the message.
+    pub fn apply_refresh(&mut self, refresh: Refresh) {
         let mut errors = Vec::new();
-        self.capabilities = capabilities
+        self.capabilities = refresh
+            .capabilities
             .map_err(|error| errors.push(error.to_string()))
             .ok();
-        self.status = status.map_err(|error| errors.push(error.to_string())).ok();
+        self.status = refresh
+            .status
+            .map_err(|error| errors.push(error.to_string()))
+            .ok();
         self.message = if errors.is_empty() {
             "Press v to open live video".into()
         } else {
@@ -407,7 +435,7 @@ impl App {
                 }
             }
             KeyCode::Char('q') if !self.control => return false,
-            KeyCode::Char('r') if !self.control => self.refresh(device).await,
+            KeyCode::Char('r') if !self.control => self.refresh_requested = true,
             KeyCode::Char('i') if !self.control => {
                 if self.capabilities.as_ref().is_some_and(|c| {
                     c.keyboard == Capability::Supported || c.mouse == Capability::Supported
@@ -1379,7 +1407,11 @@ where
         cell_size: picker.cell_size,
         ..App::default()
     };
-    app.refresh(device).await;
+    // A device read can take up to its whole timeout per route, so refreshing runs beside input handling, polled once per loop like a control request: 'q' and other keys keep working while it is in flight, and leaving the loop drops it.
+    let mut refresh_request: Option<
+        std::pin::Pin<Box<dyn std::future::Future<Output = Refresh> + '_>>,
+    > = Some(Box::pin(Refresh::read(device)));
+    app.message = "Refreshing device state".into();
     let mut video_rx: Option<
         tokio::sync::watch::Receiver<Option<Result<kvm_core::Snapshot, String>>>,
     > = None;
@@ -1398,6 +1430,21 @@ where
     > = None;
     loop {
         tokio::task::yield_now().await;
+        if std::mem::take(&mut app.refresh_requested) {
+            if refresh_request.is_some() {
+                app.message = "A refresh is already in progress".into();
+            } else {
+                refresh_request = Some(Box::pin(Refresh::read(device)));
+                app.message = "Refreshing device state".into();
+            }
+        }
+        if let Some(request) = &mut refresh_request {
+            let refresh = tokio::select! { refresh = request.as_mut() => Some(refresh), _ = tokio::time::sleep(Duration::from_millis(1)) => None };
+            if let Some(refresh) = refresh {
+                refresh_request = None;
+                app.apply_refresh(refresh);
+            }
+        }
         if let Some(request) = &mut control_request {
             let outcome = tokio::select! { outcome = request.as_mut() => Some(outcome), _ = tokio::time::sleep(Duration::from_millis(1)) => None };
             if let Some(outcome) = outcome {
@@ -1616,6 +1663,9 @@ mod tests {
         control_release: tokio::sync::Notify,
         /// Reports the status capability unknown, as the adapter does when the info or streamer route is denied.
         status_capability_unknown: bool,
+        /// Never answers a status read, as a device whose route never answers holds a read until its timeout.
+        status_hangs: bool,
+        status_reads: std::sync::atomic::AtomicUsize,
     }
     struct FakeStream {
         jpeg: Option<Vec<u8>>,
@@ -1659,6 +1709,11 @@ mod tests {
             }
         }
         async fn status(&self) -> kvm_core::Result<DeviceStatus> {
+            self.status_reads
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.status_hangs {
+                std::future::pending::<()>().await;
+            }
             Ok(DeviceStatus {
                 info: Reported::Unknown,
                 hid: Reported::Unknown,
@@ -3224,6 +3279,71 @@ mod tests {
             cells.iter().any(
                 |cell| cell.symbol() == "▀" && cell.fg == ratatui::style::Color::Rgb(255, 0, 0)
             )
+        );
+    }
+
+    // Breaks if a refresh blocks input handling: with a status read that never finishes, 'q' would never be read.
+    #[tokio::test]
+    async fn quit_works_while_a_refresh_is_in_flight() {
+        let device = FakeDevice {
+            status_hangs: true,
+            ..FakeDevice::default()
+        };
+        let mut terminal = Terminal::new(TestBackend::new(80, 16)).unwrap();
+        let mut events = 0;
+        let key = |code| {
+            Some(Event::Key(crossterm::event::KeyEvent::new(
+                code,
+                crossterm::event::KeyModifiers::NONE,
+            )))
+        };
+        // The status read never answers, so finishing at all shows the keys were handled during it; the timeout only keeps a regression from hanging the suite.
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            run_loop(
+                &mut terminal,
+                &device,
+                &ImagePicker::halfblocks(),
+                false,
+                |terminal| {
+                    events += 1;
+                    Ok(match events {
+                        1 => {
+                            let content: String = terminal
+                                .backend()
+                                .buffer()
+                                .content()
+                                .iter()
+                                .map(|cell| cell.symbol())
+                                .collect();
+                            assert!(content.contains("Refreshing device state"));
+                            key(KeyCode::Char('r'))
+                        }
+                        2 => {
+                            let content: String = terminal
+                                .backend()
+                                .buffer()
+                                .content()
+                                .iter()
+                                .map(|cell| cell.symbol())
+                                .collect();
+                            assert!(content.contains("A refresh is already in progress"));
+                            key(KeyCode::Char('q'))
+                        }
+                        _ => None,
+                    })
+                },
+            ),
+        )
+        .await
+        .expect("quit must not wait for the refresh")
+        .unwrap();
+        // The second 'r' did not start a second read while the first was in flight.
+        assert_eq!(
+            device
+                .status_reads
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
         );
     }
 
