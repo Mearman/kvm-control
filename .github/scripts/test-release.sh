@@ -108,6 +108,19 @@ if (cd "$tmp/untagged" && PLAN="$disabled_plan" bash "$root/.github/scripts/chec
   printf '%s\n' 'An auto-disabled binary was accepted.' >&2
   exit 1
 fi
+printf '%s\n' '[features]' 'extra = []' '[[bin]]' 'name = "kvm-cli"' 'path = "src/main.rs"' 'required-features = ["extra"]' >> "$tmp/untagged/crates/kvm-cli/Cargo.toml"
+(cd "$tmp/untagged" && git add crates/kvm-cli/Cargo.toml && git -c user.name=test -c user.email=test@example.com commit -qm 'test: require binary feature')
+feature_plan=$(jq -cn --arg commit "$(git -C "$tmp/untagged" rev-parse HEAD)" '[{tag:"v0.2.0",commit:$commit}]')
+if (cd "$tmp/untagged" && PLAN="$feature_plan" bash "$root/.github/scripts/check-release-binaries.sh"); then
+  printf '%s\n' 'A binary requiring an inactive feature was accepted.' >&2
+  exit 1
+fi
+printf '%s\n' 'default = ["extra"]' >> "$tmp/untagged/crates/kvm-cli/Cargo.toml"
+# Place the default feature in the features table rather than the binary table.
+python3 -c 'import pathlib, sys; p = pathlib.Path(sys.argv[1]); s = p.read_text().replace("[features]\n", "[features]\ndefault = [\"extra\"]\n").replace("required-features = [\"extra\"]\ndefault = [\"extra\"]\n", "required-features = [\"extra\"]\n"); p.write_text(s)' "$tmp/untagged/crates/kvm-cli/Cargo.toml"
+(cd "$tmp/untagged" && git add crates/kvm-cli/Cargo.toml && git -c user.name=test -c user.email=test@example.com commit -qm 'test: enable binary feature')
+feature_plan=$(jq -cn --arg commit "$(git -C "$tmp/untagged" rev-parse HEAD)" '[{tag:"v0.2.0",commit:$commit}]')
+(cd "$tmp/untagged" && PLAN="$feature_plan" bash "$root/.github/scripts/check-release-binaries.sh")
 for invalid in '{' '[{}]' '[{"tag":"v0.1.0"}]'; do
   if (cd "$tmp/untagged" && PLAN="$invalid" bash "$root/.github/scripts/record-release-intent.sh"); then
     printf '%s\n' 'Invalid release plan was accepted.' >&2
@@ -131,6 +144,7 @@ test "$(grep '^plan=' "$GITHUB_OUTPUT" | cut -d = -f 2- | jq -r '.[1].commit')" 
 test "$(git -C "$tmp/intent-origin" rev-list -n 1 v0.1.0)" = "$initial"
 test "$(git -C "$tmp/intent-origin" rev-list -n 1 abandoned-release-v0.1.0)" = "$initial"
 test "$(grep '^plan=' "$GITHUB_OUTPUT" | cut -d = -f 2- | jq -r 'map(.tag) | join(",")')" = v0.1.1
+export MOCK_NEXT=0.1.0
 : > "$GITHUB_OUTPUT"
 (cd "$tmp/untagged" && bash "$root/.github/scripts/version.sh")
 test "$(grep '^plan=' "$GITHUB_OUTPUT" | cut -d = -f 2- | jq -r 'map(.tag) | join(",")')" = v0.1.1

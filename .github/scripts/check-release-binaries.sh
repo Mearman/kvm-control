@@ -12,12 +12,12 @@ while IFS= read -r commit; do
     printf 'Release commit %s lacks a Cargo workspace.\n' "$commit" >&2
     exit 1
   fi
-  if ! metadata=$(cd "$tmp/tree" && cargo metadata --locked --no-deps --format-version 1); then
+  if ! metadata=$(cd "$tmp/tree" && cargo metadata --locked --format-version 1); then
     printf 'Cannot inspect release commit %s.\n' "$commit" >&2
     exit 2
   fi
   for binary in kvm-cli kvm-tui kvm-mcp; do
-    if ! printf '%s' "$metadata" | jq -e --arg binary "$binary" '. as $root | any(.packages[]; .id as $id | ($root.workspace_members | index($id)) != null and any(.targets[]; .name == $binary and (.kind | index("bin")) != null))' >/dev/null; then
+    if ! printf '%s' "$metadata" | jq -e --arg binary "$binary" '. as $root | any(.packages[]; .id as $id | ($root.workspace_members | index($id)) != null and ([$root.resolve.nodes[] | select(.id == $id) | .features[]] as $enabled | any(.targets[]; .name == $binary and (.kind | index("bin")) != null and all((.["required-features"] // [])[]; . as $feature | ($enabled | index($feature)) != null))))' >/dev/null; then
       printf 'Release commit %s lacks binary target %s.\n' "$commit" "$binary" >&2
       exit 1
     fi

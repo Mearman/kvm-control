@@ -47,6 +47,13 @@ while IFS= read -r tag; do
 done <<< "$tags"
 latest=$(printf '%s\n' "$tags" | sed -n '$p')
 next=$(convco version --bump)
+if [ "$next" = "${latest#v}" ] && git rev-parse -q --verify "refs/tags/abandoned-release-$latest" >/dev/null; then
+  if [[ ! "$next" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+    printf 'Cannot advance abandoned version: %s\n' "$next" >&2
+    exit 1
+  fi
+  next="${BASH_REMATCH[1]}.${BASH_REMATCH[2]}.$((10#${BASH_REMATCH[3]} + 1))"
+fi
 if [ "$next" != "${latest#v}" ]; then
   plan=$(printf '%s' "$plan" | jq -c --arg tag "v$next" --arg commit "$(git rev-parse HEAD)" '. + [{tag:$tag,commit:$commit}]')
 fi

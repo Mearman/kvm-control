@@ -20,7 +20,6 @@ workspace = set(data["workspace_members"])
 packages = {package["name"] for package in data["packages"] if package["id"] in workspace}
 version = sys.argv[1]
 root = pathlib.Path(data["workspace_root"]) / "Cargo.toml"
-root_text = root.read_text()
 inherited = set()
 for package in data["packages"]:
     if package["id"] not in workspace:
@@ -45,10 +44,17 @@ for package in data["packages"]:
             inherited.add(key)
         name = re.escape(key)
         pattern = r"(?m)^(\s*" + name + r"\s*=\s*\{[^\n}]*?\bversion\s*=\s*)\"[^\"]+\""
-        text, count = re.subn(pattern, lambda match: match.group(1) + "\"" + version + "\"", text)
+        workspace_section = re.search(r"(?ms)^\[workspace\.dependencies\]\s*$.*?(?=^\[|\Z)", text) if manifest == root else None
+        if workspace_section:
+            before, first = re.subn(pattern, lambda match: match.group(1) + "\"" + version + "\"", text[:workspace_section.start()])
+            after, second = re.subn(pattern, lambda match: match.group(1) + "\"" + version + "\"", text[workspace_section.end():])
+            text, count = before + workspace_section.group() + after, first + second
+        else:
+            text, count = re.subn(pattern, lambda match: match.group(1) + "\"" + version + "\"", text)
         if count != len(direct) or not (direct or inherited_declarations):
             raise SystemExit("Cannot update workspace dependency " + dependency["name"] + " in " + str(manifest))
     manifest.write_text(text)
+root_text = root.read_text()
 for key in inherited:
     section = re.search(r"(?ms)^\[workspace\.dependencies\]\s*$.*?(?=^\[|\Z)", root_text)
     if section is None:
