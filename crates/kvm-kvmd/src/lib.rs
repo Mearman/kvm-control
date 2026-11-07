@@ -580,14 +580,9 @@ impl Drop for Collect<'_> {
         if let Err(error) = result {
             self.device.report_abandoned(&error);
         }
-        let Some(owed) = owed else {
+        if owed.is_none() {
             return;
-        };
-        self.device
-            .owed
-            .lock()
-            .expect("owed releases lock poisoned")
-            .push_back(owed);
+        }
         let worker = self.device.input_worker();
         self.runtime.spawn(async move {
             let mut inputs = worker.inputs.lock().await;
