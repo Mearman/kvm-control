@@ -626,6 +626,21 @@ async fn cancelled_input_is_cleaned_up_with_a_retained_owner() {
     }
 }
 
+/// Polls a request once, which queues it on the input lock, then spawns it. A request queued this way is ahead of anything that waits for the lock afterwards, on any runtime flavour.
+async fn queue<F>(future: F) -> tokio::task::JoinHandle<F::Output>
+where
+    F: std::future::Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    let mut future = Box::pin(future);
+    tokio::select! {
+        biased;
+        _ = &mut future => panic!("request completed before reaching the device"),
+        () = std::future::ready(()) => {}
+    }
+    tokio::spawn(future)
+}
+
 #[tokio::test]
 async fn cancelled_cleanup_precedes_later_input_and_explicit_release() {
     let (mut endpoint, ca, calls, server) = fixture().await;
@@ -635,9 +650,7 @@ async fn cancelled_cleanup_precedes_later_input_and_explicit_release() {
     let first = tokio::spawn(async move { sender.key("KeyA", true).await });
     calls.3.notified().await;
     let sender = device.clone();
-    let second = tokio::spawn(async move { sender.key("KeyB", true).await });
-    // The later input queues on the input lock before the cancellation, so cleanup scheduled behind it would run second.
-    tokio::task::yield_now().await;
+    let second = queue(async move { sender.key("KeyB", true).await }).await;
     first.abort();
     assert!(first.await.unwrap_err().is_cancelled());
     calls.4.notify_one();
