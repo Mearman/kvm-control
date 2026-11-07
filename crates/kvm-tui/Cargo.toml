@@ -5,30 +5,28 @@ license.workspace = true
 version.workspace = true
 
 [dependencies]
-clap = { version = "4.6.7", features = ["derive"] }
+clap.workspace = true
 crossterm = "0.29.0"
-image = { version = "0.25.10", default-features = false, features = ["jpeg"] }
-kvm-core = { version = "0.1.0", path = "../kvm-core" }
-kvm-kvmd = { version = "0.1.0", path = "../kvm-kvmd" }
+image.workspace = true
+kvm-core.workspace = true
+kvm-kvmd.workspace = true
 ratatui = "0.30.2"
 ratatui-image = { version = "10.0.6", default-features = false, features = ["crossterm"] }
-rpassword = "7.5.4"
+rpassword.workspace = true
 tokio = { workspace = true, features = ["signal"] }
 url.workspace = true
-zeroize = "1.9.1"
-
+zeroize.workspace = true
 
 [target.'cfg(unix)'.dependencies]
-
-libc = "0.2.191"
+libc.workspace = true
 
 [dev-dependencies]
 async-trait.workspace = true
-axum = { version = "0.8", features = ["ws"] }
-axum-server = { version = "0.9.0", features = ["tls-rustls-no-provider"], default-features = false }
-futures-util = "0.3"
-rcgen = "0.13"
-rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+axum = { workspace = true, features = ["ws"] }
+axum-server.workspace = true
+futures-util.workspace = true
+rcgen.workspace = true
+rustls.workspace = true
 serde_json.workspace = true
 
 [lints]

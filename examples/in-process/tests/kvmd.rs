@@ -92,7 +92,7 @@ async fn downstream_uses_real_adapter_against_synthetic_https_device() {
     let ca = certificate.cert.pem().into_bytes();
     let tls = RustlsConfig::from_pem(
         ca.clone(),
-        certificate.key_pair.serialize_pem().into_bytes(),
+        certificate.signing_key.serialize_pem().into_bytes(),
     )
     .await
     .unwrap();
