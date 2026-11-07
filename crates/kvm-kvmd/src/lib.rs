@@ -829,7 +829,21 @@ impl Device for Kvmd {
             Control::MediaSelect { image } => ("msd", "msd/set_params", vec![("image", image)]),
         };
         let active = self.client.read().await;
-        if self.discover_with(&active.client, capability).await? != Capability::Supported {
+        if let Control::Switch { port } = &observed {
+            let state = self.json_with(&active.client, "switch").await?;
+            let ports = state
+                .pointer("/model/ports")
+                .and_then(serde_json::Value::as_array)
+                .ok_or_else(|| Error::Unsupported("switch port inventory not confirmed".into()))?;
+            if usize::try_from(*port)
+                .ok()
+                .is_none_or(|index| index >= ports.len())
+            {
+                return Err(Error::Unsupported(
+                    "switch port is not in the device inventory".into(),
+                ));
+            }
+        } else if self.discover_with(&active.client, capability).await? != Capability::Supported {
             return Err(Error::Unsupported(format!(
                 "{capability} capability not confirmed"
             )));
@@ -858,10 +872,12 @@ impl Device for Kvmd {
             }
             Control::Power(PowerAction::ResetHard) => false,
             Control::Switch { port } => {
-                state
-                    .pointer("/summary/synced")
-                    .and_then(serde_json::Value::as_bool)
-                    == Some(true)
+                // GL reads the active channel from sysfs but its synced flag is a constant.
+                (self.profile == DeviceProfile::GlKvm
+                    || state
+                        .pointer("/summary/synced")
+                        .and_then(serde_json::Value::as_bool)
+                        == Some(true))
                     && state
                         .pointer("/summary/active_port")
                         .and_then(serde_json::Value::as_u64)

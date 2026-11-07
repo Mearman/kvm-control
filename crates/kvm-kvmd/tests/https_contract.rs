@@ -158,7 +158,7 @@ async fn capability(uri: Uri) -> impl IntoResponse {
             json!({"state": {"outputs": {"lamp": {"online": true, "busy": false, "state": true}, "offline": {"online": false, "busy": false, "state": false}, "busy": {"online": true, "busy": true, "state": false}}}})
         }
         "/api/switch" => {
-            json!({"model": {"ports": [{}]}, "summary": {"active_port": 0, "synced": false}})
+            json!({"model": {"ports": [{}, {}]}, "summary": {"active_port": 0, "synced": false}})
         }
         "/api/atx" => json!({"enabled": true, "leds": {"power": false}}),
         _ => json!({"enabled": true, "drive": {"connected": true, "image": {"name": "disk.iso"}}}),
@@ -710,6 +710,42 @@ async fn approval_token_without_usable_cookie_is_rejected() {
         device.check_auth().await,
         Err(Error::Authentication)
     ));
+    server.abort();
+}
+
+#[tokio::test]
+async fn switch_observation_uses_profile_semantics_and_rejects_unknown_ports() {
+    let (endpoint, ca, calls, server) = fixture().await;
+    for profile in [DeviceProfile::GlKvm, DeviceProfile::PiKvm] {
+        let device = profile_client(endpoint.clone(), Some(ca.clone()), profile);
+        let outcome = device
+            .control(Control::Switch { port: 0 }, Confirmation::new())
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome,
+            if profile == DeviceProfile::GlKvm {
+                ControlOutcome::ObservedMatching
+            } else {
+                ControlOutcome::Unverified
+            }
+        );
+        assert!(matches!(
+            device
+                .control(Control::Switch { port: 2 }, Confirmation::new())
+                .await,
+            Err(Error::Unsupported(_))
+        ));
+    }
+    let paths = calls.0.lock().unwrap();
+    assert_eq!(
+        paths
+            .iter()
+            .filter(|path| path.starts_with("/api/switch/set_active?"))
+            .count(),
+        2
+    );
+    assert!(paths.iter().all(|path| !path.contains("port=2")));
     server.abort();
 }
 
