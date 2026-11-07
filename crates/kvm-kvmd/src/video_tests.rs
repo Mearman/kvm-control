@@ -757,57 +757,19 @@ async fn release_interrupted_by_runtime_shutdown_is_reported_once_by_the_next_lo
     let mut device = input_device(listener.local_addr().unwrap());
     let reports = capture_reports(&mut device);
     let device = Arc::new(device);
-    let (arrived_tx, arrived_rx) = tokio::sync::oneshot::channel();
-    let server = tokio::spawn(async move {
-        for _ in ["KeyA", "KeyB"] {
-            let (mut press, _) = listener.accept().await.unwrap();
-            assert!(read_input_request(&mut press).await.contains("state=true"));
-            respond(&mut press, "200 OK", b"{\"ok\":true}").await;
-        }
-        // The release of KeyA is held unanswered while its runtime shuts down.
-        let (mut interrupted, _) = listener.accept().await.unwrap();
-        assert!(
-            read_input_request(&mut interrupted)
-                .await
-                .contains("key=KeyA&state=false")
-        );
-        arrived_tx.send(()).unwrap();
-        let (mut release, _) = listener.accept().await.unwrap();
-        assert!(
-            read_input_request(&mut release)
-                .await
-                .contains("key=KeyB&state=false")
-        );
-        respond(&mut release, "200 OK", b"{\"ok\":true}").await;
-        let (mut press, _) = listener.accept().await.unwrap();
-        assert!(
-            read_input_request(&mut press)
-                .await
-                .contains("key=KeyC&state=true")
-        );
-        respond(&mut press, "200 OK", b"{\"ok\":true}").await;
-        drop(interrupted);
-        listener
-    });
-    device.key("KeyA", true).await.unwrap();
-    device.key("KeyB", true).await.unwrap();
-    let releasing = device.clone();
-    tokio::task::spawn_blocking(move || {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        runtime.block_on(async move {
-            tokio::select! {
-                result = releasing.release_inputs() => panic!("release completed unexpectedly: {result:?}"),
-                arrived = arrived_rx => arrived.unwrap(),
-            }
-        });
-        // Shutdown drops the release task with the KeyA release in flight, leaving no task to report it.
-    })
-    .await
-    .unwrap();
+    let (finishing_tx, _finishing_rx) = tokio::sync::oneshot::channel();
+    let (answer_tx, answer_rx) = tokio::sync::oneshot::channel();
+    let server = interrupt_a_release(
+        &device,
+        listener,
+        finishing_tx,
+        answer_rx,
+        &["key=KeyC&state=true"],
+    )
+    .await;
+    // Shutdown dropped the release task with the KeyA release in flight, leaving no task to report it.
     assert_eq!(*reports.lock().unwrap(), Vec::<String>::new());
+    answer_tx.send(()).unwrap();
     device.key("KeyC", true).await.unwrap();
     let listener = tokio::time::timeout(INPUT_TIMEOUT, server)
         .await
@@ -867,12 +829,13 @@ async fn failed_release_whose_caller_has_gone_is_reported_once() {
     assert_no_waiting_connection(listener, "the failed release was sent again");
 }
 
-/// Presses KeyA and KeyB, then interrupts an explicit release by shutting its runtime down with the KeyA release unanswered. Returns the server task, which next expects the KeyB release that finishes the interrupted one and signals `finishing` when it arrives, then answers it after `answer`.
+/// Presses KeyA and KeyB, then interrupts an explicit release by shutting its runtime down with the KeyA release unanswered. Returns the server task, which next expects the KeyB release that finishes the interrupted one and signals `finishing` when it arrives, answers it after `answer`, then accepts and confirms one request for each entry of `tail`, which must contain that entry's query.
 async fn interrupt_a_release(
     device: &Arc<Kvmd>,
     listener: TcpListener,
     finishing: tokio::sync::oneshot::Sender<()>,
     answer: tokio::sync::oneshot::Receiver<()>,
+    tail: &'static [&'static str],
 ) -> tokio::task::JoinHandle<TcpListener> {
     let (arrived_tx, arrived_rx) = tokio::sync::oneshot::channel();
     let server = tokio::spawn(async move {
@@ -897,6 +860,11 @@ async fn interrupt_a_release(
         finishing.send(()).unwrap();
         answer.await.unwrap();
         respond(&mut release, "200 OK", b"{\"ok\":true}").await;
+        for query in tail {
+            let (mut request, _) = listener.accept().await.unwrap();
+            assert!(read_input_request(&mut request).await.contains(query));
+            respond(&mut request, "200 OK", b"{\"ok\":true}").await;
+        }
         drop(interrupted);
         listener
     });
@@ -928,9 +896,9 @@ async fn interrupted_release_failure_handed_to_a_waiting_caller_is_not_reported(
     let device = Arc::new(device);
     let (finishing_tx, _finishing_rx) = tokio::sync::oneshot::channel();
     let (answer_tx, answer_rx) = tokio::sync::oneshot::channel();
-    let server = interrupt_a_release(&device, listener, finishing_tx, answer_rx).await;
+    let server = interrupt_a_release(&device, listener, finishing_tx, answer_rx, &[]).await;
     answer_tx.send(()).unwrap();
-    // The explicit release that finishes the interrupted one hands its failure to this caller, which is then informed.
+    // The explicit release that finishes the interrupted one returns an indeterminate error to this caller, and nothing is reported.
     assert!(matches!(
         device.release_inputs().await,
         Err(kvm_core::Error::AmbiguousInput(_))
@@ -952,7 +920,7 @@ async fn interrupted_release_failure_whose_finishing_caller_has_gone_is_reported
     let device = Arc::new(device);
     let (finishing_tx, finishing_rx) = tokio::sync::oneshot::channel();
     let (answer_tx, answer_rx) = tokio::sync::oneshot::channel();
-    let server = interrupt_a_release(&device, listener, finishing_tx, answer_rx).await;
+    let server = interrupt_a_release(&device, listener, finishing_tx, answer_rx, &[]).await;
     let releasing = device.clone();
     let release = tokio::spawn(async move { releasing.release_inputs().await });
     tokio::time::timeout(INPUT_TIMEOUT, finishing_rx)
