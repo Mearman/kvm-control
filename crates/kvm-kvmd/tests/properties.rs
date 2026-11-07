@@ -873,13 +873,15 @@ fn act() -> impl Strategy<Value = Act> {
 proptest! {
     #![proptest_config(cases(24))]
 
-    // The adapter's tracked inputs must equal what the device holds after every completed call, and an abandoned call must cost the adapter nothing beyond releasing everything it had tracked before the next input. Breaks if a release leaves a key tracked, if abandonment skips the cleanup, if cleanup runs after the following input, or if a release is sent for an input that was never held.
+    // The adapter's tracked inputs must equal what the device holds after every completed call, and an abandoned call must cost the adapter nothing beyond releasing its own press before the next input. Breaks if a release leaves a key tracked, if abandonment skips the cleanup, if cleanup runs after the following input, if cleanup releases an input another call pressed, or if a release is sent for an input that was never held.
     #[test]
     fn tracked_inputs_match_what_the_device_holds(acts in vec(act(), 1..14)) {
         let fx = fixture!();
         let device = fx.device(DeviceProfile::PiKvm);
         let gate = fx.with(|device| device.gate.clone());
         let mut held: BTreeSet<(bool, String)> = BTreeSet::new();
+        // The press an abandoned call owes the release of, and whether that call's cleanup may still be running.
+        let mut owed: Option<(bool, String)> = None;
         let mut cleanup_pending = false;
         for act in acts {
             if cleanup_pending {
@@ -887,7 +889,9 @@ proptest! {
                 if matches!(act, Act::Cancel(..) | Act::Release(..)) {
                     prop_assert!(fx.run(device.mouse_move(0, 0)).is_ok());
                 }
-                held.clear();
+                if let Some(own) = owed.take() {
+                    held.remove(&own);
+                }
                 cleanup_pending = false;
             }
             match act {
@@ -915,7 +919,8 @@ proptest! {
                         });
                         gate.release.notify_one();
                         if press {
-                            held.insert((button, name));
+                            held.insert((button, name.clone()));
+                            owed = Some((button, name));
                         } else {
                             held.remove(&(button, name));
                         }

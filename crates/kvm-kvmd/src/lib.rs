@@ -5,7 +5,7 @@
 //! These sources do not establish compatibility with every firmware version. Only synthetic server tests have been run; no physical device has been verified. The video API supports MJPEG only and does not change encoder settings. JPEG pixel data is decoded under resource limits before delivery; original metadata is preserved but not validated and must be treated as untrusted by consumers. Video capabilities remain unknown until this connection receives a valid JPEG snapshot or live frame. A successful operation records support for that connection; failures do not prove a capability unsupported.
 
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet, VecDeque},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -313,7 +313,7 @@ impl reqwest::cookie::CookieStore for SessionCookies {
 
 /// A KVMD connection with an explicitly authenticated session.
 ///
-/// Input requests already submitted continue after caller cancellation. Dropping a submitted key or button request before collecting its outcome is safe outside a runtime and releases tracked inputs before any later input, movement or explicit release runs, including one already waiting for the input lock, so cleanup never interleaves with later inputs: a request whose outcome was not yet delivered releases them before giving up the lock, and one whose outcome was delivered marks cleanup pending for the next lock holder and schedules it on the captured runtime. A completed request does not hold the input lock while its outcome waits to be collected, and a release of an input that cleanup has just confirmed released is not sent again unless an earlier press of it was ambiguous. Ambiguous outcomes permanently render cleanup indeterminate because a server may apply a timed-out request later, and a request interrupted by runtime shutdown counts as ambiguous and leaves cleanup pending for the next lock holder. An ambiguous release is not replayed automatically. Dropping the last owner attempts to release tracked inputs on the captured runtime; process or runtime termination provides no cleanup guarantee.
+/// Input requests already submitted continue after caller cancellation. A key or button request dropped before its outcome is collected, including outside a runtime, owes the release of its own press and nothing else: if the outcome was not yet delivered the request sends that release before giving up the input lock, and otherwise the release is queued for the next holder of the input lock and scheduled on the captured runtime. Every later input, movement or explicit release sends owed releases before its own request, including one already waiting for the lock, so cleanup never interleaves with later inputs. An owed release is skipped once a later request has pressed or released the same input, so an input whose request reported success is never undone by cleanup. A completed request does not hold the input lock while its outcome waits to be collected, and a release of an input that cleanup has just confirmed released is not sent again unless an earlier press of it was ambiguous. Ambiguous outcomes permanently render cleanup indeterminate because a server may apply a timed-out request later. A request interrupted by runtime shutdown counts as ambiguous: an interrupted press owes its release, and an interrupted explicit release is finished by the next lock holder. An ambiguous release is not replayed automatically. Dropping the last owner attempts to release tracked inputs on the captured runtime; process termination, or a runtime shutdown with no later holder of the input lock, provides no cleanup guarantee.
 ///
 /// Cookies are accepted only from login or approval responses. Later `Set-Cookie` headers, including rotation and expiry updates, are ignored. The inspected [PiKVM](https://github.com/pikvm/kvmd/blob/fcb903eb3be70d8eee4aee99e5fcc1c743e3ccef/kvmd/apps/kvmd/api/auth.py) and [GLKVM](https://github.com/gl-inet/glkvm/blob/3e8dd23c4bd638a4650433664cc3b0f3b4d29395/kvmd/apps/kvmd/api/auth.py) revisions issue authentication cookies on login, and GLKVM also issues them on approval. Other firmware requiring cookie rotation is not supported. Server-side expiry or revocation can return an authentication error; call `login` again with fresh credentials and complete any approval. Consequential and input requests are never automatically replayed, and ambiguous outcomes require observation before a caller decides what to do.
 pub struct Kvmd {
@@ -328,8 +328,8 @@ pub struct Kvmd {
     video_proven: Arc<AtomicBool>,
     cleanup_on_drop: bool,
     input_runtime: Arc<std::sync::Mutex<Option<tokio::runtime::Handle>>>,
-    // Set without the input lock by a dropped input future and consumed under the lock, so a lock holder after the drop releases tracked inputs before its own request.
-    cleanup_pending: Arc<AtomicBool>,
+    // Releases owed by abandoned presses. A dropped future may have no runtime and cannot await the input lock, so it queues here and the next lock holder sends them.
+    owed: Arc<std::sync::Mutex<VecDeque<Owed>>>,
     #[cfg(test)]
     stream_storage: Arc<tokio::sync::Semaphore>,
     #[cfg(test)]
@@ -350,12 +350,25 @@ struct Inputs {
     uncertain_keys: BTreeSet<String>,
     uncertain_buttons: BTreeSet<String>,
     indeterminate: bool,
-    // Inputs whose release cleanup for an abandoned request confirmed since the last key or button request, so that request does not resend one.
+    // Inputs whose owed release cleanup confirmed since the last key or button request, so that request does not resend one.
     cleaned: Vec<(Held, String)>,
+    // Sequence number of the last key or button request for each input, so an owed release is skipped once a later request changed that input.
+    last: BTreeMap<(Held, String), u64>,
+    sequence: u64,
+    // Set while an explicit release runs, so one interrupted by runtime shutdown is finished by the next lock holder.
+    release_pending: bool,
+}
+
+/// The release a press owes when its caller abandons it: the input and the sequence number of the request that pressed it.
+#[derive(Clone)]
+struct Owed {
+    kind: Held,
+    name: String,
+    sequence: u64,
 }
 
 /// An input that stays held until released: a keyboard key or a mouse button.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum Held {
     Key,
     Button,
@@ -436,16 +449,16 @@ impl Drop for InFlight<'_> {
     }
 }
 
-/// Holds the input lock for a key or button task and marks cleanup pending if the task is dropped (runtime shutdown) before `settle`, which it calls once its outcome is delivered or its own cleanup has finished. `Drop::drop` runs before the lock guard field is dropped, so the flag is set while the lock is still held and the next lock holder sees it.
+/// Holds the input lock for a key or button task. A press the task has submitted is owed until `settle`, which the task calls once its outcome is delivered or its own release has run, so a task dropped by runtime shutdown queues the release for the next lock holder while it still holds the lock.
 struct TaskLock {
     inputs: tokio::sync::OwnedMutexGuard<Inputs>,
-    pending: Arc<AtomicBool>,
-    armed: bool,
+    owed: Arc<std::sync::Mutex<VecDeque<Owed>>>,
+    owes: Option<Owed>,
 }
 
 impl TaskLock {
     fn settle(mut self) {
-        self.armed = false;
+        self.owes = None;
     }
 }
 
@@ -464,36 +477,19 @@ impl std::ops::DerefMut for TaskLock {
 
 impl Drop for TaskLock {
     fn drop(&mut self) {
-        if self.armed {
-            self.pending.store(true, Ordering::SeqCst);
+        if let Some(owed) = self.owes.take() {
+            self.owed
+                .lock()
+                .expect("owed releases lock poisoned")
+                .push_back(owed);
         }
     }
 }
 
-/// Puts back a pending-cleanup flag taken by a release that does not finish, so the next lock holder still releases tracked inputs.
-struct RestorePending<'a> {
-    flag: &'a AtomicBool,
-    owed: bool,
-}
-
-impl RestorePending<'_> {
-    fn complete(mut self) {
-        self.owed = false;
-    }
-}
-
-impl Drop for RestorePending<'_> {
-    fn drop(&mut self) {
-        if self.owed {
-            self.flag.store(true, Ordering::SeqCst);
-        }
-    }
-}
-
-/// Owns an input request's outcome channel for the caller. Dropped before collecting, it closes the channel so delivery and abandonment cannot race: an outcome not yet delivered makes the input task release tracked inputs itself before unlocking, and an outcome delivered after the task unlocked marks cleanup pending for the next lock holder and schedules it on the captured runtime. Needs no current runtime, so dropping outside one is safe.
+/// Owns an input request's outcome channel for the caller. Dropped before collecting, it closes the channel so delivery and abandonment cannot race: an outcome not yet delivered makes the input task send its own owed release before unlocking, and a delivered press queues its owed release and schedules it on the captured runtime. Needs no current runtime, so dropping outside one is safe.
 struct Collect<'a> {
     device: &'a Kvmd,
-    outcome: Option<tokio::sync::oneshot::Receiver<Result<()>>>,
+    outcome: Option<tokio::sync::oneshot::Receiver<(Result<()>, Option<Owed>)>>,
 }
 
 impl Collect<'_> {
@@ -504,7 +500,9 @@ impl Collect<'_> {
             .expect("outcome is collected once")
             .await;
         self.outcome = None;
-        outcome.map_err(|_| Error::AmbiguousInput("input task failed".into()))?
+        outcome
+            .map_err(|_| Error::AmbiguousInput("input task failed".into()))?
+            .0
     }
 }
 
@@ -514,12 +512,15 @@ impl Drop for Collect<'_> {
             return;
         };
         outcome.close();
-        // Empty or closed: the task sees the failed delivery under the lock and cleans up itself, or it was dropped mid-request and recorded the request as ambiguous.
-        if outcome.try_recv().is_err() {
+        // Empty or closed: the task sees the failed delivery under the lock and releases its own press, or it was dropped and its lock guard queued that release.
+        let Ok((_, Some(owed))) = outcome.try_recv() else {
             return;
-        }
-        // Set only after the task recorded this outcome, and the task never takes the flag after delivering it, so whichever lock holder takes the flag next releases this input.
-        self.device.cleanup_pending.store(true, Ordering::SeqCst);
+        };
+        self.device
+            .owed
+            .lock()
+            .expect("owed releases lock poisoned")
+            .push_back(owed);
         if let Some(runtime) = self
             .device
             .input_runtime
@@ -530,7 +531,7 @@ impl Drop for Collect<'_> {
             let worker = self.device.input_worker();
             runtime.spawn(async move {
                 let mut inputs = worker.inputs.lock().await;
-                worker.clean_pending(&mut inputs).await;
+                worker.settle_owed(&mut inputs).await;
             });
         }
     }
@@ -603,7 +604,7 @@ impl Kvmd {
             video_proven: Arc::new(AtomicBool::new(false)),
             cleanup_on_drop: true,
             input_runtime: Arc::new(std::sync::Mutex::new(None)),
-            cleanup_pending: Arc::new(AtomicBool::new(false)),
+            owed: Default::default(),
             #[cfg(test)]
             stream_storage: Arc::new(tokio::sync::Semaphore::new(MAX_JPEG_VALIDATIONS)),
             #[cfg(test)]
@@ -939,7 +940,7 @@ impl Kvmd {
             video_proven: self.video_proven.clone(),
             cleanup_on_drop: false,
             input_runtime: self.input_runtime.clone(),
-            cleanup_pending: self.cleanup_pending.clone(),
+            owed: self.owed.clone(),
             #[cfg(test)]
             stream_storage: self.stream_storage.clone(),
             #[cfg(test)]
@@ -982,80 +983,101 @@ impl Kvmd {
         result
     }
 
-    /// Releases every tracked input, the caller holding the input lock, and returns the inputs whose release the device confirmed; a failed release is tracked as uncertain and never resent. Any pending cleanup is taken first, so a drop that marks cleanup pending while this runs stays pending for the next lock holder, and a release interrupted before it finishes (runtime shutdown) leaves the flag set.
-    async fn release_owed(&self, inputs: &mut Inputs) -> (Result<()>, Vec<(Held, String)>) {
-        let owed = self.cleanup_pending.swap(false, Ordering::SeqCst);
-        let restore = RestorePending {
-            flag: &self.cleanup_pending,
-            owed,
-        };
+    /// Releases every tracked input, the caller holding the input lock. A failed release is tracked as uncertain and never resent. `release_pending` stays set until every release has been attempted, so a release interrupted by runtime shutdown is finished by the next lock holder.
+    async fn release_all(&self, inputs: &mut Inputs) -> Result<()> {
+        inputs.release_pending = true;
         let mut failed = false;
-        let mut released = Vec::new();
         for kind in [Held::Key, Held::Button] {
             for name in inputs.held(kind).clone() {
-                if self.send_held(inputs, kind, &name, false).await.is_ok() {
-                    released.push((kind, name));
-                } else {
-                    failed = true;
-                }
+                failed |= self.send_held(inputs, kind, &name, false).await.is_err();
             }
         }
-        restore.complete();
-        let result = if failed || inputs.indeterminate {
+        inputs.release_pending = false;
+        if failed || inputs.indeterminate {
             Err(Error::AmbiguousInput(
                 "input session remains indeterminate after an ambiguous operation".into(),
             ))
         } else {
             Ok(())
-        };
-        (result, released)
+        }
     }
 
-    /// Releases tracked inputs for an abandoned request, the caller holding the input lock, recording each confirmed release in `inputs.cleaned` unless the input is tracked as uncertain, since an earlier ambiguous press may still be applied after the release.
-    async fn clean_abandoned(&self, inputs: &mut Inputs) {
-        let (result, released) = self.release_owed(inputs).await;
-        let released: Vec<_> = released
-            .into_iter()
-            .filter(|(kind, name)| !inputs.uncertain(*kind).contains(name))
-            .collect();
-        inputs.cleaned.extend(released);
-        if let Err(error) = result {
+    /// Sends cleanup owed to earlier requests, the caller holding the input lock: finishes an interrupted explicit release, then releases each input an abandoned press still holds unless a later request changed it. A confirmed owed release is recorded in `inputs.cleaned` unless the input is tracked as uncertain, since an earlier ambiguous press may still be applied after the release. An owed release interrupted by runtime shutdown is recorded as ambiguous by `send_held`, so it is never resent.
+    async fn settle_owed(&self, inputs: &mut Inputs) {
+        if inputs.release_pending
+            && let Err(error) = self.release_all(inputs).await
+        {
             eprintln!("Input cleanup uncertain: {error}");
         }
-    }
-
-    /// Runs cleanup marked pending by a dropped input future, the caller holding the input lock.
-    async fn clean_pending(&self, inputs: &mut Inputs) {
-        if self.cleanup_pending.load(Ordering::SeqCst) {
-            self.clean_abandoned(inputs).await;
+        loop {
+            let next = self
+                .owed
+                .lock()
+                .expect("owed releases lock poisoned")
+                .pop_front();
+            let Some(Owed {
+                kind,
+                name,
+                sequence,
+            }) = next
+            else {
+                return;
+            };
+            if inputs.last.get(&(kind, name.clone())) != Some(&sequence)
+                || !inputs.held(kind).contains(&name)
+            {
+                continue;
+            }
+            match self.send_held(inputs, kind, &name, false).await {
+                Ok(()) if !inputs.uncertain(kind).contains(&name) => {
+                    inputs.cleaned.push((kind, name));
+                }
+                Ok(()) => {}
+                Err(error) => eprintln!("Input cleanup uncertain: {error}"),
+            }
         }
     }
 
-    /// Submits a press or release on a task that holds the input lock until the outcome is recorded and delivered, not until it is collected. A release of an input that cleanup for an abandoned request confirmed released since the previous key or button request is not sent again.
+    /// Submits a press or release on a task that holds the input lock until the outcome is recorded and delivered, not until it is collected. A release of an input whose owed release cleanup confirmed since the previous key or button request is not sent again.
     async fn held_input(&self, kind: Held, name: &str, pressed: bool) -> Result<()> {
-        let mut inputs = TaskLock {
-            inputs: self.inputs.clone().lock_owned().await,
-            pending: self.cleanup_pending.clone(),
-            armed: true,
-        };
+        // Captured before the lock so a call outside a runtime panics before it can lock or owe anything.
         self.capture_input_runtime();
         let worker = self.input_worker();
         let (result_tx, result_rx) = tokio::sync::oneshot::channel();
         let name = name.to_owned();
+        let mut inputs = TaskLock {
+            inputs: self.inputs.clone().lock_owned().await,
+            owed: self.owed.clone(),
+            owes: None,
+        };
         let collect = Collect {
             device: self,
             outcome: Some(result_rx),
         };
         tokio::spawn(async move {
-            worker.clean_pending(&mut inputs).await;
+            worker.settle_owed(&mut inputs).await;
             let cleaned = std::mem::take(&mut inputs.cleaned);
+            inputs.sequence += 1;
+            let sequence = inputs.sequence;
+            inputs.last.insert((kind, name.clone()), sequence);
+            let owes = pressed.then(|| Owed {
+                kind,
+                name: name.clone(),
+                sequence,
+            });
             let result = if !pressed && cleaned.contains(&(kind, name.clone())) {
                 Ok(())
             } else {
+                inputs.owes = owes.clone();
                 worker.send_held(&mut inputs, kind, &name, pressed).await
             };
-            if result_tx.send(result).is_err() {
-                worker.clean_abandoned(&mut inputs).await;
+            if let Err((_, Some(owed))) = result_tx.send((result, owes)) {
+                worker
+                    .owed
+                    .lock()
+                    .expect("owed releases lock poisoned")
+                    .push_back(owed);
+                worker.settle_owed(&mut inputs).await;
             }
             inputs.settle();
         });
@@ -1190,12 +1212,12 @@ impl Device for Kvmd {
     }
 
     async fn mouse_move(&self, x: i16, y: i16) -> Result<()> {
-        let inputs = self.inputs.clone().lock_owned().await;
         self.capture_input_runtime();
         let worker = self.input_worker();
+        let inputs = self.inputs.clone().lock_owned().await;
         tokio::spawn(async move {
             let mut inputs = inputs;
-            worker.clean_pending(&mut inputs).await;
+            worker.settle_owed(&mut inputs).await;
             let active = worker.client.read().await;
             let state = worker.json_with(&active.client, "hid").await?;
             if hid_capability(&state, "mouse") != Capability::Supported
@@ -1388,10 +1410,10 @@ impl Device for Kvmd {
     }
 
     async fn release_inputs(&self) -> Result<()> {
-        let mut inputs = self.inputs.clone().lock_owned().await;
         self.capture_input_runtime();
         let worker = self.input_worker();
-        tokio::spawn(async move { worker.release_owed(&mut inputs).await.0 })
+        let mut inputs = self.inputs.clone().lock_owned().await;
+        tokio::spawn(async move { worker.release_all(&mut inputs).await })
             .await
             .map_err(|_| Error::AmbiguousInput("release task failed".into()))?
     }
@@ -1644,7 +1666,7 @@ mod tests {
             video_proven: Default::default(),
             cleanup_on_drop: false,
             input_runtime: Default::default(),
-            cleanup_pending: Default::default(),
+            owed: Default::default(),
             stream_storage: Arc::new(tokio::sync::Semaphore::new(MAX_JPEG_VALIDATIONS)),
             snapshot_storage: Arc::new(tokio::sync::Semaphore::new(MAX_JPEG_VALIDATIONS)),
         };
@@ -1692,7 +1714,7 @@ mod tests {
             video_proven: Default::default(),
             cleanup_on_drop: false,
             input_runtime: Default::default(),
-            cleanup_pending: Default::default(),
+            owed: Default::default(),
             stream_storage: Arc::new(tokio::sync::Semaphore::new(MAX_JPEG_VALIDATIONS)),
             snapshot_storage: Arc::new(tokio::sync::Semaphore::new(MAX_JPEG_VALIDATIONS)),
         };

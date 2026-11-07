@@ -930,7 +930,7 @@ async fn delivered_but_uncollected_input_is_released_before_the_next_input() {
 }
 
 #[test]
-fn cleanup_interrupted_by_runtime_shutdown_stays_pending() {
+fn owed_release_interrupted_by_runtime_shutdown_is_not_resent() {
     let server_runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -951,11 +951,11 @@ fn cleanup_interrupted_by_runtime_shutdown_stays_pending() {
         calls.4.notify_one();
         within("the outcome to be delivered", woken.0.notified()).await;
     });
-    // Dropping the delivered press marks cleanup pending and schedules it on the input runtime.
+    // Dropping the delivered press owes its release and schedules it on the input runtime.
     drop(press);
     input_runtime.block_on(arrival(&calls));
-    assert_eq!(input_events(&calls).last().unwrap(), "key=KeyA&state=false");
-    // Shutdown drops the cleanup after it took the pending flag, with the KeyA release in flight and KeyB still held.
+    assert_eq!(input_events(&calls).last().unwrap(), "key=KeyB&state=false");
+    // Shutdown drops the cleanup with its release in flight, so the release is ambiguous and must not be sent again.
     drop(input_runtime);
     calls.4.notify_one();
     server_runtime
@@ -966,7 +966,6 @@ fn cleanup_interrupted_by_runtime_shutdown_stays_pending() {
         [
             "key=KeyA&state=true",
             "key=KeyB&state=true",
-            "key=KeyA&state=false",
             "key=KeyB&state=false",
             "key=KeyC&state=true",
         ]
@@ -979,24 +978,20 @@ async fn release_after_an_ambiguous_press_is_sent_after_cleanup() {
     let (mut endpoint, ca, calls, server) = fixture().await;
     endpoint.set_path("/gated/");
     let device = Arc::new(client(endpoint, Some(ca)));
-    assert!(matches!(
-        drive(&calls, device.key("late", true)).await,
-        Err(Error::AmbiguousInput(_))
-    ));
     let sender = device.clone();
-    let abandoned = tokio::spawn(async move { sender.key("KeyB", true).await });
+    let press = tokio::spawn(async move { sender.key("late", true).await });
     arrival(&calls).await;
-    abandoned.abort();
-    assert!(abandoned.await.unwrap_err().is_cancelled());
+    press.abort();
+    assert!(press.await.unwrap_err().is_cancelled());
     calls.4.notify_one();
-    // Cleanup releases both inputs, but the device may still apply the timed-out press of "late" afterwards.
+    // The abandoned press fails ambiguously, so cleanup sends its owed release, but the device may still apply the press afterwards.
+    arrival(&calls).await;
+    calls.4.notify_one();
     let _ = drive(&calls, device.key("late", false)).await;
     assert_eq!(
         input_events(&calls),
         [
             "key=late&state=true",
-            "key=KeyB&state=true",
-            "key=KeyB&state=false",
             "key=late&state=false",
             "key=late&state=false",
         ]
@@ -1126,6 +1121,83 @@ async fn release_after_cleanup_released_the_input_is_not_resent() {
         .collect();
     assert_eq!(events.len(), 2, "{events:?}");
     assert!(events[1].ends_with("key=KeyA&state=false"));
+    server.abort();
+}
+
+#[tokio::test]
+async fn abandoned_press_never_undoes_a_later_acknowledged_input() {
+    let (mut endpoint, ca, calls, server) = fixture().await;
+    endpoint.set_path("/gated/");
+    let device = client(endpoint, Some(ca));
+    let woken = Arc::new(Woken(tokio::sync::Notify::new()));
+    let mut press = Box::pin(device.key("KeyA", true));
+    poll_once(press.as_mut(), &woken);
+    arrival(&calls).await;
+    calls.4.notify_one();
+    within("the outcome to be delivered", woken.0.notified()).await;
+    // Later requests press another input and re-press the abandoned one, and their callers collect success before the drop.
+    drive(&calls, async {
+        device.key("KeyC", true).await.unwrap();
+        device.key("KeyA", false).await.unwrap();
+        device.key("KeyA", true).await.unwrap();
+    })
+    .await;
+    drop(press);
+    drive(&calls, device.key("KeyD", true)).await.unwrap();
+    assert_eq!(
+        input_events(&calls),
+        [
+            "key=KeyA&state=true",
+            "key=KeyC&state=true",
+            "key=KeyA&state=false",
+            "key=KeyA&state=true",
+            "key=KeyD&state=true",
+        ]
+    );
+    server.abort();
+}
+
+#[test]
+fn release_interrupted_by_runtime_shutdown_is_finished_by_the_next_lock_holder() {
+    let server_runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let (mut endpoint, ca, calls, server) = server_runtime.block_on(fixture());
+    endpoint.set_path("/gated/");
+    let device = client(endpoint, Some(ca));
+    let input_runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    input_runtime.block_on(drive(&calls, async {
+        device.key("KeyA", true).await.unwrap();
+        device.key("KeyB", true).await.unwrap();
+    }));
+    let mut release = Box::pin(device.release_inputs());
+    input_runtime.block_on(async {
+        tokio::select! {
+            result = &mut release => panic!("release completed unexpectedly: {result:?}"),
+            () = arrival(&calls) => {}
+        }
+    });
+    // Shutdown drops the release task with the KeyA release in flight and KeyB not yet released.
+    drop(release);
+    drop(input_runtime);
+    calls.4.notify_one();
+    server_runtime
+        .block_on(drive(&calls, device.key("KeyC", true)))
+        .unwrap();
+    assert_eq!(
+        input_events(&calls),
+        [
+            "key=KeyA&state=true",
+            "key=KeyB&state=true",
+            "key=KeyA&state=false",
+            "key=KeyB&state=false",
+            "key=KeyC&state=true",
+        ]
+    );
     server.abort();
 }
 
