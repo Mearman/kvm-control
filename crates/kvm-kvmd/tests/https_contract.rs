@@ -102,7 +102,15 @@ async fn gl_complete(body: String) -> impl IntoResponse {
 }
 
 async fn status(State(calls): State<Calls>, uri: Uri, headers: HeaderMap) -> impl IntoResponse {
-    calls.0.lock().unwrap().push(uri.path().to_string());
+    calls
+        .0
+        .lock()
+        .unwrap()
+        .push(if uri.path() == "/api/hid/events/send_key" {
+            uri.to_string()
+        } else {
+            uri.path().to_string()
+        });
     let cookie =
         headers.get(header::COOKIE).and_then(|v| v.to_str().ok()) == Some("auth_token=synthetic");
     let header_auth = headers.get("x-kvmd-user").and_then(|v| v.to_str().ok()) == Some("test-user")
@@ -498,6 +506,21 @@ async fn expired_session_requires_explicit_reauthentication() {
         device.release_inputs().await,
         Err(Error::AmbiguousInput(_))
     ));
+    let inputs_before_reauth: Vec<_> = calls
+        .0
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|v| v.starts_with("/api/hid/events/send_key?"))
+        .cloned()
+        .collect();
+    assert_eq!(
+        inputs_before_reauth,
+        [
+            "/api/hid/events/send_key?key=KeyA&state=true",
+            "/api/hid/events/send_key?key=KeyA&state=false"
+        ]
+    );
     device.login("test-user", "test-password").await.unwrap();
     device.check_auth().await.unwrap();
     assert!(matches!(
@@ -515,9 +538,9 @@ async fn expired_session_requires_explicit_reauthentication() {
     assert_eq!(
         paths
             .iter()
-            .filter(|v| v.as_str() == "/api/hid/events/send_key")
+            .filter(|v| v.starts_with("/api/hid/events/send_key?"))
             .count(),
-        1
+        2
     );
     server.abort();
 }
