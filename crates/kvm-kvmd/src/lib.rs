@@ -847,7 +847,7 @@ impl Kvmd {
                 "device approval requires the GLKVM profile".into(),
             ));
         }
-        let mut inputs = self.settled_inputs().await?;
+        let inputs = self.settled_inputs().await?;
         if !inputs.keys.is_empty() || !inputs.buttons.is_empty() {
             return Err(Error::AmbiguousInput(
                 "release tracked inputs before changing authentication".into(),
@@ -890,8 +890,6 @@ impl Kvmd {
         self.verify_client(&candidate.client).await?;
         *active = candidate;
         *pending = None;
-        // A release skipped because cleanup already sent it belongs to the session just replaced.
-        inputs.cleaned.clear();
         Ok(LoginState::Authenticated)
     }
 
