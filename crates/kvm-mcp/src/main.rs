@@ -74,7 +74,18 @@ async fn main() -> Result<(), Box<dyn Error>> {
         timeout: Duration::from_secs(30),
     })?);
     let password = read_password(&env::var("KVM_PASSWORD_FD")?)?;
-    let login = device.login(&env::var("KVM_USERNAME")?, &password).await?;
+    let totp = env::var("KVM_TOTP_FD")
+        .ok()
+        .map(|fd| read_password(&fd))
+        .transpose()?;
+    let login = device
+        .login_with_totp(
+            &env::var("KVM_USERNAME")?,
+            &password,
+            totp.as_deref().map(String::as_str),
+        )
+        .await?;
+    drop(totp);
     drop(password);
     if let LoginState::ApprovalPending { expires_in } = login {
         let seconds = expires_in.ok_or("device approval expiry is missing")?;

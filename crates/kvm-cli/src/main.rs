@@ -25,6 +25,9 @@ struct Cli {
     /// Read the password from standard input instead of a hidden terminal prompt
     #[arg(long)]
     password_stdin: bool,
+    /// Prompt for a current TOTP code for cookie login
+    #[arg(long, conflicts_with = "password_stdin")]
+    totp: bool,
     /// Authentication method
     #[arg(long, value_enum, default_value = "cookie")]
     auth: Auth,
@@ -359,11 +362,24 @@ async fn run(cli: Cli) -> Result<Value, String> {
         insecure_tls: cli.insecure_tls,
         timeout: Duration::from_secs(30),
     };
+    if cli.totp && matches!(cli.auth, Auth::Header) {
+        return Err("TOTP requires cookie authentication; header authentication would reuse an expiring code".into());
+    }
     let secret = Zeroizing::new(password(cli.password_stdin)?);
+    let totp = if cli.totp {
+        Some(Zeroizing::new(
+            rpassword::prompt_password("TOTP code: ")
+                .map_err(|_| "could not read TOTP from terminal")?,
+        ))
+    } else {
+        None
+    };
     let device = match cli.auth {
         Auth::Cookie => {
             let device = Kvmd::new(config).map_err(|e| e.to_string())?;
-            let login = device.login(&cli.username, &secret).await;
+            let login = device
+                .login_with_totp(&cli.username, &secret, totp.as_deref().map(String::as_str))
+                .await;
             drop(secret);
             let mut state = login.map_err(|e| e.to_string())?;
             if let LoginState::ApprovalPending { expires_in } = state {

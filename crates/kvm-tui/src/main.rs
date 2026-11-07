@@ -22,6 +22,9 @@ struct Args {
     profile: Option<Profile>,
     #[arg(long)]
     username: Option<String>,
+    /// Prompt for a current TOTP code
+    #[arg(long)]
+    totp: bool,
     /// PEM certificate authority to trust
     #[arg(long)]
     ca: Option<PathBuf>,
@@ -80,7 +83,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         insecure_tls: args.insecure_tls,
         timeout: Duration::from_secs(15),
     })?;
-    let mut state = device.login(&username, &password).await?;
+    let totp = if args.totp {
+        Some(zeroize::Zeroizing::new(rpassword::prompt_password(
+            "TOTP code: ",
+        )?))
+    } else {
+        None
+    };
+    let mut state = device
+        .login_with_totp(&username, &password, totp.as_deref().map(String::as_str))
+        .await?;
+    drop(totp);
     drop(password);
     while let LoginState::ApprovalPending { expires_in } = state {
         eprintln!(

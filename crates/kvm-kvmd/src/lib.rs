@@ -244,8 +244,27 @@ impl Kvmd {
         self.profile
     }
 
-    /// Authenticates using KVMD's cookie login. A rejected login may also represent a device-specific challenge.
+    /// Authenticates using KVMD's cookie login. Rejection does not identify whether TOTP is required.
     pub async fn login(&self, username: &str, password: &str) -> Result<LoginState> {
+        self.login_with_totp(username, password, None).await
+    }
+
+    /// Authenticates with an optional current six-digit TOTP code, appended to the password for KVMD. A fresh code is required for each new login.
+    pub async fn login_with_totp(
+        &self,
+        username: &str,
+        password: &str,
+        totp: Option<&str>,
+    ) -> Result<LoginState> {
+        let mut credential = zeroize::Zeroizing::new(password.to_owned());
+        if let Some(code) = totp {
+            if code.len() != 6 || !code.bytes().all(|byte| byte.is_ascii_digit()) {
+                return Err(Error::InvalidResponse(
+                    "TOTP must contain six ASCII digits".into(),
+                ));
+            }
+            credential.push_str(code);
+        }
         if !self.auth_headers.is_empty() {
             return Err(Error::InvalidResponse(
                 "cookie login cannot replace configured header credentials".into(),
@@ -262,7 +281,7 @@ impl Kvmd {
         let response = candidate
             .client
             .post(url)
-            .form(&[("user", username), ("passwd", password)])
+            .form(&[("user", username), ("passwd", credential.as_str())])
             .send()
             .await
             .map_err(|error| request_error("login", &error))?;

@@ -709,6 +709,37 @@ async fn header_auth_over_verified_tls() {
 }
 
 #[tokio::test]
+async fn totp_is_validated_and_appended_to_cookie_login() {
+    let (endpoint, ca, calls, server) = fixture().await;
+    let device = client(endpoint, Some(ca));
+    for code in ["12345", "12345x", "１２３４５６"] {
+        assert!(matches!(
+            device
+                .login_with_totp("test-user", "test-password", Some(code))
+                .await,
+            Err(Error::InvalidResponse(_))
+        ));
+    }
+    assert!(calls.0.lock().unwrap().is_empty());
+    assert_eq!(
+        device
+            .login_with_totp("test-user", "test-password", Some("012345"))
+            .await
+            .unwrap(),
+        LoginState::Authenticated
+    );
+    assert!(
+        calls
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|call| call == "/api/auth/login user=test-user&passwd=test-password012345")
+    );
+    server.abort();
+}
+
+#[tokio::test]
 async fn cookie_login_and_status_over_verified_tls() {
     let (endpoint, ca, calls, server) = fixture().await;
     let untrusted = client(endpoint.clone(), None);
