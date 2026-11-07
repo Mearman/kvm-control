@@ -49,12 +49,12 @@ fn shutdown_signal() -> std::io::Result<impl std::future::Future<Output = ()>> {
     })
 }
 
+/// Registers the Ctrl-C handler before returning, as the Unix variant registers its handlers, so the readiness message printed afterwards is true; `tokio::signal::ctrl_c` would register only when first polled.
 #[cfg(not(unix))]
 fn shutdown_signal() -> std::io::Result<impl std::future::Future<Output = ()>> {
-    Ok(async {
-        if let Err(error) = tokio::signal::ctrl_c().await {
-            eprintln!("Could not listen for shutdown signal: {error}");
-        }
+    let mut ctrl_c = tokio::signal::windows::ctrl_c()?;
+    Ok(async move {
+        ctrl_c.recv().await;
     })
 }
 
