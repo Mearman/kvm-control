@@ -70,6 +70,8 @@ async fn device(body: &'static [u8]) -> (Kvmd, Arc<Notify>, tokio::task::JoinHan
         inputs: Default::default(),
         auth_headers: Default::default(),
         approval_token: Default::default(),
+        snapshot_proven: Default::default(),
+        video_proven: Default::default(),
     };
     (device, closed, task)
 }
@@ -334,6 +336,8 @@ async fn cancelled_partial_frame_can_resume() {
         inputs: Default::default(),
         auth_headers: Default::default(),
         approval_token: Default::default(),
+        snapshot_proven: Default::default(),
+        video_proven: Default::default(),
     };
     let mut video = device.video().await.unwrap();
     assert!(
@@ -403,6 +407,8 @@ async fn relogin_waits_for_video_establishment() {
         inputs: Default::default(),
         auth_headers: Default::default(),
         approval_token: Default::default(),
+        snapshot_proven: Default::default(),
+        video_proven: Default::default(),
     });
     let video_device = device.clone();
     let video_task = tokio::spawn(async move { video_device.video().await });
@@ -466,6 +472,8 @@ async fn coalesced_http_response_delivers_multiple_frames() {
         inputs: Default::default(),
         auth_headers: Default::default(),
         approval_token: Default::default(),
+        snapshot_proven: Default::default(),
+        video_proven: Default::default(),
     };
     let mut video = device.video().await.unwrap();
     assert_eq!(
@@ -536,6 +544,8 @@ async fn maximum_frame_with_maximum_headers_and_boundary() {
         inputs: Default::default(),
         auth_headers: Default::default(),
         approval_token: Default::default(),
+        snapshot_proven: Default::default(),
+        video_proven: Default::default(),
     };
     let mut video = device.video().await.unwrap();
     assert_eq!(video.next_frame().await.unwrap().unwrap().jpeg.len(), FRAME);
