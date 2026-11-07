@@ -133,7 +133,12 @@ async fn run() -> Result<(), Box<dyn Error>> {
     if insecure_tls {
         eprintln!("Warning: TLS certificate verification is disabled");
     }
-    let ca = env::var("KVM_CA_FILE").ok().map(fs::read).transpose()?;
+    let ca = env::var("KVM_CA_FILE")
+        .ok()
+        .map(|path| {
+            fs::read(&path).map_err(|error| format!("cannot read KVM_CA_FILE {path}: {error}"))
+        })
+        .transpose()?;
     let device = Arc::new(Kvmd::new(Config {
         endpoint,
         profile,

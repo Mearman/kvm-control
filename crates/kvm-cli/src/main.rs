@@ -385,9 +385,11 @@ async fn execute(device: &impl Device, command: Command) -> Result<Value, String
 async fn run(cli: Cli) -> Result<Value, String> {
     let ca = cli
         .ca
-        .map(std::fs::read)
-        .transpose()
-        .map_err(|e| format!("cannot read CA certificate: {e}"))?;
+        .map(|path| {
+            std::fs::read(&path)
+                .map_err(|e| format!("cannot read --ca certificate {}: {e}", path.display()))
+        })
+        .transpose()?;
     if cli.insecure_tls {
         eprintln!("warning: TLS certificate verification is disabled");
     }

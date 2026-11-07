@@ -3,7 +3,7 @@ use kvm_core::DeviceProfile;
 use kvm_kvmd::{Config, Kvmd, LoginState};
 use std::{
     io::{self, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
     time::Duration,
 };
 use url::Url;
@@ -35,7 +35,7 @@ struct Args {
 
 #[cfg(test)]
 mod tests {
-    use super::Args;
+    use super::{Args, read_ca};
     use clap::Parser;
 
     #[test]
@@ -43,12 +43,36 @@ mod tests {
         assert!(Args::try_parse_from(["kvm-tui", "--totp"]).unwrap().totp);
         assert!(Args::try_parse_from(["kvm-tui", "--totp", "012345"]).is_err());
     }
+
+    #[test]
+    fn unreadable_ca_names_the_option_and_path() {
+        let path =
+            std::env::temp_dir().join(format!("kvm-tui-missing-ca-{}.pem", std::process::id()));
+        let error = read_ca(&path).unwrap_err();
+        assert!(
+            error.starts_with(&format!(
+                "cannot read --ca certificate {}: ",
+                path.display()
+            )),
+            "{error}"
+        );
+    }
 }
 
 #[derive(Clone, Copy, ValueEnum)]
 enum Profile {
     Pikvm,
     Glkvm,
+}
+
+/// Reads the `--ca` certificate file.
+///
+/// # Errors
+///
+/// Returns a message naming `--ca` and the path when the file cannot be read; the file's contents never appear in it.
+fn read_ca(path: &Path) -> Result<Vec<u8>, String> {
+    std::fs::read(path)
+        .map_err(|error| format!("cannot read --ca certificate {}: {error}", path.display()))
 }
 
 fn prompt(label: &str) -> io::Result<String> {
@@ -62,6 +86,8 @@ fn prompt(label: &str) -> io::Result<String> {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
+    // Read before any prompt, so a wrong path fails before the password is asked for.
+    let trusted_ca_pem = args.ca.as_deref().map(read_ca).transpose()?;
     let endpoint = match args.endpoint {
         Some(endpoint) => endpoint,
         None => prompt("Device HTTPS URL")?.parse()?,
@@ -91,7 +117,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Profile::Pikvm => DeviceProfile::PiKvm,
             Profile::Glkvm => DeviceProfile::GlKvm,
         },
-        trusted_ca_pem: args.ca.map(std::fs::read).transpose()?,
+        trusted_ca_pem,
         insecure_tls: args.insecure_tls,
         timeout: Duration::from_secs(15),
     })?;
