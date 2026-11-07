@@ -654,6 +654,18 @@ async fn drive<F: std::future::Future>(calls: &Calls, future: F) -> F::Output {
     }
 }
 
+/// Returns the recorded key and button events in order.
+fn input_events(calls: &Calls) -> Vec<String> {
+    calls
+        .0
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|v| v.contains("/hid/events/"))
+        .map(|v| v.split_once('?').unwrap().1.to_owned())
+        .collect()
+}
+
 /// Replays the recorded key and button events and returns the inputs the fake device still holds.
 fn held_on_device(calls: &Calls) -> Vec<String> {
     let mut held = std::collections::BTreeSet::new();
@@ -836,6 +848,19 @@ fn input_interrupted_by_runtime_shutdown_stays_tracked_as_ambiguous() {
             .filter(|v| v.contains("/hid/events/"))
             .count(),
         1
+    );
+    // Releases the request the dropped task left gated on the device, if its handler still runs.
+    calls.4.notify_one();
+    server_runtime
+        .block_on(drive(&calls, device.key("KeyB", true)))
+        .unwrap();
+    assert_eq!(
+        input_events(&calls),
+        [
+            "key=KeyA&state=true",
+            "key=KeyA&state=false",
+            "key=KeyB&state=true"
+        ]
     );
     server.abort();
 }

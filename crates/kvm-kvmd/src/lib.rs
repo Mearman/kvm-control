@@ -313,7 +313,7 @@ impl reqwest::cookie::CookieStore for SessionCookies {
 
 /// A KVMD connection with an explicitly authenticated session.
 ///
-/// Input requests already submitted continue after caller cancellation. Dropping a submitted key or button request before collecting its outcome is safe outside a runtime and releases tracked inputs before any later input, movement or explicit release runs, including one already waiting for the input lock, so cleanup never interleaves with later inputs: a request whose outcome was not yet delivered releases them before giving up the lock, and one whose outcome was delivered marks cleanup pending for the next lock holder and schedules it on the captured runtime. A completed request does not hold the input lock while its outcome waits to be collected, and a release of an input that cleanup has just released is not sent again. Ambiguous outcomes permanently render cleanup indeterminate because a server may apply a timed-out request later, and a request interrupted by runtime shutdown counts as ambiguous. An ambiguous release is not replayed automatically. Dropping the last owner attempts to release tracked inputs on the captured runtime; process or runtime termination provides no cleanup guarantee.
+/// Input requests already submitted continue after caller cancellation. Dropping a submitted key or button request before collecting its outcome is safe outside a runtime and releases tracked inputs before any later input, movement or explicit release runs, including one already waiting for the input lock, so cleanup never interleaves with later inputs: a request whose outcome was not yet delivered releases them before giving up the lock, and one whose outcome was delivered marks cleanup pending for the next lock holder and schedules it on the captured runtime. A completed request does not hold the input lock while its outcome waits to be collected, and a release of an input that cleanup has just released is not sent again. Ambiguous outcomes permanently render cleanup indeterminate because a server may apply a timed-out request later, and a request interrupted by runtime shutdown counts as ambiguous and leaves cleanup pending for the next lock holder. An ambiguous release is not replayed automatically. Dropping the last owner attempts to release tracked inputs on the captured runtime; process or runtime termination provides no cleanup guarantee.
 ///
 /// Cookies are accepted only from login or approval responses. Later `Set-Cookie` headers, including rotation and expiry updates, are ignored. The inspected [PiKVM](https://github.com/pikvm/kvmd/blob/fcb903eb3be70d8eee4aee99e5fcc1c743e3ccef/kvmd/apps/kvmd/api/auth.py) and [GLKVM](https://github.com/gl-inet/glkvm/blob/3e8dd23c4bd638a4650433664cc3b0f3b4d29395/kvmd/apps/kvmd/api/auth.py) revisions issue authentication cookies on login, and GLKVM also issues them on approval. Other firmware requiring cookie rotation is not supported. Server-side expiry or revocation can return an authentication error; call `login` again with fresh credentials and complete any approval. Consequential and input requests are never automatically replayed, and ambiguous outcomes require observation before a caller decides what to do.
 pub struct Kvmd {
@@ -425,6 +425,40 @@ impl Drop for InFlight<'_> {
         if !self.finished {
             self.inputs
                 .record(self.kind, self.name, self.pressed, false);
+        }
+    }
+}
+
+/// Holds the input lock for a key or button task and marks cleanup pending if the task is dropped (runtime shutdown) before `settle`, which it calls once its outcome is delivered or its own cleanup has finished. `Drop::drop` runs before the lock guard field is dropped, so the flag is set while the lock is still held and the next lock holder sees it.
+struct TaskLock {
+    inputs: tokio::sync::OwnedMutexGuard<Inputs>,
+    pending: Arc<AtomicBool>,
+    armed: bool,
+}
+
+impl TaskLock {
+    fn settle(mut self) {
+        self.armed = false;
+    }
+}
+
+impl std::ops::Deref for TaskLock {
+    type Target = Inputs;
+    fn deref(&self) -> &Inputs {
+        &self.inputs
+    }
+}
+
+impl std::ops::DerefMut for TaskLock {
+    fn deref_mut(&mut self) -> &mut Inputs {
+        &mut self.inputs
+    }
+}
+
+impl Drop for TaskLock {
+    fn drop(&mut self) {
+        if self.armed {
+            self.pending.store(true, Ordering::SeqCst);
         }
     }
 }
@@ -984,7 +1018,11 @@ impl Kvmd {
 
     /// Submits a press or release on a task that holds the input lock until the outcome is recorded and delivered, not until it is collected. A release of an input that cleanup for an abandoned request confirmed released since the previous key or button request is not sent again.
     async fn held_input(&self, kind: Held, name: &str, pressed: bool) -> Result<()> {
-        let mut inputs = self.inputs.clone().lock_owned().await;
+        let mut inputs = TaskLock {
+            inputs: self.inputs.clone().lock_owned().await,
+            pending: self.cleanup_pending.clone(),
+            armed: true,
+        };
         self.capture_input_runtime();
         let worker = self.input_worker();
         let (result_tx, result_rx) = tokio::sync::oneshot::channel();
@@ -1004,6 +1042,7 @@ impl Kvmd {
             if result_tx.send(result).is_err() {
                 worker.clean_abandoned(&mut inputs).await;
             }
+            inputs.settle();
         });
         collect.outcome().await
     }
