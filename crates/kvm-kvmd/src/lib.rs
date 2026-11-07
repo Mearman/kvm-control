@@ -7,8 +7,8 @@
 use std::{
     collections::BTreeSet,
     sync::{
-        Arc,
         atomic::{AtomicBool, Ordering},
+        Arc,
     },
     time::Duration,
 };
@@ -346,6 +346,45 @@ struct Inputs {
 }
 
 impl Kvmd {
+    async fn snapshot_with_storage(&self, slots: Arc<tokio::sync::Semaphore>) -> Result<Snapshot> {
+        const MAX_SNAPSHOT_BYTES: usize = 16 * 1024 * 1024;
+        let storage = slots
+            .try_acquire_owned()
+            .map_err(|_| Error::Transport("snapshot capacity exhausted".into()))?;
+        let mut response = self.get("streamer/snapshot").await?;
+        if response
+            .content_length()
+            .is_some_and(|n| n > MAX_SNAPSHOT_BYTES as u64)
+        {
+            return Err(Error::InvalidResponse(
+                "snapshot exceeds the size limit".into(),
+            ));
+        }
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|error| request_error("snapshot read", &error))?
+        {
+            if chunk.len() > MAX_SNAPSHOT_BYTES - bytes.len() {
+                return Err(Error::InvalidResponse(
+                    "snapshot exceeds the size limit".into(),
+                ));
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        let permit = jpeg_permit().await?;
+        let task = tokio::spawn(async move {
+            let _storage = storage;
+            validate_jpeg_async(bytes, permit).await
+        });
+        let jpeg = task
+            .await
+            .map_err(|_| Error::Transport("JPEG validation task failed".into()))??;
+        self.snapshot_proven.store(true, Ordering::Release);
+        Ok(Snapshot { jpeg })
+    }
+
     /// Builds a client without contacting the device. TLS verification is enabled unless explicitly disabled.
     pub fn new(config: Config) -> Result<Self> {
         if config.endpoint.scheme() != "https"
@@ -817,47 +856,12 @@ impl Device for Kvmd {
     }
 
     async fn snapshot(&self) -> Result<Snapshot> {
-        // Limit compressed image data before collecting it, including chunked responses.
-        const MAX_SNAPSHOT_BYTES: usize = 16 * 1024 * 1024;
         static STORAGE: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> =
             std::sync::OnceLock::new();
-        let storage = STORAGE
+        let slots = STORAGE
             .get_or_init(|| Arc::new(tokio::sync::Semaphore::new(MAX_JPEG_VALIDATIONS)))
-            .clone()
-            .try_acquire_owned()
-            .map_err(|_| Error::Transport("snapshot capacity exhausted".into()))?;
-        let mut response = self.get("streamer/snapshot").await?;
-        if response
-            .content_length()
-            .is_some_and(|n| n > MAX_SNAPSHOT_BYTES as u64)
-        {
-            return Err(Error::InvalidResponse(
-                "snapshot exceeds the size limit".into(),
-            ));
-        }
-        let mut bytes = Vec::new();
-        while let Some(chunk) = response
-            .chunk()
-            .await
-            .map_err(|error| request_error("snapshot read", &error))?
-        {
-            if chunk.len() > MAX_SNAPSHOT_BYTES - bytes.len() {
-                return Err(Error::InvalidResponse(
-                    "snapshot exceeds the size limit".into(),
-                ));
-            }
-            bytes.extend_from_slice(&chunk);
-        }
-        let permit = jpeg_permit().await?;
-        let task = tokio::spawn(async move {
-            let _storage = storage;
-            validate_jpeg_async(bytes, permit).await
-        });
-        let jpeg = task
-            .await
-            .map_err(|_| Error::Transport("JPEG validation task failed".into()))??;
-        self.snapshot_proven.store(true, Ordering::Release);
-        Ok(Snapshot { jpeg })
+            .clone();
+        self.snapshot_with_storage(slots).await
     }
 
     async fn key(&self, key: &str, pressed: bool) -> Result<()> {
@@ -1254,13 +1258,11 @@ mod tests {
             .await
             .is_err()
         );
-        assert!(
-            run_jpeg_validation(slots.clone(), || -> Result<()> {
-                panic!("synthetic panic")
-            })
-            .await
-            .is_err()
-        );
+        assert!(run_jpeg_validation(slots.clone(), || -> Result<()> {
+            panic!("synthetic panic")
+        })
+        .await
+        .is_err());
         assert!(slots.try_acquire_owned().is_ok());
     }
 
@@ -1433,6 +1435,54 @@ mod tests {
             device.snapshot().await,
             Err(Error::InvalidResponse(_))
         ));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn snapshot_capacity_is_held_by_active_response() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (started, started_rx) = tokio::sync::oneshot::channel();
+        let (release, release_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0; 4096];
+            socket.read(&mut request).await.unwrap();
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\n")
+                .await
+                .unwrap();
+            started.send(()).unwrap();
+            release_rx.await.unwrap();
+            socket.write_all(b"\xff\xd8\xff\xd9").await.unwrap();
+        });
+        let endpoint = Url::parse(&format!("http://{address}/")).unwrap();
+        let client = reqwest::Client::new();
+        let device = Kvmd {
+            client: RwLock::new(Session {
+                client: client.clone(),
+                video: client,
+                cookies: Default::default(),
+            }),
+            config: config(endpoint.as_str()),
+            endpoint,
+            profile: DeviceProfile::PiKvm,
+            inputs: Default::default(),
+            auth_headers: Default::default(),
+            approval_token: Default::default(),
+        };
+        let slots = Arc::new(tokio::sync::Semaphore::new(1));
+        let first = device.snapshot_with_storage(slots.clone());
+        tokio::pin!(first);
+        tokio::select! { _ = &mut first => panic!("snapshot completed early"), _ = started_rx => {} }
+        assert!(matches!(
+            device.snapshot_with_storage(slots.clone()).await,
+            Err(Error::Transport(_))
+        ));
+        release.send(()).unwrap();
+        assert!(matches!(first.await, Err(Error::InvalidResponse(_))));
+        assert_eq!(slots.available_permits(), 1);
         server.await.unwrap();
     }
 
