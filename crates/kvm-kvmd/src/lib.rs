@@ -510,14 +510,10 @@ impl Collect<'_> {
 
 impl Drop for Collect<'_> {
     fn drop(&mut self) {
-        let Some(mut outcome) = self.outcome.take() else {
+        let Some(outcome) = self.outcome.take() else {
             return;
         };
-        outcome.close();
-        // Empty or closed: the task sees the failed delivery under the lock and cleans up itself, or it was dropped mid-request and recorded the request as ambiguous.
-        if outcome.try_recv().is_err() {
-            return;
-        }
+        drop(outcome);
         // Set only after the task recorded this outcome, and the task never takes the flag after delivering it, so whichever lock holder takes the flag next releases this input.
         self.device.cleanup_pending.store(true, Ordering::SeqCst);
         if let Some(runtime) = self
@@ -984,7 +980,7 @@ impl Kvmd {
 
     /// Releases every tracked input, the caller holding the input lock, and returns the inputs whose release the device confirmed; a failed release is tracked as uncertain and never resent. Any pending cleanup is taken first, so a drop that marks cleanup pending while this runs stays pending for the next lock holder, and a release interrupted before it finishes (runtime shutdown) leaves the flag set.
     async fn release_owed(&self, inputs: &mut Inputs) -> (Result<()>, Vec<(Held, String)>) {
-        let owed = self.cleanup_pending.swap(false, Ordering::SeqCst);
+        let owed = self.cleanup_pending.load(Ordering::SeqCst);
         let restore = RestorePending {
             flag: &self.cleanup_pending,
             owed,
@@ -1001,6 +997,7 @@ impl Kvmd {
             }
         }
         restore.complete();
+        self.cleanup_pending.store(false, Ordering::SeqCst);
         let result = if failed || inputs.indeterminate {
             Err(Error::AmbiguousInput(
                 "input session remains indeterminate after an ambiguous operation".into(),
@@ -1054,9 +1051,7 @@ impl Kvmd {
             } else {
                 worker.send_held(&mut inputs, kind, &name, pressed).await
             };
-            if result_tx.send(result).is_err() {
-                worker.clean_abandoned(&mut inputs).await;
-            }
+            let _ = result_tx.send(result);
             inputs.settle();
         });
         collect.outcome().await
