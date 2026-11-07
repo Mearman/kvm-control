@@ -311,7 +311,7 @@ impl reqwest::cookie::CookieStore for SessionCookies {
 
 /// A KVMD connection with an explicitly authenticated session.
 ///
-/// Input requests already submitted continue after caller cancellation. Ambiguous outcomes permanently render cleanup indeterminate because a server may apply a timed-out request later. An ambiguous release is not replayed automatically. Dropping the last owner attempts to release tracked inputs on the captured runtime; process or runtime termination provides no cleanup guarantee.
+/// Input requests already submitted continue after caller cancellation. Cancelling a submitted key or button request schedules best-effort release of tracked inputs. Ambiguous outcomes permanently render cleanup indeterminate because a server may apply a timed-out request later. An ambiguous release is not replayed automatically. Dropping the last owner attempts to release tracked inputs on the captured runtime; process or runtime termination provides no cleanup guarantee.
 ///
 /// Cookies are accepted only from login or approval responses. Later `Set-Cookie` headers, including rotation and expiry updates, are ignored. The inspected [PiKVM](https://github.com/pikvm/kvmd/blob/fcb903eb3be70d8eee4aee99e5fcc1c743e3ccef/kvmd/apps/kvmd/api/auth.py) and [GLKVM](https://github.com/gl-inet/glkvm/blob/3e8dd23c4bd638a4650433664cc3b0f3b4d29395/kvmd/apps/kvmd/api/auth.py) revisions issue authentication cookies on login, and GLKVM also issues them on approval. Other firmware requiring cookie rotation is not supported. Server-side expiry or revocation can return an authentication error; call `login` again with fresh credentials and complete any approval. Consequential and input requests are never automatically replayed, and ambiguous outcomes require observation before a caller decides what to do.
 pub struct Kvmd {
@@ -336,6 +336,20 @@ impl std::ops::Deref for Session {
     type Target = Client;
     fn deref(&self) -> &Client {
         &self.client
+    }
+}
+
+struct CancelInputCleanup(Option<Kvmd>);
+
+impl Drop for CancelInputCleanup {
+    fn drop(&mut self) {
+        if let Some(worker) = self.0.take() {
+            tokio::spawn(async move {
+                if let Err(error) = worker.release_inputs().await {
+                    eprintln!("Input cleanup uncertain: {error}");
+                }
+            });
+        }
     }
 }
 
@@ -883,8 +897,9 @@ impl Device for Kvmd {
         let mut inputs = self.inputs.clone().lock_owned().await;
         self.capture_input_runtime();
         let worker = self.input_worker();
+        let mut cleanup = CancelInputCleanup(Some(self.input_worker()));
         let key = key.to_owned();
-        tokio::spawn(async move {
+        let result = tokio::spawn(async move {
             let result = worker
                 .input(
                     "hid/events/send_key",
@@ -913,15 +928,18 @@ impl Device for Kvmd {
             }
         })
         .await
-        .map_err(|_| Error::AmbiguousInput("input task failed".into()))?
+        .map_err(|_| Error::AmbiguousInput("input task failed".into()))?;
+        cleanup.0 = None;
+        result
     }
 
     async fn mouse_button(&self, button: &str, pressed: bool) -> Result<()> {
         let mut inputs = self.inputs.clone().lock_owned().await;
         self.capture_input_runtime();
         let worker = self.input_worker();
+        let mut cleanup = CancelInputCleanup(Some(self.input_worker()));
         let button = button.to_owned();
-        tokio::spawn(async move {
+        let result = tokio::spawn(async move {
             let result = worker
                 .input(
                     "hid/events/send_mouse_button",
@@ -950,7 +968,9 @@ impl Device for Kvmd {
             }
         })
         .await
-        .map_err(|_| Error::AmbiguousInput("input task failed".into()))?
+        .map_err(|_| Error::AmbiguousInput("input task failed".into()))?;
+        cleanup.0 = None;
+        result
     }
 
     async fn mouse_move(&self, x: i16, y: i16) -> Result<()> {

@@ -23,7 +23,26 @@ use serde_json::json;
 use url::Url;
 
 #[derive(Clone, Default)]
-struct Calls(Arc<Mutex<Vec<String>>>, Arc<AtomicBool>, Arc<AtomicBool>);
+struct Calls(
+    Arc<Mutex<Vec<String>>>,
+    Arc<AtomicBool>,
+    Arc<AtomicBool>,
+    Arc<tokio::sync::Notify>,
+    Arc<tokio::sync::Notify>,
+);
+
+async fn gated_input(State(calls): State<Calls>, uri: Uri) -> impl IntoResponse {
+    calls.0.lock().unwrap().push(uri.to_string());
+    calls.3.notify_one();
+    calls.4.notified().await;
+    if uri.query().unwrap().contains("ambiguous") {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"ok": false})),
+        );
+    }
+    (StatusCode::OK, Json(json!({"ok": true, "result": {}})))
+}
 
 async fn login(State(calls): State<Calls>, uri: Uri, body: String) -> impl IntoResponse {
     calls
@@ -294,6 +313,9 @@ async fn fixture() -> (Url, Vec<u8>, Calls, tokio::task::JoinHandle<()>) {
         .route("/glswitch/api/switch/set_active", post(control))
         .route("/api/gpio", get(capability))
         .route("/api/msd", get(capability))
+        .route("/gated/api/auth/login", post(login))
+        .route("/gated/api/hid/events/send_key", post(gated_input))
+        .route("/gated/api/hid/events/send_mouse_button", post(gated_input))
         .route("/api/hid/events/send_key", post(status))
         .route("/api/hid/events/send_mouse_move", post(control))
         .route("/api/atx/power", post(control))
@@ -561,6 +583,73 @@ async fn request_during_relogin_cannot_use_old_session() {
         Err(Error::Authentication)
     ));
     assert!(matches!(task.await.unwrap(), Err(Error::Authentication)));
+    server.abort();
+}
+
+#[tokio::test]
+async fn cancelled_input_is_cleaned_up_with_a_retained_owner() {
+    for button in [false, true] {
+        let (mut endpoint, ca, calls, server) = fixture().await;
+        endpoint.set_path("/gated/");
+        let device = Arc::new(client(endpoint, Some(ca)));
+        device.login("test-user", "test-password").await.unwrap();
+        let sender = device.clone();
+        let task = tokio::spawn(async move {
+            if button {
+                sender.mouse_button("left", true).await
+            } else {
+                sender.key("KeyA", true).await
+            }
+        });
+        calls.3.notified().await;
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        calls.4.notify_one();
+        tokio::time::timeout(Duration::from_secs(5), calls.3.notified())
+            .await
+            .unwrap();
+        calls.4.notify_one();
+        device.release_inputs().await.unwrap();
+        let events: Vec<_> = calls
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|v| v.contains("/hid/events/"))
+            .cloned()
+            .collect();
+        assert_eq!(events.len(), 2);
+        assert!(events[0].ends_with("state=true"));
+        assert!(events[1].ends_with("state=false"));
+        server.abort();
+    }
+}
+
+#[tokio::test]
+async fn cancelled_ambiguous_release_is_not_replayed() {
+    let (mut endpoint, ca, calls, server) = fixture().await;
+    endpoint.set_path("/gated/");
+    let device = Arc::new(client(endpoint, Some(ca)));
+    let sender = device.clone();
+    let task = tokio::spawn(async move { sender.key("ambiguous", false).await });
+    calls.3.notified().await;
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    calls.4.notify_one();
+    assert!(matches!(
+        device.release_inputs().await,
+        Err(Error::AmbiguousInput(_))
+    ));
+    assert_eq!(
+        calls
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|v| v.contains("/hid/events/"))
+            .count(),
+        1
+    );
     server.abort();
 }
 
