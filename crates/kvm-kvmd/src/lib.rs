@@ -791,8 +791,7 @@ impl Kvmd {
                 "release tracked inputs before changing authentication".into(),
             ));
         }
-        // A release skipped because cleanup already sent it belongs to the session being replaced.
-        inputs.cleaned.clear();
+        inputs.cleaned.shrink_to_fit();
         let mut pending = self.approval_token.lock().await;
         let token = pending
             .as_ref()
