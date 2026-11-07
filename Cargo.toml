@@ -15,3 +15,20 @@ thiserror = "2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "cookies"] }
 url = "2"
+
+# Deny-level lints the CI command already makes errors through `-D warnings`, stated here so a local `cargo build` or `cargo clippy` enforces them too, plus the unsafe-code policy: every unsafe block is opted into with a justified `#[allow(unsafe_code)]` and carries a `// SAFETY:` comment.
+# examples/in-process is its own workspace and repeats this table; its tests check the two stay identical.
+[workspace.lints.rust]
+dead_code = "deny"
+unreachable_patterns = "deny"
+unsafe_code = "deny"
+unsafe_op_in_unsafe_fn = "deny"
+unused_imports = "deny"
+unused_must_use = "deny"
+unused_variables = "deny"
+
+[workspace.lints.clippy]
+dbg_macro = "deny"
+todo = "deny"
+undocumented_unsafe_blocks = "deny"
+unimplemented = "deny"

@@ -323,6 +323,8 @@ pub(crate) async fn probe(query: &[u8], deadline: Duration) -> io::Result<ProbeR
 
 /// Whether a read of standard input would return without blocking; hang-up and invalid descriptors count as ready so that the following read reports them.
 #[cfg(unix)]
+// A non-blocking readiness check of the raw descriptor needs poll(2), which no dependency wraps safely.
+#[allow(unsafe_code)]
 fn stdin_ready() -> io::Result<bool> {
     let mut descriptor = libc::pollfd {
         fd: libc::STDIN_FILENO,
@@ -344,6 +346,8 @@ fn stdin_ready() -> io::Result<bool> {
 
 /// Reads what standard input holds; `None` means the read was interrupted or would block and should be retried after the next readiness check.
 #[cfg(unix)]
+// Reading the raw descriptor without buffering needs read(2): a buffered `Stdin` could hold back bytes the readiness check cannot see.
+#[allow(unsafe_code)]
 fn read_stdin(buffer: &mut [u8]) -> io::Result<Option<usize>> {
     // SAFETY: the pointer and length describe `buffer`, which outlives the call.
     let read = unsafe { libc::read(libc::STDIN_FILENO, buffer.as_mut_ptr().cast(), buffer.len()) };

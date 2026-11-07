@@ -23,3 +23,6 @@ rcgen = "0.13"
 rustix = { version = "1.1.6", features = ["pipe", "fs", "process"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 tempfile = "3"
+
+[lints]
+workspace = true

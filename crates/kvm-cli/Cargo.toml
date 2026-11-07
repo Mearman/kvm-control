@@ -22,3 +22,6 @@ rustls = { version = "0.23.46", default-features = false, features = ["ring", "s
 
 [target.'cfg(unix)'.dev-dependencies]
 libc = "0.2.191"
+
+[lints]
+workspace = true
