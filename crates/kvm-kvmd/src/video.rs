@@ -2296,7 +2296,11 @@ mod tests {
         let hold = hold_all_but(&storage, 2 * MAX_HEADER);
         assert!(part_end(&frame) > 2 * MAX_HEADER);
         let (response, mut socket) = multipart().await;
-        socket.write_all(&body[..headers]).await.unwrap();
+        // The headers and the start of the body: the part is reserved once body bytes arrive.
+        socket
+            .write_all(&body[..headers + b"\xff\xd8".len()])
+            .await
+            .unwrap();
         let (video, _lease) = parser(response, storage.clone());
         let id = video.ledger.id;
         // The read and storage timeout is the bound, so only the consumer deadline, half of it, can end the second read within the bound.
