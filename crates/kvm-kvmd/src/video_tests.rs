@@ -73,11 +73,11 @@ async fn device(body: impl Into<Vec<u8>>) -> (Kvmd, Arc<Notify>, tokio::task::Jo
         .build()
         .unwrap();
     let device = Kvmd {
-        client: tokio::sync::RwLock::new(crate::Session {
+        client: Arc::new(tokio::sync::RwLock::new(crate::Session {
             client: client.clone(),
             video: client,
             cookies: Default::default(),
-        }),
+        })),
         config: Config {
             endpoint: Url::parse(&format!("http://{address}/proxy/")).unwrap(),
             profile: DeviceProfile::PiKvm,
@@ -92,8 +92,207 @@ async fn device(body: impl Into<Vec<u8>>) -> (Kvmd, Arc<Notify>, tokio::task::Jo
         approval_token: Default::default(),
         snapshot_proven: Default::default(),
         video_proven: Default::default(),
+        cleanup_on_drop: false,
     };
     (device, closed, task)
+}
+
+fn input_device(address: std::net::SocketAddr) -> Kvmd {
+    let endpoint = Url::parse(&format!("http://{address}/")).unwrap();
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .http1_only()
+        .build()
+        .unwrap();
+    Kvmd {
+        client: Arc::new(tokio::sync::RwLock::new(crate::Session {
+            client: client.clone(),
+            video: client,
+            cookies: Default::default(),
+        })),
+        config: Config {
+            endpoint: endpoint.clone(),
+            profile: DeviceProfile::PiKvm,
+            trusted_ca_pem: None,
+            insecure_tls: false,
+            timeout: Duration::from_secs(3),
+        },
+        endpoint,
+        profile: DeviceProfile::PiKvm,
+        inputs: Default::default(),
+        auth_headers: Default::default(),
+        approval_token: Default::default(),
+        cleanup_on_drop: true,
+    }
+}
+
+#[tokio::test]
+async fn cancelled_press_finishes_before_concurrent_release() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (accepted_tx, accepted_rx) = tokio::sync::oneshot::channel();
+    let (finish_tx, finish_rx) = tokio::sync::oneshot::channel();
+    let (checked_tx, checked_rx) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        let (mut press, _) = listener.accept().await.unwrap();
+        let mut request = [0; 4096];
+        let n = press.read(&mut request).await.unwrap();
+        let first = String::from_utf8_lossy(&request[..n]).into_owned();
+        accepted_tx.send(()).unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), listener.accept())
+                .await
+                .is_err(),
+            "release arrived before press completion"
+        );
+        checked_tx.send(()).unwrap();
+        finish_rx.await.unwrap();
+        press
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}",
+            )
+            .await
+            .unwrap();
+        let (mut release, _) = listener.accept().await.unwrap();
+        let n = release.read(&mut request).await.unwrap();
+        let second = String::from_utf8_lossy(&request[..n]).into_owned();
+        release
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}",
+            )
+            .await
+            .unwrap();
+        (first, second, listener)
+    });
+    let endpoint = Url::parse(&format!("http://{address}/")).unwrap();
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .http1_only()
+        .build()
+        .unwrap();
+    let device = Arc::new(Kvmd {
+        client: Arc::new(tokio::sync::RwLock::new(crate::Session {
+            client: client.clone(),
+            video: client,
+            cookies: Default::default(),
+        })),
+        config: Config {
+            endpoint: endpoint.clone(),
+            profile: DeviceProfile::PiKvm,
+            trusted_ca_pem: None,
+            insecure_tls: false,
+            timeout: Duration::from_secs(3),
+        },
+        endpoint,
+        profile: DeviceProfile::PiKvm,
+        inputs: Default::default(),
+        auth_headers: Default::default(),
+        approval_token: Default::default(),
+        cleanup_on_drop: true,
+    });
+    let pressing = device.clone();
+    let task = tokio::spawn(async move { pressing.key("KeyA", true).await });
+    accepted_rx.await.unwrap();
+    task.abort();
+    let releasing = device.clone();
+    let release = tokio::spawn(async move { releasing.release_inputs().await });
+    tokio::task::yield_now().await;
+    assert!(!release.is_finished());
+    checked_rx.await.unwrap();
+    finish_tx.send(()).unwrap();
+    release.await.unwrap().unwrap();
+    let (first, second, listener) = server.await.unwrap();
+    assert!(first.contains("state=true"));
+    assert!(second.contains("state=false"));
+    drop(device);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), listener.accept())
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn concurrent_key_and_button_presses_are_serialised() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let device = Arc::new(input_device(listener.local_addr().unwrap()));
+    let (accepted_tx, accepted_rx) = tokio::sync::oneshot::channel();
+    let (proceed_tx, proceed_rx) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        let mut buffer = [0; 4096];
+        let (mut first, _) = listener.accept().await.unwrap();
+        let n = first.read(&mut buffer).await.unwrap();
+        assert!(String::from_utf8_lossy(&buffer[..n]).contains("send_key"));
+        accepted_tx.send(()).unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), listener.accept())
+                .await
+                .is_err()
+        );
+        proceed_rx.await.unwrap();
+        first
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}",
+            )
+            .await
+            .unwrap();
+        let (mut second, _) = listener.accept().await.unwrap();
+        let n = second.read(&mut buffer).await.unwrap();
+        assert!(String::from_utf8_lossy(&buffer[..n]).contains("send_mouse_button"));
+        second
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}",
+            )
+            .await
+            .unwrap();
+    });
+    let first_device = device.clone();
+    let first = tokio::spawn(async move { first_device.key("KeyA", true).await });
+    accepted_rx.await.unwrap();
+    let second_device = device.clone();
+    let second = tokio::spawn(async move { second_device.mouse_button("left", true).await });
+    tokio::task::yield_now().await;
+    proceed_tx.send(()).unwrap();
+    first.await.unwrap().unwrap();
+    second.await.unwrap().unwrap();
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn ambiguous_press_is_reported_and_last_owner_releases_it() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let device = input_device(listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        let (mut press, _) = listener.accept().await.unwrap();
+        let mut request = [0; 4096];
+        let n = press.read(&mut request).await.unwrap();
+        assert!(String::from_utf8_lossy(&request[..n]).contains("state=true"));
+        press.write_all(b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.unwrap();
+        let (mut release, _) = listener.accept().await.unwrap();
+        let n = release.read(&mut request).await.unwrap();
+        assert!(String::from_utf8_lossy(&request[..n]).contains("state=false"));
+        release
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}",
+            )
+            .await
+            .unwrap();
+        listener
+    });
+    assert!(matches!(
+        device.mouse_button("left", true).await,
+        Err(kvm_core::Error::AmbiguousInput(_))
+    ));
+    drop(device);
+    let listener = tokio::time::timeout(Duration::from_secs(3), server)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), listener.accept())
+            .await
+            .is_err()
+    );
 }
 
 #[tokio::test]
@@ -338,11 +537,11 @@ async fn cancelled_partial_frame_can_resume() {
     });
     let client = reqwest::Client::builder().http1_only().build().unwrap();
     let device = Kvmd {
-        client: tokio::sync::RwLock::new(crate::Session {
+        client: Arc::new(tokio::sync::RwLock::new(crate::Session {
             client: client.clone(),
             video: client,
             cookies: Default::default(),
-        }),
+        })),
         config: Config {
             endpoint: Url::parse(&format!("http://{address}/proxy/")).unwrap(),
             profile: DeviceProfile::PiKvm,
@@ -357,6 +556,7 @@ async fn cancelled_partial_frame_can_resume() {
         approval_token: Default::default(),
         snapshot_proven: Default::default(),
         video_proven: Default::default(),
+        cleanup_on_drop: false,
     };
     let mut video = device.video().await.unwrap();
     assert!(
@@ -407,11 +607,11 @@ async fn relogin_waits_for_video_establishment() {
     let client = reqwest::Client::builder().http1_only().build().unwrap();
     let endpoint = Url::parse(&format!("http://{address}/proxy/")).unwrap();
     let device = Arc::new(Kvmd {
-        client: tokio::sync::RwLock::new(crate::Session {
+        client: Arc::new(tokio::sync::RwLock::new(crate::Session {
             client: client.clone(),
             video: client,
             cookies: Default::default(),
-        }),
+        })),
         config: Config {
             endpoint: endpoint.clone(),
             profile: DeviceProfile::PiKvm,
@@ -426,6 +626,7 @@ async fn relogin_waits_for_video_establishment() {
         approval_token: Default::default(),
         snapshot_proven: Default::default(),
         video_proven: Default::default(),
+        cleanup_on_drop: false,
     });
     let video_device = device.clone();
     let video_task = tokio::spawn(async move { video_device.video().await });
@@ -476,11 +677,11 @@ async fn coalesced_http_response_delivers_multiple_frames() {
     });
     let client = reqwest::Client::builder().http1_only().build().unwrap();
     let device = Kvmd {
-        client: tokio::sync::RwLock::new(crate::Session {
+        client: Arc::new(tokio::sync::RwLock::new(crate::Session {
             client: client.clone(),
             video: client,
             cookies: Default::default(),
-        }),
+        })),
         config: Config {
             endpoint: Url::parse(&format!("http://{address}/proxy/")).unwrap(),
             profile: DeviceProfile::PiKvm,
@@ -495,6 +696,7 @@ async fn coalesced_http_response_delivers_multiple_frames() {
         approval_token: Default::default(),
         snapshot_proven: Default::default(),
         video_proven: Default::default(),
+        cleanup_on_drop: false,
     };
     let mut video = device.video().await.unwrap();
     assert_eq!(video.next_frame().await.unwrap().unwrap().jpeg, jpeg());
@@ -553,11 +755,11 @@ async fn maximum_frame_with_maximum_headers_and_boundary() {
     let client = reqwest::Client::builder().http1_only().build().unwrap();
     let endpoint = Url::parse(&format!("http://{address}/proxy/")).unwrap();
     let device = Kvmd {
-        client: tokio::sync::RwLock::new(crate::Session {
+        client: Arc::new(tokio::sync::RwLock::new(crate::Session {
             client: client.clone(),
             video: client,
             cookies: Default::default(),
-        }),
+        })),
         config: Config {
             endpoint: endpoint.clone(),
             profile: DeviceProfile::PiKvm,
@@ -572,6 +774,7 @@ async fn maximum_frame_with_maximum_headers_and_boundary() {
         approval_token: Default::default(),
         snapshot_proven: Default::default(),
         video_proven: Default::default(),
+        cleanup_on_drop: false,
     };
     let mut video = device.video().await.unwrap();
     assert_eq!(video.next_frame().await.unwrap().unwrap().jpeg.len(), FRAME);
