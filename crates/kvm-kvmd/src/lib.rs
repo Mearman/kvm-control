@@ -1210,10 +1210,6 @@ impl Kvmd {
         tokio::spawn(async move {
             worker.settle_owed(&mut inputs).await;
             // A request whose caller left before its own press or release was submitted sends nothing, so it owes nothing.
-            if result_tx.is_closed() {
-                inputs.settle();
-                return;
-            }
             let cleaned = std::mem::take(&mut inputs.cleaned);
             inputs.sequence += 1;
             let sequence = inputs.sequence;
