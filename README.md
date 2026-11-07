@@ -4,7 +4,24 @@ Rust libraries and local clients for controlling KVMD-compatible devices over HT
 
 ## Build from source
 
-Install a Rust toolchain supporting the 2024 edition, then from this checkout run `cargo build --workspace` or `cargo test --workspace`. These commands compile the project; they do not establish hardware compatibility. Pull requests are checked, and release-mode binaries are packaged and smoke-tested as validation archives, by `.github/workflows/verification.yml`; see [compatibility](COMPATIBILITY.md). No release is published from the repository, so publication is unproven. The workspace version is not evidence that packages have been published or that an API stability guarantee exists.
+Install a Rust toolchain supporting the 2024 edition, then from this checkout run `cargo build --workspace` or `cargo test --workspace`. These commands compile the project; they do not establish hardware compatibility. Pull requests and pushes to `main` are checked by `.github/workflows/ci.yml`; see [compatibility](COMPATIBILITY.md). The version in `Cargo.toml` is not the release version, which comes from the release tag, and no crate is published to a package registry. Neither is evidence of an API stability guarantee.
+
+## Install from a release
+
+Each [GitHub release](https://github.com/Mearman/kvm-control/releases) has one archive for each of `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`, `x86_64-apple-darwin` and `aarch64-apple-darwin`, named `kvm-control-TAG-TARGET.tar.gz` and holding the `kvm-cli`, `kvm-tui` and `kvm-mcp` binaries, with a SHA-256 checksum file named after the archive plus `.sha256`. Download the archive for your platform and its checksum file, check the archive against it, then unpack it:
+
+```sh
+tag=$(curl -fsSL -o /dev/null -w '%{url_effective}' https://github.com/Mearman/kvm-control/releases/latest | sed 's|.*/||')
+target=aarch64-apple-darwin
+archive="kvm-control-$tag-$target.tar.gz"
+curl -fsSLO "https://github.com/Mearman/kvm-control/releases/download/$tag/$archive"
+curl -fsSLO "https://github.com/Mearman/kvm-control/releases/download/$tag/$archive.sha256"
+shasum -a 256 -c "$archive.sha256"
+mkdir kvm-control && tar -xzf "$archive" -C kvm-control
+kvm-control/kvm-cli --version
+```
+
+`sha256sum -c` reads the same checksum file on Linux. Put the unpacked binaries on your `PATH` to run them as `kvm-cli`, `kvm-tui` and `kvm-mcp`. The binaries are not signed or notarised; a checksum shows the download matches what the release published, not who built it. Building from source remains the way to run a commit or target that has no release.
 
 ## Direct connection
 
