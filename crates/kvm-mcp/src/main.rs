@@ -1,4 +1,4 @@
-use std::{env, error::Error, fs, sync::Arc, time::Duration};
+use std::{env, error::Error, fs, process::ExitCode, sync::Arc, time::Duration};
 
 use kvm_core::DeviceProfile;
 use kvm_kvmd::{Config, Kvmd, LoginState};
@@ -104,8 +104,19 @@ fn required_settings() -> Result<RequiredSettings, String> {
     }
 }
 
+/// Prints a startup or serving failure as `Error: ` and its message, rather than the quoted `Debug` form a `Result` returned from `main` prints, and exits with the same failure status.
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn Error>> {
+async fn main() -> ExitCode {
+    match run().await {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("Error: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+async fn run() -> Result<(), Box<dyn Error>> {
     let RequiredSettings {
         endpoint,
         profile,

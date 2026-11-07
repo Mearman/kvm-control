@@ -2,7 +2,7 @@
 
 use std::process::{Command, Stdio};
 
-/// Each required variable is named in the error, with what to set it to, instead of the bare `NotPresent` of `std::env::var`.
+/// Each required variable is named in a plain error, with what to set it to, instead of the bare `NotPresent` of `std::env::var`.
 #[test]
 fn missing_configuration_names_each_unset_variable() {
     let output = Command::new(env!("CARGO_BIN_EXE_kvm-mcp"))
@@ -12,8 +12,11 @@ fn missing_configuration_names_each_unset_variable() {
         .unwrap();
     assert!(!output.status.success());
     let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.starts_with("Error: KVM_ENDPOINT is not set (set it to the device HTTPS URL); "),
+        "{stderr}"
+    );
     for (name, expected) in [
-        ("KVM_ENDPOINT", "the device HTTPS URL"),
         ("KVM_PROFILE", "pikvm or glkvm"),
         ("KVM_USERNAME", "the device account name"),
         (
@@ -45,10 +48,5 @@ fn non_unicode_configuration_is_named_without_its_value() {
         .unwrap();
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("KVM_USERNAME is not valid Unicode"),
-        "{stderr}"
-    );
-    assert!(!stderr.contains("synthetic-user"), "{stderr}");
-    assert!(!stderr.contains("is not set"), "{stderr}");
+    assert_eq!(stderr, "Error: KVM_USERNAME is not valid Unicode\n");
 }
