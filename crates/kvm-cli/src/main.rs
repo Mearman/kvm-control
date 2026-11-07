@@ -197,79 +197,78 @@ async fn run_control(
     Ok(json!({"accepted": true, "post_state": post_state}))
 }
 
-/// Registers the SIGTERM and SIGINT handlers when called, not when first polled, and returns a future that resolves when either signal arrives. A caller that calls this before submitting any input therefore handles a signal at every later point instead of taking the default disposition, which would exit with the input still held. A registration failure is returned by the future.
+/// Registers the SIGTERM and SIGINT handlers before returning, and returns a future that resolves when either signal arrives. A caller that calls this before submitting any input therefore handles a signal at every later point instead of taking the default disposition, which would exit with the input still held.
+///
+/// # Errors
+/// Returns an error when a handler cannot be registered.
 #[cfg(unix)]
-fn termination_signal() -> impl std::future::Future<Output = io::Result<()>> {
+fn termination_signal() -> io::Result<impl std::future::Future<Output = ()>> {
     use tokio::signal::unix::{SignalKind, signal};
-    let terminate = signal(SignalKind::terminate());
-    let interrupt = signal(SignalKind::interrupt());
-    async move {
-        let (mut terminate, mut interrupt) = (terminate?, interrupt?);
+    let mut terminate = signal(SignalKind::terminate())?;
+    let mut interrupt = signal(SignalKind::interrupt())?;
+    Ok(async move {
         tokio::select! {
             _ = terminate.recv() => (),
             _ = interrupt.recv() => (),
         }
-        Ok::<(), io::Error>(())
-    }
+    })
 }
 
-/// Registers the Ctrl-C handler when called, not when first polled, and returns a future that resolves when Ctrl-C arrives; see the Unix variant for why registration is eager.
+/// Registers the Ctrl-C handler before returning, and returns a future that resolves when Ctrl-C arrives; see the Unix variant for why registration is eager.
+///
+/// # Errors
+/// Returns an error when the handler cannot be registered.
 #[cfg(not(unix))]
-fn termination_signal() -> impl std::future::Future<Output = io::Result<()>> {
-    let ctrl_c = tokio::signal::windows::ctrl_c();
-    async move {
-        let mut ctrl_c = ctrl_c?;
+fn termination_signal() -> io::Result<impl std::future::Future<Output = ()>> {
+    let mut ctrl_c = tokio::signal::windows::ctrl_c()?;
+    Ok(async move {
         ctrl_c.recv().await;
-        Ok::<(), io::Error>(())
-    }
+    })
 }
 
-/// Holds `press` until it completes or `interrupt` resolves, then always releases inputs. An interruption is reported in preference to the press's own result, both when it ends the press and when it arrives after the press has finished but before the release has, so a termination request is never discarded while the command is still running.
+/// Holds `press` until it completes or `interrupt` resolves, then always releases inputs, and reports the outcome described by [`press_outcome`]. A press result already available when the signal is also ready is used rather than discarded. A signal the runtime has observed by the time the release completes is passed on; one observed later, or after this returns, is not.
 async fn press_and_release<F, S>(device: &impl Device, press: F, interrupt: S) -> Result<(), String>
 where
     F: std::future::Future<Output = kvm_core::Result<()>>,
-    S: std::future::Future<Output = io::Result<()>>,
+    S: std::future::Future<Output = ()>,
 {
-    /// How the press phase ended: by a signal, whose registration may have failed, or by the press's own result.
-    enum Ended {
-        Signal(io::Result<()>),
-        Press(kvm_core::Result<()>),
-    }
-    fn interrupted(signal: io::Result<()>, outcome: &str) -> String {
-        match signal {
-            Ok(()) => format!("interrupted; {outcome}"),
-            Err(e) => format!("signal handler failed: {e}; {outcome}"),
-        }
-    }
     let mut interrupt = std::pin::pin!(interrupt);
-    // Biased towards the signal, so a signal already received when the press also completes decides the outcome rather than a random branch order.
-    let ended = tokio::select! {
+    // Biased towards the press so a result already available is kept; a pending press lets the signal be polled next, so the signal is never starved.
+    let pressed = tokio::select! {
         biased;
-        signal = &mut interrupt => Ended::Signal(signal),
-        result = press => Ended::Press(result),
+        result = press => Some(result),
+        () = &mut interrupt => None,
     };
     let cleanup = device.release_inputs().await;
-    let result = match ended {
-        Ended::Signal(signal) => Err(interrupted(signal, "input outcome uncertain")),
-        // The release can outlast the press, so a signal received meanwhile is collected here rather than discarded by the handler that stays registered.
-        Ended::Press(pressed) => tokio::select! {
+    // A press that ended by the signal has already consumed it; otherwise one poll collects a signal observed during the release.
+    let signalled = pressed.is_none()
+        || tokio::select! {
             biased;
-            signal = &mut interrupt => Err(interrupted(signal, &match pressed {
-                Ok(()) => "press completed".into(),
-                Err(e) => format!("press: {e}"),
-            })),
-            () = std::future::ready(()) => pressed.map_err(|e| e.to_string()),
-        },
+            () = &mut interrupt => true,
+            () = std::future::ready(()) => false,
+        };
+    press_outcome(pressed, cleanup, signalled)
+}
+
+/// Reports a press that the signal ended (`pressed` is `None`) as an interruption with an uncertain outcome. A completed press is reported as it ended: a successful press with confirmed cleanup is a success even when a signal arrived, since nothing was interrupted and a failure would invite a retry that presses the input again; when the press or the cleanup failed, a signal is named first as `interrupted; press: <error>` or `interrupted; press completed`. Every failure after a press carries the cleanup result.
+fn press_outcome(
+    pressed: Option<kvm_core::Result<()>>,
+    cleanup: kvm_core::Result<()>,
+    signalled: bool,
+) -> Result<(), String> {
+    let failure = match (pressed, &cleanup) {
+        (Some(Ok(())), Ok(())) => return Ok(()),
+        (Some(Ok(())), Err(e)) if !signalled => return Err(e.to_string()),
+        (Some(Ok(())), Err(_)) => "interrupted; press completed".to_owned(),
+        (Some(Err(e)), _) if signalled => format!("interrupted; press: {e}"),
+        (Some(Err(e)), _) => e.to_string(),
+        (None, _) => "interrupted; input outcome uncertain".to_owned(),
     };
-    result.map_err(|e| {
-        format!(
-            "{e}; cleanup: {}",
-            cleanup
-                .as_ref()
-                .map_or_else(ToString::to_string, |()| "confirmed".into())
-        )
-    })?;
-    cleanup.map_err(|e| e.to_string())
+    let cleanup = match cleanup {
+        Ok(()) => "confirmed".to_owned(),
+        Err(e) => e.to_string(),
+    };
+    Err(format!("{failure}; cleanup: {cleanup}"))
 }
 
 fn write_snapshot(
@@ -313,13 +312,15 @@ async fn execute(device: &impl Device, command: Command) -> Result<Value, String
             Ok(json!({"output": output, "bytes": snapshot.jpeg.len()}))
         }
         Command::Key { key } => {
-            // Registered before the press future exists, so no signal can precede the handlers.
-            let interrupt = termination_signal();
+            // Registered before the press future exists, so no signal can precede the handlers, and a registration failure is reported before anything is sent.
+            let interrupt =
+                termination_signal().map_err(|e| format!("signal handler failed: {e}"))?;
             press_and_release(device, device.key(&key, true), interrupt).await?;
             Ok(json!({"key": key, "released": true}))
         }
         Command::Click { button } => {
-            let interrupt = termination_signal();
+            let interrupt =
+                termination_signal().map_err(|e| format!("signal handler failed: {e}"))?;
             press_and_release(device, device.mouse_button(&button, true), interrupt).await?;
             Ok(json!({"button": button, "released": true}))
         }
@@ -625,23 +626,9 @@ mod tests {
     async fn interruption_releases_an_inflight_press() {
         let device = Fake(Default::default());
         let press = std::future::pending::<kvm_core::Result<()>>();
-        let error = press_and_release(&device, press, std::future::ready(Ok(())))
+        let error = press_and_release(&device, press, std::future::ready(()))
             .await
             .unwrap_err();
-        assert!(error.contains("interrupted"));
-        assert_eq!(*device.0.lock().unwrap(), ["release"]);
-    }
-
-    #[tokio::test]
-    async fn signal_ready_with_the_press_decides_the_outcome() {
-        let device = Fake(Default::default());
-        let error = press_and_release(
-            &device,
-            std::future::ready(Ok(())),
-            std::future::ready(Ok(())),
-        )
-        .await
-        .unwrap_err();
         assert_eq!(
             error,
             "interrupted; input outcome uncertain; cleanup: confirmed"
@@ -649,16 +636,38 @@ mod tests {
         assert_eq!(*device.0.lock().unwrap(), ["release"]);
     }
 
+    fn synthetic(message: &str) -> kvm_core::Error {
+        kvm_core::Error::AmbiguousInput(message.into())
+    }
+
     #[tokio::test]
-    async fn signal_during_release_is_reported_after_the_press() {
-        for (press, outcome) in [
-            (Ok(()), "press completed"),
-            (
-                Err(kvm_core::Error::AmbiguousInput("synthetic failure".into())),
-                "press: ",
-            ),
-        ] {
+    async fn press_result_ready_with_the_signal_is_used() {
+        let device = Fake(Default::default());
+        press_and_release(&device, std::future::ready(Ok(())), std::future::ready(()))
+            .await
+            .unwrap();
+        let error = press_and_release(
+            &device,
+            std::future::ready(Err(synthetic("press"))),
+            std::future::ready(()),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            error,
+            format!(
+                "interrupted; press: {}; cleanup: confirmed",
+                synthetic("press")
+            )
+        );
+        assert_eq!(*device.0.lock().unwrap(), ["release", "release"]);
+    }
+
+    #[tokio::test]
+    async fn signal_during_release_is_reported_only_after_a_failed_press() {
+        for press in [Ok(()), Err(synthetic("press"))] {
             let device = Fake(Default::default());
+            let failed = press.is_err();
             // Resolves only once the release has been requested, so the signal arrives after the press has finished.
             let interrupt = std::future::poll_fn(|_| {
                 if device
@@ -668,57 +677,121 @@ mod tests {
                     .iter()
                     .any(|event| event == "release")
                 {
-                    std::task::Poll::Ready(Ok(()))
+                    std::task::Poll::Ready(())
                 } else {
                     std::task::Poll::Pending
                 }
             });
-            let error = press_and_release(&device, std::future::ready(press), interrupt)
-                .await
-                .unwrap_err();
-            assert!(error.starts_with("interrupted; "), "{error}");
-            assert!(error.contains(outcome), "{error}");
-            assert!(error.ends_with("; cleanup: confirmed"), "{error}");
+            let result = press_and_release(&device, std::future::ready(press), interrupt).await;
+            if failed {
+                assert_eq!(
+                    result.unwrap_err(),
+                    format!(
+                        "interrupted; press: {}; cleanup: confirmed",
+                        synthetic("press")
+                    )
+                );
+            } else {
+                result.unwrap();
+            }
             assert_eq!(*device.0.lock().unwrap(), ["release"]);
         }
     }
 
-    /// Signals this process after the handlers are registered but before their future is first polled: a handler registered only on first poll leaves the signal its default disposition, which kills the child, so its exit status shows the ordering.
+    #[test]
+    fn press_outcome_names_the_signal_only_for_a_failure() {
+        let (press, cleanup) = (synthetic("press"), synthetic("cleanup"));
+        for (pressed, cleaned, signalled, expected) in [
+            (Some(Ok(())), Ok(()), false, Ok(())),
+            (Some(Ok(())), Ok(()), true, Ok(())),
+            (Some(Ok(())), Err(()), false, Err(cleanup.to_string())),
+            (
+                Some(Ok(())),
+                Err(()),
+                true,
+                Err(format!("interrupted; press completed; cleanup: {cleanup}")),
+            ),
+            (
+                Some(Err(())),
+                Ok(()),
+                false,
+                Err(format!("{press}; cleanup: confirmed")),
+            ),
+            (
+                Some(Err(())),
+                Err(()),
+                true,
+                Err(format!("interrupted; press: {press}; cleanup: {cleanup}")),
+            ),
+            (
+                None,
+                Err(()),
+                true,
+                Err(format!(
+                    "interrupted; input outcome uncertain; cleanup: {cleanup}"
+                )),
+            ),
+        ] {
+            let pressed =
+                pressed.map(|result: Result<(), ()>| result.map_err(|()| synthetic("press")));
+            let cleaned = cleaned.map_err(|()| synthetic("cleanup"));
+            assert_eq!(press_outcome(pressed, cleaned, signalled), expected);
+        }
+    }
+
+    /// Signals this process after the handlers are registered but before their future is first polled. The child first restores the signal's default disposition and unblocks it, so a handler registered only on first poll lets the signal kill the child whatever the parent inherited, and the parent sees that in the child's exit status.
     #[cfg(unix)]
     #[test]
     fn termination_signals_are_handled_from_registration() {
         const CHILD: &str = "KVM_SIGNAL_REGISTRATION_TEST_CHILD";
-        let Some(signal) = std::env::var_os(CHILD) else {
-            for signal in ["TERM", "INT"] {
-                let result = std::process::Command::new(std::env::current_exe().unwrap())
-                    .args([
-                        "--exact",
-                        "tests::termination_signals_are_handled_from_registration",
-                    ])
-                    .env(CHILD, signal)
-                    .status()
+        const NAME: &str = "tests::termination_signals_are_handled_from_registration";
+        // Bounds only a signal that never reaches the handler, so a regression fails instead of hanging; a working handler resolves as soon as the runtime reads the signal.
+        const OBSERVATION_BOUND: Duration = Duration::from_secs(10);
+        let Ok(name) = std::env::var(CHILD) else {
+            for name in ["TERM", "INT"] {
+                let output = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", NAME])
+                    .env(CHILD, name)
+                    .output()
                     .unwrap();
-                assert!(result.success(), "SIG{signal}: {result}");
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                // A child that ran no test also exits successfully, so the count proves the signal case ran.
+                assert!(
+                    output.status.success() && stdout.contains("1 passed"),
+                    "SIG{name}: {}\n{stdout}\n{}",
+                    output.status,
+                    String::from_utf8_lossy(&output.stderr)
+                );
             }
             return;
         };
+        let signal = match name.as_str() {
+            "TERM" => libc::SIGTERM,
+            "INT" => libc::SIGINT,
+            other => panic!("unknown signal {other}"),
+        };
+        // SAFETY: the calls receive a valid signal number and a set initialised by sigemptyset before use.
+        unsafe {
+            assert_ne!(libc::signal(signal, libc::SIG_DFL), libc::SIG_ERR);
+            let mut set = std::mem::MaybeUninit::<libc::sigset_t>::uninit();
+            assert_eq!(libc::sigemptyset(set.as_mut_ptr()), 0);
+            assert_eq!(libc::sigaddset(set.as_mut_ptr(), signal), 0);
+            assert_eq!(
+                libc::pthread_sigmask(libc::SIG_UNBLOCK, set.as_ptr(), std::ptr::null_mut()),
+                0
+            );
+        }
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap();
         runtime.block_on(async {
-            let interrupt = termination_signal();
-            let mut flag = std::ffi::OsString::from("-");
-            flag.push(&signal);
-            assert!(
-                std::process::Command::new("kill")
-                    .arg(flag)
-                    .arg(std::process::id().to_string())
-                    .status()
-                    .unwrap()
-                    .success()
-            );
-            interrupt.await.unwrap();
+            let interrupt = termination_signal().unwrap();
+            // SAFETY: kill(2) on this process's own id with a valid signal number.
+            assert_eq!(unsafe { libc::kill(libc::getpid(), signal) }, 0);
+            tokio::time::timeout(OBSERVATION_BOUND, interrupt)
+                .await
+                .expect("signal not observed");
         });
     }
 

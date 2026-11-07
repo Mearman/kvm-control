@@ -1534,6 +1534,7 @@ dependencies = [
  "clap",
  "kvm-core",
  "kvm-kvmd",
+ "libc",
  "rcgen 0.14.10",
  "rpassword",
  "rustls",
