@@ -339,20 +339,6 @@ impl std::ops::Deref for Session {
     }
 }
 
-struct CancelInputCleanup(Option<Kvmd>);
-
-impl Drop for CancelInputCleanup {
-    fn drop(&mut self) {
-        if let Some(worker) = self.0.take() {
-            tokio::spawn(async move {
-                if let Err(error) = worker.release_inputs().await {
-                    eprintln!("Input cleanup uncertain: {error}");
-                }
-            });
-        }
-    }
-}
-
 #[derive(Default)]
 struct Inputs {
     keys: BTreeSet<String>,
@@ -774,6 +760,51 @@ impl Kvmd {
             .expect("input runtime lock poisoned") = Some(tokio::runtime::Handle::current());
     }
 
+    async fn release_locked(&self, inputs: &mut Inputs) -> Result<()> {
+        let mut failed = false;
+        for key in inputs.keys.clone() {
+            if self
+                .input(
+                    "hid/events/send_key",
+                    &[("key", key.clone()), ("state", "false".into())],
+                )
+                .await
+                .is_ok()
+            {
+                inputs.keys.remove(&key);
+            } else {
+                inputs.keys.remove(&key);
+                inputs.uncertain_keys.insert(key);
+                inputs.indeterminate = true;
+                failed = true;
+            }
+        }
+        for button in inputs.buttons.clone() {
+            if self
+                .input(
+                    "hid/events/send_mouse_button",
+                    &[("button", button.clone()), ("state", "false".into())],
+                )
+                .await
+                .is_ok()
+            {
+                inputs.buttons.remove(&button);
+            } else {
+                inputs.buttons.remove(&button);
+                inputs.uncertain_buttons.insert(button);
+                inputs.indeterminate = true;
+                failed = true;
+            }
+        }
+        if failed || inputs.indeterminate {
+            Err(Error::AmbiguousInput(
+                "input session remains indeterminate after an ambiguous operation".into(),
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
     async fn input(&self, path: &str, params: &[(&str, String)]) -> Result<()> {
         let active = self.client.read().await;
         self.input_with(&active.client, path, params).await
@@ -897,16 +928,17 @@ impl Device for Kvmd {
         let mut inputs = self.inputs.clone().lock_owned().await;
         self.capture_input_runtime();
         let worker = self.input_worker();
-        let mut cleanup = CancelInputCleanup(Some(self.input_worker()));
+        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
         let key = key.to_owned();
-        let result = tokio::spawn(async move {
+        tokio::runtime::Handle::current().spawn(async move {
             let result = worker
                 .input(
                     "hid/events/send_key",
                     &[("key", key.clone()), ("state", pressed.to_string())],
                 )
                 .await;
-            match result {
+            let result = match result {
                 Ok(()) => {
                     if pressed {
                         inputs.keys.insert(key);
@@ -925,11 +957,17 @@ impl Device for Kvmd {
                     inputs.indeterminate = true;
                     Err(error)
                 }
+            };
+            if result_tx.send(result).is_err() || ack_rx.await.is_err() {
+                if let Err(error) = worker.release_locked(&mut inputs).await {
+                    eprintln!("Input cleanup uncertain: {error}");
+                }
             }
-        })
-        .await
-        .map_err(|_| Error::AmbiguousInput("input task failed".into()))?;
-        cleanup.0 = None;
+        });
+        let result = result_rx
+            .await
+            .map_err(|_| Error::AmbiguousInput("input task failed".into()))?;
+        let _ = ack_tx.send(());
         result
     }
 
@@ -937,16 +975,17 @@ impl Device for Kvmd {
         let mut inputs = self.inputs.clone().lock_owned().await;
         self.capture_input_runtime();
         let worker = self.input_worker();
-        let mut cleanup = CancelInputCleanup(Some(self.input_worker()));
+        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
         let button = button.to_owned();
-        let result = tokio::spawn(async move {
+        tokio::runtime::Handle::current().spawn(async move {
             let result = worker
                 .input(
                     "hid/events/send_mouse_button",
                     &[("button", button.clone()), ("state", pressed.to_string())],
                 )
                 .await;
-            match result {
+            let result = match result {
                 Ok(()) => {
                     if pressed {
                         inputs.buttons.insert(button);
@@ -965,11 +1004,17 @@ impl Device for Kvmd {
                     inputs.indeterminate = true;
                     Err(error)
                 }
+            };
+            if result_tx.send(result).is_err() || ack_rx.await.is_err() {
+                if let Err(error) = worker.release_locked(&mut inputs).await {
+                    eprintln!("Input cleanup uncertain: {error}");
+                }
             }
-        })
-        .await
-        .map_err(|_| Error::AmbiguousInput("input task failed".into()))?;
-        cleanup.0 = None;
+        });
+        let result = result_rx
+            .await
+            .map_err(|_| Error::AmbiguousInput("input task failed".into()))?;
+        let _ = ack_tx.send(());
         result
     }
 
@@ -1171,52 +1216,9 @@ impl Device for Kvmd {
         let mut inputs = self.inputs.clone().lock_owned().await;
         self.capture_input_runtime();
         let worker = self.input_worker();
-        tokio::spawn(async move {
-            let mut failed = false;
-            for key in inputs.keys.clone() {
-                if worker
-                    .input(
-                        "hid/events/send_key",
-                        &[("key", key.clone()), ("state", "false".into())],
-                    )
-                    .await
-                    .is_ok()
-                {
-                    inputs.keys.remove(&key);
-                } else {
-                    inputs.keys.remove(&key);
-                    inputs.uncertain_keys.insert(key);
-                    inputs.indeterminate = true;
-                    failed = true;
-                }
-            }
-            for button in inputs.buttons.clone() {
-                if worker
-                    .input(
-                        "hid/events/send_mouse_button",
-                        &[("button", button.clone()), ("state", "false".into())],
-                    )
-                    .await
-                    .is_ok()
-                {
-                    inputs.buttons.remove(&button);
-                } else {
-                    inputs.buttons.remove(&button);
-                    inputs.uncertain_buttons.insert(button);
-                    inputs.indeterminate = true;
-                    failed = true;
-                }
-            }
-            if failed || inputs.indeterminate {
-                Err(Error::AmbiguousInput(
-                    "input session remains indeterminate after an ambiguous operation".into(),
-                ))
-            } else {
-                Ok(())
-            }
-        })
-        .await
-        .map_err(|_| Error::AmbiguousInput("release task failed".into()))?
+        tokio::spawn(async move { worker.release_locked(&mut inputs).await })
+            .await
+            .map_err(|_| Error::AmbiguousInput("release task failed".into()))?
     }
 }
 

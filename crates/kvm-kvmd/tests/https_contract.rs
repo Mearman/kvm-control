@@ -314,6 +314,7 @@ async fn fixture() -> (Url, Vec<u8>, Calls, tokio::task::JoinHandle<()>) {
         .route("/api/gpio", get(capability))
         .route("/api/msd", get(capability))
         .route("/gated/api/auth/login", post(login))
+        .route("/gated/api/auth/check", get(status))
         .route("/gated/api/hid/events/send_key", post(gated_input))
         .route("/gated/api/hid/events/send_mouse_button", post(gated_input))
         .route("/api/hid/events/send_key", post(status))
@@ -623,6 +624,95 @@ async fn cancelled_input_is_cleaned_up_with_a_retained_owner() {
         assert!(events[1].ends_with("state=false"));
         server.abort();
     }
+}
+
+#[tokio::test]
+async fn cancelled_cleanup_precedes_later_input_and_explicit_release() {
+    let (mut endpoint, ca, calls, server) = fixture().await;
+    endpoint.set_path("/gated/");
+    let device = Arc::new(client(endpoint, Some(ca)));
+    let sender = device.clone();
+    let first = tokio::spawn(async move { sender.key("KeyA", true).await });
+    calls.3.notified().await;
+    first.abort();
+    assert!(first.await.unwrap_err().is_cancelled());
+    let sender = device.clone();
+    let second = tokio::spawn(async move { sender.key("KeyB", true).await });
+    calls.4.notify_one();
+    calls.3.notified().await;
+    assert!(
+        calls
+            .0
+            .lock()
+            .unwrap()
+            .last()
+            .unwrap()
+            .contains("key=KeyA&state=false")
+    );
+    calls.4.notify_one();
+    calls.3.notified().await;
+    assert!(
+        calls
+            .0
+            .lock()
+            .unwrap()
+            .last()
+            .unwrap()
+            .contains("key=KeyB&state=true")
+    );
+    calls.4.notify_one();
+    second.await.unwrap().unwrap();
+    let sender = device.clone();
+    let release = tokio::spawn(async move { sender.release_inputs().await });
+    calls.3.notified().await;
+    assert!(
+        calls
+            .0
+            .lock()
+            .unwrap()
+            .last()
+            .unwrap()
+            .contains("key=KeyB&state=false")
+    );
+    calls.4.notify_one();
+    release.await.unwrap().unwrap();
+    assert_eq!(calls.0.lock().unwrap().len(), 4);
+    server.abort();
+}
+
+#[test]
+fn input_future_dropped_outside_runtime_is_cleaned_up() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let (mut endpoint, ca, calls, server) = runtime.block_on(fixture());
+    endpoint.set_path("/gated/");
+    let device = client(endpoint, Some(ca));
+    let mut input = Box::pin(device.key("KeyA", true));
+    runtime.block_on(async {
+        tokio::select! {
+            result = &mut input => panic!("input completed unexpectedly: {result:?}"),
+            () = calls.3.notified() => {}
+        }
+    });
+    drop(input);
+    runtime.block_on(async {
+        calls.4.notify_one();
+        calls.3.notified().await;
+        assert!(
+            calls
+                .0
+                .lock()
+                .unwrap()
+                .last()
+                .unwrap()
+                .contains("key=KeyA&state=false")
+        );
+        calls.4.notify_one();
+        device.release_inputs().await.unwrap();
+    });
+    server.abort();
 }
 
 #[tokio::test]
