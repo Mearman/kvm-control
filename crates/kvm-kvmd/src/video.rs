@@ -188,8 +188,10 @@ pub(crate) async fn open(device: &Kvmd) -> Result<Box<dyn VideoStream>> {
     Ok(Box::new(Mjpeg::start(parser, device.config.timeout)))
 }
 
+type SharedSnapshotResult = std::sync::Arc<std::sync::Mutex<Option<Result<Option<Snapshot>>>>>;
+
 struct Delivery {
-    result: std::sync::Arc<std::sync::Mutex<Option<Result<Option<Snapshot>>>>>,
+    result: SharedSnapshotResult,
     acknowledged: tokio::sync::oneshot::Sender<bool>,
     finished: bool,
     claimed: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -200,7 +202,7 @@ struct Mjpeg {
     requests: tokio::sync::mpsc::Sender<tokio::sync::oneshot::Sender<Delivery>>,
     terminal: watch::Receiver<bool>,
     actor: JoinHandle<()>,
-    final_result: Option<std::sync::Arc<std::sync::Mutex<Option<Result<Option<Snapshot>>>>>>,
+    final_result: Option<SharedSnapshotResult>,
     final_storage: Option<
         std::sync::Arc<std::sync::Mutex<Option<std::sync::Arc<tokio::sync::OwnedSemaphorePermit>>>>,
     >,
@@ -744,7 +746,7 @@ mod tests {
         let server = tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.unwrap();
             let mut request = [0; 1024];
-            socket.read(&mut request).await.unwrap();
+            assert!(socket.read(&mut request).await.unwrap() > 0);
             socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: multipart/x-mixed-replace; boundary=frame\r\n\r\n").await.unwrap();
             tokio::time::sleep(Duration::from_millis(200)).await;
         });
@@ -789,7 +791,7 @@ mod tests {
         let server = tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.unwrap();
             let mut request = [0; 1024];
-            socket.read(&mut request).await.unwrap();
+            assert!(socket.read(&mut request).await.unwrap() > 0);
             socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: multipart/x-mixed-replace; boundary=frame\r\n\r\n--frame\r\n").await.unwrap();
             loop {
                 tokio::time::sleep(Duration::from_millis(5)).await;
@@ -1006,7 +1008,7 @@ mod tests {
         let server = tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.unwrap();
             let mut request = [0; 1024];
-            socket.read(&mut request).await.unwrap();
+            assert!(socket.read(&mut request).await.unwrap() > 0);
             socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: multipart/x-mixed-replace; boundary=frame\r\n\r\n--frame\r\nContent-Type: image/jpeg\r\n\r\n").await.unwrap();
             socket.write_all(&jpeg).await.unwrap();
             socket.write_all(b"\r\n--frame--\r\n").await.unwrap();
@@ -1074,7 +1076,7 @@ mod tests {
         let server = tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.unwrap();
             let mut request = [0; 1024];
-            socket.read(&mut request).await.unwrap();
+            assert!(socket.read(&mut request).await.unwrap() > 0);
             socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: multipart/x-mixed-replace; boundary=frame\r\n\r\n").await.unwrap();
             wait.await.unwrap();
             socket

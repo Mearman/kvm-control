@@ -102,7 +102,7 @@ fn jpeg_frame_safe(bytes: &[u8], stripped: &mut Vec<u8>) -> bool {
             let mut area = 0_u64;
             let mut max_h = 1_u64;
             let mut max_v = 1_u64;
-            for component in segment[6..].chunks_exact(3) {
+            for component in segment[6..].as_chunks::<3>().0 {
                 let h = component[1] >> 4;
                 let v = component[1] & 15;
                 if !matches!(h, 1 | 2 | 4) || !(1..=4).contains(&v) {
@@ -184,7 +184,6 @@ async fn validate_jpeg_async(
 }
 
 #[cfg(test)]
-
 async fn run_jpeg_validation<T: Send + 'static>(
     slots: Arc<tokio::sync::Semaphore>,
     validate: impl FnOnce() -> Result<T> + Send + 'static,
@@ -1468,7 +1467,7 @@ mod tests {
         let server = tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.unwrap();
             let mut request = [0; 4096];
-            socket.read(&mut request).await.unwrap();
+            assert!(socket.read(&mut request).await.unwrap() > 0);
             socket
                 .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\n")
                 .await
