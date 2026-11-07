@@ -703,21 +703,23 @@ async fn failed_release_by_an_owner_dropped_on_another_runtime_is_reported_once(
     });
     device.key("KeyA", true).await.unwrap();
     let inputs = device.inputs.clone();
-    // Dropped on another runtime, the owner schedules the release on this one and a waiting task on its own, which must not report the failure again.
-    std::thread::spawn(move || {
+    // Dropped on another runtime, the owner schedules the release on this one and a waiting task on its own, which must not report the failure again. That runtime keeps running until both tasks have finished, so the waiting task runs to completion; this runtime keeps running too, since the blocking thread is awaited rather than joined.
+    tokio::task::spawn_blocking(move || {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap();
-        runtime.block_on(async move { drop(device) });
+        runtime.block_on(async move {
+            drop(device);
+            input_tasks_finished(&inputs).await;
+        });
     })
-    .join()
+    .await
     .unwrap();
     let listener = tokio::time::timeout(INPUT_TIMEOUT, server)
         .await
         .unwrap()
         .unwrap();
-    input_tasks_finished(&inputs).await;
     assert_eq!(
         *reports.lock().unwrap(),
         ["Input cleanup uncertain: a release sent by a dropped owner was not confirmed"]
