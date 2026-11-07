@@ -30,18 +30,104 @@ use url::Url;
 const MAX_IMAGE_DIMENSION: u32 = 8192;
 const MAX_IMAGE_PIXELS: u64 = 32 * 1024 * 1024;
 const MAX_DECODED_BYTES: u64 = MAX_IMAGE_PIXELS * 4;
-// Cargo.lock pins zune-jpeg 0.5.15. Its mcu_prog.rs and mcu.rs allocate at most ceil(width/8) * ceil(height/8) * 64 * horizontal_sample * vertical_sample i16s per component; components.rs limits each factor to 4. Recheck this bound when updating the decoder.
-const MAX_PROGRESSIVE_COEFFICIENT_BYTES: u64 = MAX_DECODED_BYTES;
-const MAX_JPEG_COMPONENTS: u64 = 4;
-const MAX_SAMPLING_AREA: u64 = 4 * 4;
+// Bound variable decoder allocations as well as the output. Recheck the formula against zune-jpeg when Cargo.lock changes.
+const MAX_JPEG_WORKING_BYTES: u64 = MAX_DECODED_BYTES * 2;
 const MAX_JPEG_VALIDATIONS: usize = 2;
 
-fn jpeg_dimensions_safe(width: u32, height: u32) -> bool {
-    let blocks = u64::from(width).div_ceil(8) * u64::from(height).div_ceil(8);
-    let coefficients =
-        blocks * 64 * size_of::<i16>() as u64 * MAX_JPEG_COMPONENTS * MAX_SAMPLING_AREA;
-    u64::from(width) * u64::from(height) <= MAX_IMAGE_PIXELS
-        && coefficients <= MAX_PROGRESSIVE_COEFFICIENT_BYTES
+fn jpeg_frame_safe(bytes: &[u8]) -> bool {
+    let mut pos = 2;
+    let mut frame = false;
+    let mut scan = false;
+    let mut in_entropy = false;
+    while pos < bytes.len() {
+        if bytes[pos] != 0xff {
+            if !in_entropy {
+                return false;
+            }
+            pos += 1;
+            continue;
+        }
+        while pos < bytes.len() && bytes[pos] == 0xff {
+            pos += 1;
+        }
+        let Some(&marker) = bytes.get(pos) else {
+            return false;
+        };
+        pos += 1;
+        match marker {
+            0x00 | 0xd0..=0xd7 if in_entropy => continue,
+            0xd9 => return frame && scan && pos == bytes.len(),
+            0xd8 | 0x00 | 0x01 | 0xd0..=0xd7 => return false,
+            _ => {}
+        }
+        in_entropy = false;
+        let Some(length_bytes) = bytes.get(pos..pos + 2) else {
+            return false;
+        };
+        let length = usize::from(u16::from_be_bytes([length_bytes[0], length_bytes[1]]));
+        if length < 2 || pos + length > bytes.len() {
+            return false;
+        }
+        let segment = &bytes[pos + 2..pos + length];
+        if matches!(marker, 0xc0..=0xc3 | 0xc5..=0xc7 | 0xc9..=0xcb | 0xcd..=0xcf) {
+            if frame || scan || !matches!(marker, 0xc0..=0xc2) || segment.len() < 6 {
+                return false;
+            }
+            let height = u64::from(u16::from_be_bytes([segment[1], segment[2]]));
+            let width = u64::from(u16::from_be_bytes([segment[3], segment[4]]));
+            let count = usize::from(segment[5]);
+            if !matches!(count, 1 | 3 | 4)
+                || segment.len() != 6 + count * 3
+                || width == 0
+                || height == 0
+                || width > u64::from(MAX_IMAGE_DIMENSION)
+                || height > u64::from(MAX_IMAGE_DIMENSION)
+                || width * height > MAX_IMAGE_PIXELS
+            {
+                return false;
+            }
+            let mut area = 0_u64;
+            let mut max_h = 1_u64;
+            let mut max_v = 1_u64;
+            for component in segment[6..].chunks_exact(3) {
+                let h = component[1] >> 4;
+                let v = component[1] & 15;
+                if !matches!(h, 1 | 2 | 4) || !(1..=4).contains(&v) {
+                    return false;
+                }
+                area += u64::from(h) * u64::from(v);
+                max_h = max_h.max(u64::from(h));
+                max_v = max_v.max(u64::from(v));
+            }
+            // mcu.rs and mcu_prog.rs retain coefficient planes even for separate baseline scans. The non-interleaved block count bounds both paths.
+            let block_columns = width.div_ceil(8).max(width.div_ceil(8 * max_h));
+            let block_rows = height
+                .div_ceil(8)
+                .max(height.div_ceil(8 * max_v) * max_v / max_h);
+            let coefficients = block_columns * block_rows * 64 * size_of::<i16>() as u64 * area;
+            // components.rs, worker.rs and mcu_prog.rs allocate row, upsample, raw coefficient and scratch buffers. Bound every component by the largest stride, factors and resize case, including i16 storage and Vec growth.
+            let stride = width.div_ceil(8 * max_h) * 8 * max_h;
+            let row_buffers =
+                count as u64 * stride * (4 * 8 + 2 * 4 + 4 * 16 + 16 * 2 * 8 + 4 * 8 * 2) * 2 * 2
+                    + stride * 8 * 2;
+            // Output is at most four bytes per pixel. image copies the compressed input and zune metadata retains bounded copies of segments.
+            let input_and_metadata = bytes.len() as u64 * 8;
+            let working = coefficients + row_buffers + width * height * 4 + input_and_metadata;
+            if working > MAX_JPEG_WORKING_BYTES {
+                return false;
+            }
+            frame = true;
+        }
+        if marker == 0xda {
+            if !frame {
+                return false;
+            }
+            scan = true;
+            in_entropy = true;
+        }
+        pos += length;
+    }
+    false
 }
 
 async fn validate_jpeg_async(bytes: Vec<u8>) -> Result<Vec<u8>> {
@@ -73,15 +159,11 @@ async fn run_jpeg_validation<T: Send + 'static>(
 fn validate_jpeg(bytes: &[u8]) -> Result<()> {
     use image::ImageDecoder;
     let invalid = || Error::InvalidResponse("invalid or oversized JPEG image".into());
-    if !bytes.starts_with(&[0xff, 0xd8]) || !bytes.ends_with(&[0xff, 0xd9]) {
+    if !bytes.starts_with(&[0xff, 0xd8]) || !jpeg_frame_safe(bytes) {
         return Err(invalid());
     }
     let mut decoder = image::codecs::jpeg::JpegDecoder::new(std::io::Cursor::new(bytes))
         .map_err(|_| invalid())?;
-    let (width, height) = decoder.dimensions();
-    if !jpeg_dimensions_safe(width, height) {
-        return Err(invalid());
-    }
     let mut limits = image::Limits::default();
     limits.max_image_width = Some(MAX_IMAGE_DIMENSION);
     limits.max_image_height = Some(MAX_IMAGE_DIMENSION);
@@ -1104,16 +1186,6 @@ mod tests {
     }
 
     #[test]
-    fn jpeg_coefficient_budget_bounds_padded_blocks() {
-        let bytes_per_block =
-            64 * size_of::<i16>() as u64 * MAX_JPEG_COMPONENTS * MAX_SAMPLING_AREA;
-        let blocks = MAX_PROGRESSIVE_COEFFICIENT_BYTES / bytes_per_block;
-        let width = (blocks * 8) as u32;
-        assert!(jpeg_dimensions_safe(width, 8));
-        assert!(!jpeg_dimensions_safe(width + 1, 8));
-    }
-
-    #[test]
     fn progressive_jpeg_is_decoded_and_oversized_header_rejected() {
         use base64::Engine;
         // An 8x8 synthetic RGB image encoded by ImageMagick with progressive scans.
@@ -1123,8 +1195,64 @@ mod tests {
             .windows(2)
             .position(|bytes| bytes == [0xff, 0xc2])
             .unwrap();
-        image[sof + 5..sof + 9].copy_from_slice(&[0x10, 0x00, 0x10, 0x00]);
+        image[sof + 5..sof + 9].copy_from_slice(&[0x20, 0x00, 0x20, 0x00]);
         assert!(validate_jpeg(&image).is_err());
+    }
+
+    #[test]
+    fn malformed_jpeg_markers_are_rejected() {
+        let mut image = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new(&mut image)
+            .encode(&[64, 128, 192], 1, 1, image::ExtendedColorType::Rgb8)
+            .unwrap();
+        let sof = image
+            .windows(2)
+            .position(|bytes| bytes == [0xff, 0xc0])
+            .unwrap();
+        let length = usize::from(u16::from_be_bytes([image[sof + 2], image[sof + 3]])) + 2;
+        let mut duplicate = image.clone();
+        duplicate.splice(sof..sof, image[sof..sof + length].iter().copied());
+        assert!(!jpeg_frame_safe(&duplicate));
+        let mut bad_length = image.clone();
+        bad_length[sof + 2..sof + 4].copy_from_slice(&[0xff, 0xff]);
+        assert!(!jpeg_frame_safe(&bad_length));
+        let mut zero_sampling = image.clone();
+        zero_sampling[sof + 11] = 0;
+        assert!(!jpeg_frame_safe(&zero_sampling));
+        let mut trailing = image.clone();
+        trailing.push(0);
+        assert!(!jpeg_frame_safe(&trailing));
+        assert!(!jpeg_frame_safe(&image[..sof + 4]));
+    }
+
+    #[test]
+    fn progressive_1080p_is_accepted() {
+        let mut image = Vec::new();
+        let pixels = vec![64; 1920 * 1080 * 3];
+        let mut encoder = jpeg_encoder::Encoder::new(&mut image, 75);
+        encoder.set_progressive(true);
+        encoder
+            .encode(&pixels, 1920, 1080, jpeg_encoder::ColorType::Rgb)
+            .unwrap();
+        assert!(validate_jpeg(&image).is_ok());
+    }
+
+    #[test]
+    fn baseline_1080p_and_sampling_budget() {
+        let mut image = Vec::new();
+        let pixels = vec![64; 1920 * 1080 * 3];
+        image::codecs::jpeg::JpegEncoder::new(&mut image)
+            .encode(&pixels, 1920, 1080, image::ExtendedColorType::Rgb8)
+            .unwrap();
+        assert!(validate_jpeg(&image).is_ok());
+        let sof = image
+            .windows(2)
+            .position(|bytes| bytes == [0xff, 0xc0])
+            .unwrap();
+        for i in 0..3 {
+            image[sof + 11 + i * 3] = 0x55;
+        }
+        assert!(!jpeg_frame_safe(&image));
     }
 
     #[test]
