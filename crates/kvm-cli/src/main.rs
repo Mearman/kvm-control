@@ -197,18 +197,31 @@ async fn run_control(
     Ok(json!({"accepted": true, "post_state": post_state}))
 }
 
-async fn termination_signal() -> io::Result<()> {
-    #[cfg(unix)]
-    {
-        let mut terminate =
-            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+/// Registers the SIGTERM and SIGINT handlers when called, not when first polled, and returns a future that resolves when either signal arrives. A caller that calls this before submitting any input therefore handles a signal at every later point instead of taking the default disposition, which would exit with the input still held. A registration failure is returned by the future.
+#[cfg(unix)]
+fn termination_signal() -> impl std::future::Future<Output = io::Result<()>> {
+    use tokio::signal::unix::{SignalKind, signal};
+    let terminate = signal(SignalKind::terminate());
+    let interrupt = signal(SignalKind::interrupt());
+    async move {
+        let (mut terminate, mut interrupt) = (terminate?, interrupt?);
         tokio::select! {
-            result = tokio::signal::ctrl_c() => result,
-            _ = terminate.recv() => Ok(()),
+            _ = terminate.recv() => (),
+            _ = interrupt.recv() => (),
         }
+        Ok::<(), io::Error>(())
     }
-    #[cfg(not(unix))]
-    tokio::signal::ctrl_c().await
+}
+
+/// Registers the Ctrl-C handler when called, not when first polled, and returns a future that resolves when Ctrl-C arrives; see the Unix variant for why registration is eager.
+#[cfg(not(unix))]
+fn termination_signal() -> impl std::future::Future<Output = io::Result<()>> {
+    let ctrl_c = tokio::signal::windows::ctrl_c();
+    async move {
+        let mut ctrl_c = ctrl_c?;
+        ctrl_c.recv().await;
+        Ok::<(), io::Error>(())
+    }
 }
 
 async fn press_and_release<F, S>(device: &impl Device, press: F, interrupt: S) -> Result<(), String>
@@ -273,16 +286,14 @@ async fn execute(device: &impl Device, command: Command) -> Result<Value, String
             Ok(json!({"output": output, "bytes": snapshot.jpeg.len()}))
         }
         Command::Key { key } => {
-            press_and_release(device, device.key(&key, true), termination_signal()).await?;
+            // Registered before the press future exists, so no signal can precede the handlers.
+            let interrupt = termination_signal();
+            press_and_release(device, device.key(&key, true), interrupt).await?;
             Ok(json!({"key": key, "released": true}))
         }
         Command::Click { button } => {
-            press_and_release(
-                device,
-                device.mouse_button(&button, true),
-                termination_signal(),
-            )
-            .await?;
+            let interrupt = termination_signal();
+            press_and_release(device, device.mouse_button(&button, true), interrupt).await?;
             Ok(json!({"button": button, "released": true}))
         }
         Command::Move { x, y } => {
@@ -592,6 +603,45 @@ mod tests {
             .unwrap_err();
         assert!(error.contains("interrupted"));
         assert_eq!(*device.0.lock().unwrap(), ["release"]);
+    }
+
+    /// Signals this process after the handlers are registered but before their future is first polled: a handler registered only on first poll leaves the signal its default disposition, which kills the child, so its exit status shows the ordering.
+    #[cfg(unix)]
+    #[test]
+    fn termination_signals_are_handled_from_registration() {
+        const CHILD: &str = "KVM_SIGNAL_REGISTRATION_TEST_CHILD";
+        let Some(signal) = std::env::var_os(CHILD) else {
+            for signal in ["TERM", "INT"] {
+                let result = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "tests::termination_signals_are_handled_from_registration",
+                    ])
+                    .env(CHILD, signal)
+                    .status()
+                    .unwrap();
+                assert!(result.success(), "SIG{signal}: {result}");
+            }
+            return;
+        };
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let interrupt = termination_signal();
+            let mut flag = std::ffi::OsString::from("-");
+            flag.push(&signal);
+            assert!(
+                std::process::Command::new("kill")
+                    .arg(flag)
+                    .arg(std::process::id().to_string())
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+            interrupt.await.unwrap();
+        });
     }
 
     #[tokio::test]
