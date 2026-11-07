@@ -13,7 +13,7 @@ use kvm_core::{
 };
 use serde_json::Value;
 
-use super::{Kvmd, mouse_mode};
+use super::{Kvmd, RequestFailure, mouse_mode};
 
 /// State routes read for a status, in the order `parse` takes them.
 const ROUTES: [&str; 7] = ["info", "hid", "streamer", "atx", "switch", "gpio", "msd"];
@@ -32,17 +32,26 @@ pub(crate) enum Read {
 }
 
 impl Kvmd {
-    /// Reads every state route with GET requests only, so reading status sends no input or control request. A transport failure, which leaves the connection itself in doubt, fails the whole status at once; how the other outcomes combine is described at [`parse`].
+    /// Reads every state route with GET requests only, so reading status sends no input or control request. A connection failure (no connection or TLS session could be established) fails the whole status at once. A route that timed out after connecting, or whose body broke off, failed on its own, like one answering an error status; how such outcomes combine is described at [`parse`].
     pub(crate) async fn read_status(&self) -> Result<DeviceStatus> {
         let active = self.client.read().await;
         let mut reads: [Read; 7] = Default::default();
         for (read, path) in reads.iter_mut().zip(ROUTES) {
-            *read = match self.json_with(&active.client, path).await {
+            *read = match self.state_with(&active.client, path).await {
                 Ok(state) => Read::State(state),
-                Err(Error::Http(404)) => Read::Absent,
-                Err(Error::Authentication) => Read::Denied,
-                Err(error @ Error::Transport(_)) => return Err(error),
-                Err(error) => Read::Failed(error),
+                Err(RequestFailure {
+                    error,
+                    connection: true,
+                }) => return Err(error),
+                Err(RequestFailure {
+                    error: Error::Http(404),
+                    ..
+                }) => Read::Absent,
+                Err(RequestFailure {
+                    error: Error::Authentication,
+                    ..
+                }) => Read::Denied,
+                Err(RequestFailure { error, .. }) => Read::Failed(error),
             };
         }
         parse(self.profile, reads)
@@ -51,25 +60,24 @@ impl Kvmd {
 
 /// Builds a typed status from the route reads, in `ROUTES` order.
 ///
-/// Both inspected sources always register the info, HID and streamer routes, so a 404 on any of them means the endpoint is not a KVMD API and fails with that HTTP error. A status in which no route produced state has observed nothing, so it fails: with an authentication error when a route was denied, otherwise with the first route's error (for example the HTTP 502 of a proxy whose daemon is stopped, or the invalid JSON of a page that is not the API). Otherwise each failed or denied route is unknown, and an absent route is unsupported only when the info route was read, which establishes that the endpoint is a KVMD API; without that it is unknown.
+/// Both inspected sources always register the info, HID and streamer routes, so a 404 on any of them means the endpoint is not a KVMD API and fails with that HTTP error. A status in which no route produced state has observed nothing, so it fails: with an authentication error when a route was denied, otherwise with the info route's error (for example the HTTP 502 of a proxy whose daemon is stopped, or the invalid JSON of a page that is not the API).
+///
+/// A denied route is unknown, which keeps the subsystems a partly permitted session may read. A session whose credentials became invalid between requests therefore looks the same as one denied some routes; `check_auth` or a new login tells them apart. Otherwise each failed or denied route is unknown, and an absent route is unsupported only when the info route was read, which establishes that the endpoint is a KVMD API; without that it is unknown.
 pub(crate) fn parse(profile: DeviceProfile, reads: [Read; 7]) -> Result<DeviceStatus> {
     if reads[..3].iter().any(|read| matches!(read, Read::Absent)) {
         return Err(Error::Http(404));
     }
-    if !reads.iter().any(|read| matches!(read, Read::State(_))) {
-        if reads.iter().any(|read| matches!(read, Read::Denied)) {
-            return Err(Error::Authentication);
-        }
-        return Err(reads
-            .into_iter()
-            .find_map(|read| match read {
-                Read::Failed(error) => Some(error),
-                _ => None,
-            })
-            .unwrap_or(Error::Http(404)));
+    let observed = reads.iter().any(|read| matches!(read, Read::State(_)));
+    if !observed && reads.iter().any(|read| matches!(read, Read::Denied)) {
+        return Err(Error::Authentication);
     }
     let api_confirmed = matches!(reads[0], Read::State(_));
     let [info, hid, streamer, atx, switch, gpio, msd] = reads;
+    // With nothing observed and nothing denied, the info route, which is neither absent (checked above) nor read, failed, and its error is the status's.
+    let info = match info {
+        Read::Failed(error) if !observed => return Err(error),
+        info => info,
+    };
     Ok(DeviceStatus {
         info: section(info, api_confirmed, |state| {
             Reported::Supported(system_info(profile, state))
