@@ -1596,27 +1596,16 @@ impl Device for Kvmd {
 impl Drop for Kvmd {
     fn drop(&mut self) {
         // Best-effort: only a connection that has taken the input lock has inputs to release. The release is scheduled on the runtime that last took the input lock, which every lock holder records except a dropped owner's own release (that one runs only after this drop has read the runtime), and runs only while that runtime is driven. When the owner is dropped on another runtime, a task there waits for that release and performs it only if the last runtime could not run it (shut down, or panicked). While the last runtime runs it, a current runtime without IO or time drivers never starts a release; if the last runtime has shut down, the fallback starts the release on the current runtime whatever drivers it has. A current runtime that is shutting down discards its task while the last runtime still releases.
-        let last = self
+        let _last = self
             .input_runtime
             .lock()
             .expect("input runtime lock poisoned")
             .clone();
         if self.cleanup_on_drop
-            && let Some(last) = last
+            && let Ok(current) = tokio::runtime::Handle::try_current()
         {
-            let current = tokio::runtime::Handle::try_current()
-                .ok()
-                .filter(|current| current.id() != last.id());
             let worker = self.input_worker();
-            let released = last.spawn(async move { worker.release_for_drop().await });
-            if let Some(current) = current {
-                let worker = self.input_worker();
-                current.spawn(async move {
-                    if released.await.is_err() {
-                        worker.release_for_drop().await;
-                    }
-                });
-            }
+            current.spawn(async move { worker.release_for_drop().await });
         }
     }
 }
