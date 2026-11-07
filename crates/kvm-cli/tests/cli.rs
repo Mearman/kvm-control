@@ -11,10 +11,11 @@ use rustls::{ServerConfig, ServerConnection, StreamOwned, pki_types::PrivatePkcs
 use serde_json::Value;
 
 fn invoke(command: &[&str], responses: Vec<&'static [u8]>) -> (std::process::Output, Vec<String>) {
-    invoke_with_signal(command, responses, false)
+    invoke_with_signal("pikvm", command, responses, false)
 }
 
 fn invoke_with_signal(
+    profile: &str,
     command: &[&str],
     responses: Vec<&'static [u8]>,
     signal_press: bool,
@@ -111,7 +112,7 @@ fn invoke_with_signal(
             "--endpoint",
             &format!("https://localhost:{}", address.port()),
             "--profile",
-            "pikvm",
+            profile,
             "--username",
             "synthetic",
             "--password-stdin",
@@ -193,9 +194,11 @@ fn approval_pending_is_reported_and_polled_before_status() {
     let pending = b"{\"ok\":true,\"result\":{\"status\":\"pending\"}}";
     let approved = b"{\"ok\":true,\"result\":{\"token\":\"synthetic-session\"}}";
     let body = b"{\"ok\":true,\"result\":{\"online\":true}}";
-    let (output, requests) = invoke(
+    let (output, requests) = invoke_with_signal(
+        "glkvm",
         &["status"],
         vec![login, pending, approved, body, body, body, body],
+        false,
     );
     assert!(
         output.status.success(),
@@ -214,7 +217,7 @@ fn approval_pending_is_reported_and_polled_before_status() {
 #[test]
 fn expired_approval_does_not_submit_a_poll() {
     let login = b"{\"ok\":true,\"result\":{\"two_step_required\":true,\"two_step_token\":\"synthetic-approval\",\"expires_in\":0}}";
-    let (output, requests) = invoke(&["status"], vec![login]);
+    let (output, requests) = invoke_with_signal("glkvm", &["status"], vec![login], false);
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("device approval expired"));
     assert_eq!(requests.len(), 1);
@@ -224,7 +227,8 @@ fn expired_approval_does_not_submit_a_poll() {
 #[test]
 fn sigterm_during_key_press_releases_input() {
     let ok = b"{\"ok\":true,\"result\":{}}";
-    let (output, requests) = invoke_with_signal(&["key", "KeyA"], vec![ok, ok, ok, ok], true);
+    let (output, requests) =
+        invoke_with_signal("pikvm", &["key", "KeyA"], vec![ok, ok, ok, ok], true);
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("interrupted"));
     assert!(requests[2].starts_with("POST /api/hid/events/send_key?key=KeyA&state=true "));
