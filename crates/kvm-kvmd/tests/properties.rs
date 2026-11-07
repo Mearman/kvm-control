@@ -706,6 +706,11 @@ fn malformed_totp() -> impl Strategy<Value = String> {
     })
 }
 
+/// Whether a result is a pending approval that does (or does not) report an expiry. A helper because `prop_assert!` formats its condition, which cannot contain a struct pattern's braces.
+fn approval_pending(result: &kvm_core::Result<LoginState>, with_expiry: bool) -> bool {
+    matches!(result, Ok(LoginState::ApprovalPending { expires_in }) if expires_in.is_some() == with_expiry)
+}
+
 #[derive(Debug, Clone, Copy)]
 enum Step {
     Accept,
@@ -762,10 +767,7 @@ proptest! {
                             pending = false;
                         }
                         _ => {
-                            prop_assert!(matches!(
-                                result,
-                                Ok(LoginState::ApprovalPending { expires_in: Some(_) })
-                            ));
+                            prop_assert!(approval_pending(&result, true));
                             authenticated = false;
                             pending = true;
                             approved = false;
@@ -783,10 +785,7 @@ proptest! {
                     if !pending {
                         prop_assert!(matches!(result, Err(Error::InvalidResponse(_))));
                     } else if !approved {
-                        prop_assert!(matches!(
-                            result,
-                            Ok(LoginState::ApprovalPending { expires_in: None })
-                        ));
+                        prop_assert!(approval_pending(&result, false));
                     } else {
                         prop_assert!(matches!(result, Ok(LoginState::Authenticated)));
                         authenticated = true;
