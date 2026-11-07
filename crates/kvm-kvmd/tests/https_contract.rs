@@ -625,7 +625,7 @@ async fn expired_session_requires_explicit_reauthentication() {
 async fn failed_or_pending_relogin_does_not_reuse_previous_cookie() {
     let (mut endpoint, ca, _, server) = fixture().await;
     endpoint.set_path("/proxy/");
-    let device = client(endpoint, Some(ca));
+    let device = profile_client(endpoint, Some(ca), DeviceProfile::GlKvm);
     device.login("test-user", "test-password").await.unwrap();
     device.check_auth().await.unwrap();
     assert!(matches!(
