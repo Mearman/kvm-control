@@ -709,7 +709,9 @@ fn input_events(calls: &Calls) -> Vec<String> {
         .lock()
         .unwrap()
         .iter()
-        .filter(|v| v.contains("/hid/events/"))
+        .filter(|v| {
+            v.contains("/hid/events/send_key?") || v.contains("/hid/events/send_mouse_button?")
+        })
         .map(|v| v.split_once('?').unwrap().1.to_owned())
         .collect()
 }
@@ -718,9 +720,9 @@ fn input_events(calls: &Calls) -> Vec<String> {
 fn held_on_device(calls: &Calls) -> Vec<String> {
     let mut held = std::collections::BTreeSet::new();
     for call in calls.0.lock().unwrap().iter() {
-        let Some((_, query)) = call
-            .split_once("/hid/events/")
-            .and_then(|(_, rest)| rest.split_once('?'))
+        let Some((_, query)) = ["/hid/events/send_key?", "/hid/events/send_mouse_button?"]
+            .iter()
+            .find_map(|path| call.split_once(path))
         else {
             continue;
         };
