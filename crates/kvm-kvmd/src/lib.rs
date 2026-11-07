@@ -747,6 +747,10 @@ impl Kvmd {
             video_proven: self.video_proven.clone(),
             cleanup_on_drop: false,
             input_runtime: self.input_runtime.clone(),
+            #[cfg(test)]
+            stream_storage: self.stream_storage.clone(),
+            #[cfg(test)]
+            snapshot_storage: self.snapshot_storage.clone(),
         }
     }
 

@@ -144,6 +144,8 @@ fn input_device(address: std::net::SocketAddr) -> Kvmd {
         video_proven: Default::default(),
         cleanup_on_drop: true,
         input_runtime: Default::default(),
+        stream_storage: Arc::new(tokio::sync::Semaphore::new(crate::MAX_JPEG_VALIDATIONS)),
+        snapshot_storage: Arc::new(tokio::sync::Semaphore::new(crate::MAX_JPEG_VALIDATIONS)),
     }
 }
 
@@ -210,6 +212,8 @@ async fn cancelled_press_finishes_before_concurrent_release() {
         video_proven: Default::default(),
         cleanup_on_drop: true,
         input_runtime: Default::default(),
+        stream_storage: Arc::new(tokio::sync::Semaphore::new(crate::MAX_JPEG_VALIDATIONS)),
+        snapshot_storage: Arc::new(tokio::sync::Semaphore::new(crate::MAX_JPEG_VALIDATIONS)),
     });
     let pressing = device.clone();
     let task = tokio::spawn(async move { pressing.key("KeyA", true).await });
@@ -637,11 +641,11 @@ async fn cancelling_snapshot_read_releases_capacity() {
     let client = reqwest::Client::builder().http1_only().build().unwrap();
     let endpoint = Url::parse(&format!("http://{address}/proxy/")).unwrap();
     let device = Kvmd {
-        client: tokio::sync::RwLock::new(crate::Session {
+        client: Arc::new(tokio::sync::RwLock::new(crate::Session {
             client: client.clone(),
             video: client,
             cookies: Default::default(),
-        }),
+        })),
         config: Config {
             endpoint: endpoint.clone(),
             profile: DeviceProfile::PiKvm,
@@ -654,6 +658,10 @@ async fn cancelling_snapshot_read_releases_capacity() {
         inputs: Default::default(),
         auth_headers: Default::default(),
         approval_token: Default::default(),
+        snapshot_proven: Default::default(),
+        video_proven: Default::default(),
+        cleanup_on_drop: false,
+        input_runtime: Default::default(),
         stream_storage: Arc::new(tokio::sync::Semaphore::new(crate::MAX_JPEG_VALIDATIONS)),
         snapshot_storage: Arc::new(tokio::sync::Semaphore::new(crate::MAX_JPEG_VALIDATIONS)),
     };
@@ -730,11 +738,11 @@ async fn stream_validation_survives_cancelled_next_frame() {
     let client = reqwest::Client::builder().http1_only().build().unwrap();
     let endpoint = Url::parse(&format!("http://{address}/proxy/")).unwrap();
     let device = Kvmd {
-        client: tokio::sync::RwLock::new(crate::Session {
+        client: Arc::new(tokio::sync::RwLock::new(crate::Session {
             client: client.clone(),
             video: client,
             cookies: Default::default(),
-        }),
+        })),
         config: Config {
             endpoint: endpoint.clone(),
             profile: DeviceProfile::PiKvm,
@@ -747,6 +755,10 @@ async fn stream_validation_survives_cancelled_next_frame() {
         inputs: Default::default(),
         auth_headers: Default::default(),
         approval_token: Default::default(),
+        snapshot_proven: Default::default(),
+        video_proven: Default::default(),
+        cleanup_on_drop: false,
+        input_runtime: Default::default(),
         stream_storage: Arc::new(tokio::sync::Semaphore::new(crate::MAX_JPEG_VALIDATIONS)),
         snapshot_storage: Arc::new(tokio::sync::Semaphore::new(crate::MAX_JPEG_VALIDATIONS)),
     };
@@ -791,11 +803,11 @@ async fn concurrent_snapshots_exhaust_and_recover_storage() {
     let client = reqwest::Client::builder().http1_only().build().unwrap();
     let endpoint = Url::parse(&format!("http://{address}/proxy/")).unwrap();
     let device = Arc::new(Kvmd {
-        client: tokio::sync::RwLock::new(crate::Session {
+        client: Arc::new(tokio::sync::RwLock::new(crate::Session {
             client: client.clone(),
             video: client,
             cookies: Default::default(),
-        }),
+        })),
         config: Config {
             endpoint: endpoint.clone(),
             profile: DeviceProfile::PiKvm,
@@ -808,6 +820,10 @@ async fn concurrent_snapshots_exhaust_and_recover_storage() {
         inputs: Default::default(),
         auth_headers: Default::default(),
         approval_token: Default::default(),
+        snapshot_proven: Default::default(),
+        video_proven: Default::default(),
+        cleanup_on_drop: false,
+        input_runtime: Default::default(),
         stream_storage: Arc::new(tokio::sync::Semaphore::new(crate::MAX_JPEG_VALIDATIONS)),
         snapshot_storage: Arc::new(tokio::sync::Semaphore::new(crate::MAX_JPEG_VALIDATIONS)),
     });

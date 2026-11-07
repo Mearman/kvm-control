@@ -518,8 +518,8 @@ impl Parser {
         if self.validation.is_some() {
             let result = self.validation.as_mut().expect("validation exists").await;
             self.validation = None;
-            let jpeg = result
-                .map_err(|_| Error::Transport("JPEG validation task failed".into()))??;
+            let jpeg =
+                result.map_err(|_| Error::Transport("JPEG validation task failed".into()))??;
             self.proven.store(true, Ordering::Release);
             return Ok(Some(Snapshot { jpeg }));
         }
