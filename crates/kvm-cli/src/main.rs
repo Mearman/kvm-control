@@ -492,6 +492,7 @@ mod tests {
     use super::*;
     use clap::CommandFactory;
 
+    /// A device whose key requests are ambiguous but whose releases succeed, so the CLI's press and cleanup reporting can be checked separately. It does not keep `release_inputs` failing after an ambiguous key as `Device::release_inputs` requires of an adapter, which the CLI does not rely on: it reports each call's result as it is.
     struct Fake(std::sync::Mutex<Vec<String>>);
     struct Frames(u8);
 
