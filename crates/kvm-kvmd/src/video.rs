@@ -22,6 +22,8 @@ struct Mjpeg {
     scan_offset: usize,
     #[cfg(test)]
     scanned: usize,
+    #[cfg(test)]
+    scan_progress: Option<tokio::sync::mpsc::UnboundedSender<usize>>,
     lease: JoinHandle<()>,
     lease_state: watch::Receiver<bool>,
     timeout: Duration,
@@ -142,6 +144,8 @@ pub(crate) async fn open(device: &Kvmd) -> Result<Box<dyn VideoStream>> {
         scan_offset: 0,
         #[cfg(test)]
         scanned: 0,
+        #[cfg(test)]
+        scan_progress: None,
         lease: guard.0.take().expect("lease exists"),
         lease_state,
         timeout: device.config.timeout,
@@ -342,6 +346,10 @@ impl VideoStream for Mjpeg {
                     }
                     self.scan_offset =
                         next_scan_offset(self.buffer.len(), delimiter.len(), body_start);
+                    #[cfg(test)]
+                    if let Some(progress) = &self.scan_progress {
+                        let _ = progress.send(self.buffer.len());
+                    }
                     if !self.fill(frame_limit).await? {
                         return Err(Error::InvalidResponse("truncated frame".into()));
                     }
@@ -405,6 +413,7 @@ mod tests {
         });
         let response = reqwest::get(format!("http://{address}/")).await.unwrap();
         let (_tx, lease_state) = watch::channel(true);
+        let (progress_tx, mut progress_rx) = mpsc::unbounded_channel();
         let lease = tokio::spawn(std::future::pending());
         let mut video = Mjpeg {
             response,
@@ -413,19 +422,25 @@ mod tests {
             pending: bytes::Bytes::new(),
             scan_offset: 0,
             scanned: 0,
+            scan_progress: Some(progress_tx),
             lease,
             lease_state,
-            timeout: Duration::from_secs(60),
+            timeout: Duration::from_secs(3),
             first: true,
             ended: false,
         };
-        for _ in 0..64 {
+        for index in 1..=64 {
             send.send(false).await.unwrap();
-            assert!(
-                tokio::time::timeout(Duration::from_millis(5), video.next_frame())
-                    .await
-                    .is_err()
-            );
+            let frame = video.next_frame();
+            tokio::pin!(frame);
+            loop {
+                tokio::select! {
+                    result = &mut frame => panic!("frame ended before cancellation: {result:?}"),
+                    progress = progress_rx.recv() => {
+                        if progress.unwrap() >= 2 + index * 256 { break; }
+                    }
+                }
+            }
         }
         send.send(true).await.unwrap();
         assert_eq!(
