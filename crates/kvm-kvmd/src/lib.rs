@@ -311,7 +311,7 @@ impl reqwest::cookie::CookieStore for SessionCookies {
 
 /// A KVMD connection with an explicitly authenticated session.
 ///
-/// Input requests already submitted continue after caller cancellation. Cancelling a submitted key or button request schedules best-effort release of tracked inputs. Ambiguous outcomes permanently render cleanup indeterminate because a server may apply a timed-out request later. An ambiguous release is not replayed automatically. Dropping the last owner attempts to release tracked inputs on the captured runtime; process or runtime termination provides no cleanup guarantee.
+/// Input requests already submitted continue after caller cancellation. Dropping a submitted key or button request before collecting its outcome, including outside a runtime, marks cleanup pending and schedules a release of tracked inputs on the captured runtime. Every input, movement or explicit release that acquires the input lock after that drop, including one already waiting for it, first releases tracked inputs, so cleanup never interleaves with later inputs. A completed request does not hold the input lock while its outcome waits to be collected. Ambiguous outcomes permanently render cleanup indeterminate because a server may apply a timed-out request later, and a request interrupted by runtime shutdown counts as ambiguous. An ambiguous release is not replayed automatically. Dropping the last owner attempts to release tracked inputs on the captured runtime; process or runtime termination provides no cleanup guarantee.
 ///
 /// Cookies are accepted only from login or approval responses. Later `Set-Cookie` headers, including rotation and expiry updates, are ignored. The inspected [PiKVM](https://github.com/pikvm/kvmd/blob/fcb903eb3be70d8eee4aee99e5fcc1c743e3ccef/kvmd/apps/kvmd/api/auth.py) and [GLKVM](https://github.com/gl-inet/glkvm/blob/3e8dd23c4bd638a4650433664cc3b0f3b4d29395/kvmd/apps/kvmd/api/auth.py) revisions issue authentication cookies on login, and GLKVM also issues them on approval. Other firmware requiring cookie rotation is not supported. Server-side expiry or revocation can return an authentication error; call `login` again with fresh credentials and complete any approval. Consequential and input requests are never automatically replayed, and ambiguous outcomes require observation before a caller decides what to do.
 pub struct Kvmd {
@@ -326,6 +326,8 @@ pub struct Kvmd {
     video_proven: Arc<AtomicBool>,
     cleanup_on_drop: bool,
     input_runtime: Arc<std::sync::Mutex<Option<tokio::runtime::Handle>>>,
+    // Set without the input lock by a dropped input future and consumed under the lock, so a lock holder after the drop releases tracked inputs before its own request.
+    cleanup_pending: Arc<AtomicBool>,
     #[cfg(test)]
     stream_storage: Arc<tokio::sync::Semaphore>,
     #[cfg(test)]
@@ -346,6 +348,115 @@ struct Inputs {
     uncertain_keys: BTreeSet<String>,
     uncertain_buttons: BTreeSet<String>,
     indeterminate: bool,
+}
+
+/// An input that stays held until released: a keyboard key or a mouse button.
+#[derive(Clone, Copy)]
+enum Held {
+    Key,
+    Button,
+}
+
+impl Held {
+    fn path(self) -> &'static str {
+        match self {
+            Self::Key => "hid/events/send_key",
+            Self::Button => "hid/events/send_mouse_button",
+        }
+    }
+
+    fn param(self) -> &'static str {
+        match self {
+            Self::Key => "key",
+            Self::Button => "button",
+        }
+    }
+}
+
+impl Inputs {
+    fn held(&self, kind: Held) -> &BTreeSet<String> {
+        match kind {
+            Held::Key => &self.keys,
+            Held::Button => &self.buttons,
+        }
+    }
+
+    /// Records a press or release outcome; an unconfirmed outcome tracks a press as held and marks the input and the session indeterminate.
+    fn record(&mut self, kind: Held, name: &str, pressed: bool, confirmed: bool) {
+        let (held, uncertain) = match kind {
+            Held::Key => (&mut self.keys, &mut self.uncertain_keys),
+            Held::Button => (&mut self.buttons, &mut self.uncertain_buttons),
+        };
+        if pressed {
+            held.insert(name.to_owned());
+        } else {
+            held.remove(name);
+        }
+        if !confirmed {
+            uncertain.insert(name.to_owned());
+            self.indeterminate = true;
+        }
+    }
+}
+
+/// Records a submitted held-input request as ambiguous unless `finish` runs, so a request whose task is dropped mid-flight (runtime shutdown) is neither forgotten nor left tracked for replay.
+struct InFlight<'a> {
+    inputs: &'a mut Inputs,
+    kind: Held,
+    name: &'a str,
+    pressed: bool,
+    finished: bool,
+}
+
+impl InFlight<'_> {
+    fn finish(mut self, confirmed: bool) {
+        self.inputs
+            .record(self.kind, self.name, self.pressed, confirmed);
+        self.finished = true;
+    }
+}
+
+impl Drop for InFlight<'_> {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.inputs
+                .record(self.kind, self.name, self.pressed, false);
+        }
+    }
+}
+
+/// Marks cleanup pending when a caller drops an input future before collecting its outcome, then schedules that cleanup on the captured runtime. Needs no current runtime, so dropping outside one is safe.
+struct CollectGuard<'a> {
+    device: &'a Kvmd,
+    armed: bool,
+}
+
+impl CollectGuard<'_> {
+    fn disarm(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for CollectGuard<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        self.device.cleanup_pending.store(true, Ordering::SeqCst);
+        if let Some(runtime) = self
+            .device
+            .input_runtime
+            .lock()
+            .expect("input runtime lock poisoned")
+            .clone()
+        {
+            let worker = self.device.input_worker();
+            runtime.spawn(async move {
+                let mut inputs = worker.inputs.lock().await;
+                worker.clean_pending(&mut inputs).await;
+            });
+        }
+    }
 }
 
 impl Kvmd {
@@ -415,6 +526,7 @@ impl Kvmd {
             video_proven: Arc::new(AtomicBool::new(false)),
             cleanup_on_drop: true,
             input_runtime: Arc::new(std::sync::Mutex::new(None)),
+            cleanup_pending: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
             stream_storage: Arc::new(tokio::sync::Semaphore::new(MAX_JPEG_VALIDATIONS)),
             #[cfg(test)]
@@ -746,6 +858,7 @@ impl Kvmd {
             video_proven: self.video_proven.clone(),
             cleanup_on_drop: false,
             input_runtime: self.input_runtime.clone(),
+            cleanup_pending: self.cleanup_pending.clone(),
             #[cfg(test)]
             stream_storage: self.stream_storage.clone(),
             #[cfg(test)]
@@ -760,40 +873,40 @@ impl Kvmd {
             .expect("input runtime lock poisoned") = Some(tokio::runtime::Handle::current());
     }
 
+    /// Sends one press or release and records its outcome in `inputs`, the caller holding the input lock.
+    async fn send_held(
+        &self,
+        inputs: &mut Inputs,
+        kind: Held,
+        name: &str,
+        pressed: bool,
+    ) -> Result<()> {
+        let in_flight = InFlight {
+            inputs,
+            kind,
+            name,
+            pressed,
+            finished: false,
+        };
+        let result = self
+            .input(
+                kind.path(),
+                &[
+                    (kind.param(), name.to_owned()),
+                    ("state", pressed.to_string()),
+                ],
+            )
+            .await;
+        in_flight.finish(result.is_ok());
+        result
+    }
+
+    /// Releases every tracked key, then every tracked button, the caller holding the input lock. A failed release is tracked as uncertain and never resent.
     async fn release_locked(&self, inputs: &mut Inputs) -> Result<()> {
         let mut failed = false;
-        for key in inputs.keys.clone() {
-            if self
-                .input(
-                    "hid/events/send_key",
-                    &[("key", key.clone()), ("state", "false".into())],
-                )
-                .await
-                .is_ok()
-            {
-                inputs.keys.remove(&key);
-            } else {
-                inputs.keys.remove(&key);
-                inputs.uncertain_keys.insert(key);
-                inputs.indeterminate = true;
-                failed = true;
-            }
-        }
-        for button in inputs.buttons.clone() {
-            if self
-                .input(
-                    "hid/events/send_mouse_button",
-                    &[("button", button.clone()), ("state", "false".into())],
-                )
-                .await
-                .is_ok()
-            {
-                inputs.buttons.remove(&button);
-            } else {
-                inputs.buttons.remove(&button);
-                inputs.uncertain_buttons.insert(button);
-                inputs.indeterminate = true;
-                failed = true;
+        for kind in [Held::Key, Held::Button] {
+            for name in inputs.held(kind).clone() {
+                failed |= self.send_held(inputs, kind, &name, false).await.is_err();
             }
         }
         if failed || inputs.indeterminate {
@@ -803,6 +916,38 @@ impl Kvmd {
         } else {
             Ok(())
         }
+    }
+
+    /// Runs cleanup marked pending by a dropped input future, the caller holding the input lock. The flag is cleared only once cleanup has run, so a task interrupted mid-cleanup leaves it for the next lock holder.
+    async fn clean_pending(&self, inputs: &mut Inputs) {
+        if self.cleanup_pending.load(Ordering::SeqCst) {
+            if let Err(error) = self.release_locked(inputs).await {
+                eprintln!("Input cleanup uncertain: {error}");
+            }
+            self.cleanup_pending.store(false, Ordering::SeqCst);
+        }
+    }
+
+    /// Submits a press or release on a task that holds the input lock until the outcome is recorded, not until it is collected.
+    async fn held_input(&self, kind: Held, name: &str, pressed: bool) -> Result<()> {
+        let mut inputs = self.inputs.clone().lock_owned().await;
+        self.capture_input_runtime();
+        let worker = self.input_worker();
+        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+        let name = name.to_owned();
+        let collect = CollectGuard {
+            device: self,
+            armed: true,
+        };
+        tokio::spawn(async move {
+            worker.clean_pending(&mut inputs).await;
+            let result = worker.send_held(&mut inputs, kind, &name, pressed).await;
+            drop(inputs);
+            let _ = result_tx.send(result);
+        });
+        let result = result_rx.await;
+        collect.disarm();
+        result.map_err(|_| Error::AmbiguousInput("input task failed".into()))?
     }
 
     async fn input(&self, path: &str, params: &[(&str, String)]) -> Result<()> {
@@ -925,97 +1070,11 @@ impl Device for Kvmd {
     }
 
     async fn key(&self, key: &str, pressed: bool) -> Result<()> {
-        let mut inputs = self.inputs.clone().lock_owned().await;
-        self.capture_input_runtime();
-        let worker = self.input_worker();
-        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
-        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
-        let key = key.to_owned();
-        tokio::runtime::Handle::current().spawn(async move {
-            let result = worker
-                .input(
-                    "hid/events/send_key",
-                    &[("key", key.clone()), ("state", pressed.to_string())],
-                )
-                .await;
-            let result = match result {
-                Ok(()) => {
-                    if pressed {
-                        inputs.keys.insert(key);
-                    } else {
-                        inputs.keys.remove(&key);
-                    }
-                    Ok(())
-                }
-                Err(error) => {
-                    if pressed {
-                        inputs.keys.insert(key.clone());
-                    } else {
-                        inputs.keys.remove(&key);
-                    }
-                    inputs.uncertain_keys.insert(key);
-                    inputs.indeterminate = true;
-                    Err(error)
-                }
-            };
-            if (result_tx.send(result).is_err() || ack_rx.await.is_err())
-                && let Err(error) = worker.release_locked(&mut inputs).await
-            {
-                eprintln!("Input cleanup uncertain: {error}");
-            }
-        });
-        let result = result_rx
-            .await
-            .map_err(|_| Error::AmbiguousInput("input task failed".into()))?;
-        let _ = ack_tx.send(());
-        result
+        self.held_input(Held::Key, key, pressed).await
     }
 
     async fn mouse_button(&self, button: &str, pressed: bool) -> Result<()> {
-        let mut inputs = self.inputs.clone().lock_owned().await;
-        self.capture_input_runtime();
-        let worker = self.input_worker();
-        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
-        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
-        let button = button.to_owned();
-        tokio::runtime::Handle::current().spawn(async move {
-            let result = worker
-                .input(
-                    "hid/events/send_mouse_button",
-                    &[("button", button.clone()), ("state", pressed.to_string())],
-                )
-                .await;
-            let result = match result {
-                Ok(()) => {
-                    if pressed {
-                        inputs.buttons.insert(button);
-                    } else {
-                        inputs.buttons.remove(&button);
-                    }
-                    Ok(())
-                }
-                Err(error) => {
-                    if pressed {
-                        inputs.buttons.insert(button.clone());
-                    } else {
-                        inputs.buttons.remove(&button);
-                    }
-                    inputs.uncertain_buttons.insert(button);
-                    inputs.indeterminate = true;
-                    Err(error)
-                }
-            };
-            if (result_tx.send(result).is_err() || ack_rx.await.is_err())
-                && let Err(error) = worker.release_locked(&mut inputs).await
-            {
-                eprintln!("Input cleanup uncertain: {error}");
-            }
-        });
-        let result = result_rx
-            .await
-            .map_err(|_| Error::AmbiguousInput("input task failed".into()))?;
-        let _ = ack_tx.send(());
-        result
+        self.held_input(Held::Button, button, pressed).await
     }
 
     async fn mouse_move(&self, x: i16, y: i16) -> Result<()> {
@@ -1024,6 +1083,7 @@ impl Device for Kvmd {
         let worker = self.input_worker();
         tokio::spawn(async move {
             let mut inputs = inputs;
+            worker.clean_pending(&mut inputs).await;
             let active = worker.client.read().await;
             let state = worker.json_with(&active.client, "hid").await?;
             if hid_capability(&state, "mouse") != Capability::Supported
@@ -1033,6 +1093,9 @@ impl Device for Kvmd {
                     "absolute mouse movement requires an online absolute-mode mouse".into(),
                 ));
             }
+            // Marked before submission so a task dropped mid-request (runtime shutdown) leaves the session indeterminate.
+            let indeterminate = inputs.indeterminate;
+            inputs.indeterminate = true;
             let result = worker
                 .input_with(
                     &active.client,
@@ -1040,8 +1103,8 @@ impl Device for Kvmd {
                     &[("to_x", x.to_string()), ("to_y", y.to_string())],
                 )
                 .await;
-            if result.is_err() {
-                inputs.indeterminate = true;
+            if result.is_ok() {
+                inputs.indeterminate = indeterminate;
             }
             result
         })
@@ -1216,9 +1279,13 @@ impl Device for Kvmd {
         let mut inputs = self.inputs.clone().lock_owned().await;
         self.capture_input_runtime();
         let worker = self.input_worker();
-        tokio::spawn(async move { worker.release_locked(&mut inputs).await })
-            .await
-            .map_err(|_| Error::AmbiguousInput("release task failed".into()))?
+        tokio::spawn(async move {
+            let result = worker.release_locked(&mut inputs).await;
+            worker.cleanup_pending.store(false, Ordering::SeqCst);
+            result
+        })
+        .await
+        .map_err(|_| Error::AmbiguousInput("release task failed".into()))?
     }
 }
 
@@ -1469,6 +1536,7 @@ mod tests {
             video_proven: Default::default(),
             cleanup_on_drop: false,
             input_runtime: Default::default(),
+            cleanup_pending: Default::default(),
             stream_storage: Arc::new(tokio::sync::Semaphore::new(MAX_JPEG_VALIDATIONS)),
             snapshot_storage: Arc::new(tokio::sync::Semaphore::new(MAX_JPEG_VALIDATIONS)),
         };
@@ -1516,6 +1584,7 @@ mod tests {
             video_proven: Default::default(),
             cleanup_on_drop: false,
             input_runtime: Default::default(),
+            cleanup_pending: Default::default(),
             stream_storage: Arc::new(tokio::sync::Semaphore::new(MAX_JPEG_VALIDATIONS)),
             snapshot_storage: Arc::new(tokio::sync::Semaphore::new(MAX_JPEG_VALIDATIONS)),
         };

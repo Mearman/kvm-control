@@ -682,6 +682,41 @@ async fn cancelled_cleanup_precedes_later_input_and_explicit_release() {
     server.abort();
 }
 
+#[tokio::test]
+async fn completed_input_awaiting_collection_does_not_hold_the_input_lock() {
+    let (mut endpoint, ca, calls, server) = fixture().await;
+    endpoint.set_path("/gated/");
+    let device = client(endpoint, Some(ca));
+    let mut press = Box::pin(device.key("KeyA", true));
+    tokio::select! {
+        result = &mut press => panic!("input completed unexpectedly: {result:?}"),
+        () = calls.3.notified() => {}
+    }
+    calls.4.notify_one();
+    // The press completes while its future stays alive and unpolled.
+    let mut release = Box::pin(device.release_inputs());
+    tokio::select! {
+        result = &mut release => panic!("release completed unexpectedly: {result:?}"),
+        waited = tokio::time::timeout(Duration::from_secs(5), calls.3.notified()) => {
+            waited.expect("release waited on a lock held for an uncollected outcome");
+        }
+    }
+    assert!(
+        calls
+            .0
+            .lock()
+            .unwrap()
+            .last()
+            .unwrap()
+            .contains("key=KeyA&state=false")
+    );
+    calls.4.notify_one();
+    release.await.unwrap();
+    press.await.unwrap();
+    assert_eq!(calls.0.lock().unwrap().len(), 2);
+    server.abort();
+}
+
 #[test]
 fn input_future_dropped_outside_runtime_is_cleaned_up() {
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -714,6 +749,48 @@ fn input_future_dropped_outside_runtime_is_cleaned_up() {
         calls.4.notify_one();
         device.release_inputs().await.unwrap();
     });
+    server.abort();
+}
+
+#[test]
+fn input_interrupted_by_runtime_shutdown_stays_tracked_as_ambiguous() {
+    let server_runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let (mut endpoint, ca, calls, server) = server_runtime.block_on(fixture());
+    endpoint.set_path("/gated/");
+    let device = client(endpoint, Some(ca));
+    let input_runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let mut input = Box::pin(device.key("KeyA", true));
+    input_runtime.block_on(async {
+        tokio::select! {
+            result = &mut input => panic!("input completed unexpectedly: {result:?}"),
+            () = calls.3.notified() => {}
+        }
+    });
+    drop(input);
+    // Shutdown drops the input task while its request is still in flight.
+    drop(input_runtime);
+    server_runtime.block_on(async {
+        assert!(matches!(
+            device.login("test-user", "test-password").await,
+            Err(Error::AmbiguousInput(_))
+        ));
+    });
+    assert_eq!(
+        calls
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|v| v.contains("/hid/events/"))
+            .count(),
+        1
+    );
     server.abort();
 }
 
