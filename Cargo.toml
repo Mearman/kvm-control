@@ -5,6 +5,8 @@ members = ["crates/*"]
 [workspace.package]
 edition = "2024"
 license = "MIT"
+# The highest `rust-version` the locked dependencies declare, and no lower than 1.86, which trait upcasting from `Arc<dyn Connection>` to `Arc<dyn Device>` needs; raise it when Cargo.lock needs more.
+rust-version = "1.90"
 version = "0.1.0"
 
 [workspace.dependencies]
