@@ -171,7 +171,7 @@ async fn status(State(calls): State<Calls>, uri: Uri, headers: HeaderMap) -> imp
 /// - `slowstatus` never answers ATX, so the request's overall deadline ends that one request;
 /// - `downstatus` answers every route with HTTP 502, as a proxy does when its daemon is stopped;
 /// - `htmlstatus` answers every route with an HTML page, as a single-page application's catch-all does;
-/// - `ch9329status` answers HID in the shape of the CH9329 plugin, whose online flags are the integers `0` and `1`.
+/// - `ch9329status` answers HID in the shape of an online CH9329 plugin, whose online flags are the integer `1` (and `0` when offline, which the status unit tests cover).
 async fn typed_status(
     State(calls): State<Calls>,
     method: Method,
@@ -2524,7 +2524,7 @@ async fn unreadable_routes_are_unknown_and_an_unreadable_device_fails() {
 #[tokio::test]
 async fn a_timed_out_route_is_unknown_and_the_others_are_kept() {
     let (endpoint, ca, calls, server) = fixture().await;
-    // The ATX route never answers; only the request's overall deadline, twice `REQUEST_TIMEOUT` because the request reuses an established connection, ends it, and every other route answers at once.
+    // The ATX route never answers; only the request's overall deadline, twice `REQUEST_TIMEOUT` from sending, ends it, and every other route answers at once.
     let status = status_client(&endpoint, &ca, "slowstatus", DeviceProfile::PiKvm)
         .status()
         .await
