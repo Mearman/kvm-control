@@ -1423,15 +1423,16 @@ impl Device for Kvmd {
 
 impl Drop for Kvmd {
     fn drop(&mut self) {
-        // The runtime the owner is dropped on is running; outside one, the runtime that last took the input lock is the best remaining choice.
+        // Only a connection that has taken the input lock has inputs to release. The runtime the owner is dropped on is running, so it is preferred; outside one, the runtime that last took the input lock is the best remaining choice.
+        let last = self
+            .input_runtime
+            .lock()
+            .expect("input runtime lock poisoned")
+            .clone();
         if self.cleanup_on_drop
-            && let Some(runtime) = tokio::runtime::Handle::try_current().ok().or_else(|| {
-                self.input_runtime
-                    .lock()
-                    .expect("input runtime lock poisoned")
-                    .clone()
-            })
+            && let Some(last) = last
         {
+            let runtime = tokio::runtime::Handle::try_current().unwrap_or(last);
             let worker = self.input_worker();
             runtime.spawn(async move {
                 if let Err(error) = worker.release_inputs().await {
