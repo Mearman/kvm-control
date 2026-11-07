@@ -657,6 +657,25 @@ async fn drive<F: std::future::Future>(calls: &Calls, future: F) -> F::Output {
     }
 }
 
+/// Records when a manually polled future is woken, which for an input request means its outcome was delivered.
+struct Woken(tokio::sync::Notify);
+
+impl std::task::Wake for Woken {
+    fn wake(self: Arc<Self>) {
+        self.0.notify_one();
+    }
+}
+
+/// Polls `future` once with a waker that signals `woken`.
+fn poll_once<F: std::future::Future + ?Sized>(future: std::pin::Pin<&mut F>, woken: &Arc<Woken>) {
+    let waker = std::task::Waker::from(woken.clone());
+    assert!(
+        future
+            .poll(&mut std::task::Context::from_waker(&waker))
+            .is_pending()
+    );
+}
+
 /// Returns the recorded key and button events in order.
 fn input_events(calls: &Calls) -> Vec<String> {
     calls
@@ -863,6 +882,76 @@ fn input_interrupted_by_runtime_shutdown_stays_tracked_as_ambiguous() {
             "key=KeyA&state=true",
             "key=KeyA&state=false",
             "key=KeyB&state=true"
+        ]
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn delivered_but_uncollected_input_is_released_before_the_next_input() {
+    let (mut endpoint, ca, calls, server) = fixture().await;
+    endpoint.set_path("/gated/");
+    let device = client(endpoint, Some(ca));
+    let woken = Arc::new(Woken(tokio::sync::Notify::new()));
+    let mut press = Box::pin(device.key("KeyA", true));
+    poll_once(press.as_mut(), &woken);
+    calls.3.notified().await;
+    calls.4.notify_one();
+    // The outcome is delivered, waking the caller, which drops the future without collecting it.
+    woken.0.notified().await;
+    drop(press);
+    drive(&calls, device.key("KeyB", true)).await.unwrap();
+    assert_eq!(
+        input_events(&calls),
+        [
+            "key=KeyA&state=true",
+            "key=KeyA&state=false",
+            "key=KeyB&state=true"
+        ]
+    );
+    server.abort();
+}
+
+#[test]
+fn cleanup_interrupted_by_runtime_shutdown_stays_pending() {
+    let server_runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let (mut endpoint, ca, calls, server) = server_runtime.block_on(fixture());
+    endpoint.set_path("/gated/");
+    let device = client(endpoint, Some(ca));
+    let input_runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let woken = Arc::new(Woken(tokio::sync::Notify::new()));
+    let mut press = Box::pin(device.key("KeyB", true));
+    input_runtime.block_on(async {
+        drive(&calls, device.key("KeyA", true)).await.unwrap();
+        poll_once(press.as_mut(), &woken);
+        calls.3.notified().await;
+        calls.4.notify_one();
+        woken.0.notified().await;
+    });
+    // Dropping the delivered press marks cleanup pending and schedules it on the input runtime.
+    drop(press);
+    input_runtime.block_on(calls.3.notified());
+    assert_eq!(input_events(&calls).last().unwrap(), "key=KeyA&state=false");
+    // Shutdown drops the cleanup after it took the pending flag, with the KeyA release in flight and KeyB still held.
+    drop(input_runtime);
+    calls.4.notify_one();
+    server_runtime
+        .block_on(drive(&calls, device.key("KeyC", true)))
+        .unwrap();
+    assert_eq!(
+        input_events(&calls),
+        [
+            "key=KeyA&state=true",
+            "key=KeyB&state=true",
+            "key=KeyA&state=false",
+            "key=KeyB&state=false",
+            "key=KeyC&state=true",
         ]
     );
     server.abort();
