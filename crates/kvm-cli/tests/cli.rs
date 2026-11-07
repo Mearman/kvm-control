@@ -255,10 +255,12 @@ fn sigterm_during_key_press_releases_input() {
     let ok = b"{\"ok\":true,\"result\":{}}";
     let (output, requests) =
         invoke_with_signal("pikvm", &["key", "KeyA"], vec![ok, ok, ok, ok], true);
-    assert!(!output.status.success());
-    // The fake device closes the press connection once the signal is sent, so the press can fail before the CLI observes the signal; the CLI still reports the interruption because it collects a signal that arrives during the release.
+    // An exit status rather than death by the signal shows the handler was registered when the press was sent.
+    assert_eq!(output.status.code(), Some(1), "{}", output.status);
+    // The fake device signals the CLI and then closes the press connection without answering. Holding the connection open instead cannot make the signal end the press: the release waits for the input lock, which the submitted press holds until its request finishes, so the release would follow only the client's request timeout. The press therefore fails, and the interruption is reported because the signal, sent before the close, has been observed by the time the release round trip completes.
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("interrupted"), "{stderr}");
+    assert!(stderr.contains("interrupted; press: "), "{stderr}");
+    assert!(stderr.contains("; cleanup: confirmed"), "{stderr}");
     assert!(requests[2].starts_with("POST /api/hid/events/send_key?key=KeyA&state=true "));
     assert!(requests[3].starts_with("POST /api/hid/events/send_key?key=KeyA&state=false "));
 }
