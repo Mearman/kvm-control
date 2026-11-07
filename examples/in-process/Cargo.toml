@@ -2,6 +2,8 @@
 name = "kvm-in-process-example"
 version = "0.1.0"
 edition = "2024"
+# A workspace of its own, so it declares its own minimum: the highest `rust-version` its locked dependencies declare, and no lower than 1.86 for trait upcasting; raise it when its Cargo.lock needs more.
+rust-version = "1.88"
 publish = false
 
 # Its own workspace, so it resolves the crates as an outside consumer does; the lint tables repeat the repository workspace's, which tests/lints.rs checks.
@@ -28,7 +30,7 @@ workspace = true
 [dependencies]
 kvm-core = { path = "../../crates/kvm-core" }
 async-trait = "0.1"
-tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
 
 [dev-dependencies]
 kvm-kvmd = { path = "../../crates/kvm-kvmd" }
