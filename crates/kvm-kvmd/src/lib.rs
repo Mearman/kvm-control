@@ -1110,9 +1110,8 @@ impl Kvmd {
             else {
                 return;
             };
-            if inputs.last.get(&(kind, name.clone())) != Some(&sequence)
-                || !inputs.held(kind).contains(&name)
-            {
+            let _ = sequence;
+            if !inputs.held(kind).contains(&name) {
                 continue;
             }
             match self.send_held(inputs, kind, &name, false).await {
