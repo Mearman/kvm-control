@@ -556,18 +556,18 @@ async fn control_keeps_session_across_concurrent_relogin() {
             .control(Control::Power(PowerAction::Off), Confirmation::new())
             .await
     });
-    loop {
-        if calls
+    within("the capability request to start", async {
+        while !calls
             .0
             .lock()
             .unwrap()
             .iter()
             .any(|v| v == "capability-start")
         {
-            break;
+            tokio::task::yield_now().await;
         }
-        tokio::task::yield_now().await;
-    }
+    })
+    .await;
     let login_device = device.clone();
     let login_task = tokio::spawn(async move { login_device.login("test-user", "bad").await });
     assert_eq!(
@@ -593,18 +593,18 @@ async fn request_during_relogin_cannot_use_old_session() {
     device.login("test-user", "test-password").await.unwrap();
     let task_device = device.clone();
     let task = tokio::spawn(async move { task_device.login("test-user", "delay").await });
-    loop {
-        if calls
+    within("the delayed login to start", async {
+        while !calls
             .0
             .lock()
             .unwrap()
             .iter()
             .any(|v| v.contains("passwd=delay"))
         {
-            break;
+            tokio::task::yield_now().await;
         }
-        tokio::task::yield_now().await;
-    }
+    })
+    .await;
     assert!(matches!(
         device.check_auth().await,
         Err(Error::Authentication)
