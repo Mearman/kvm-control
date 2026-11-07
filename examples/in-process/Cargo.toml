@@ -4,7 +4,26 @@ version = "0.1.0"
 edition = "2024"
 publish = false
 
+# Its own workspace, so it resolves the crates as an outside consumer does; the lint tables repeat the repository workspace's, which tests/lints.rs checks.
 [workspace]
+
+[workspace.lints.rust]
+dead_code = "deny"
+unreachable_patterns = "deny"
+unsafe_code = "deny"
+unsafe_op_in_unsafe_fn = "deny"
+unused_imports = "deny"
+unused_must_use = "deny"
+unused_variables = "deny"
+
+[workspace.lints.clippy]
+dbg_macro = "deny"
+todo = "deny"
+undocumented_unsafe_blocks = "deny"
+unimplemented = "deny"
+
+[lints]
+workspace = true
 
 [dependencies]
 kvm-core = { path = "../../crates/kvm-core" }

@@ -783,6 +783,8 @@ mod tests {
     /// Signals this process after the handlers are registered but before their future is first polled. The child first restores the signal's default disposition and unblocks it, so a handler registered only on first poll lets the signal kill the child whatever the parent inherited, and the parent sees that in the child's exit status.
     #[cfg(unix)]
     #[test]
+    // Restoring the signal disposition and mask and signalling this process have no safe wrapper in the dependencies.
+    #[allow(unsafe_code)]
     fn termination_signals_are_handled_from_registration() {
         const CHILD: &str = "KVM_SIGNAL_REGISTRATION_TEST_CHILD";
         const NAME: &str = "tests::termination_signals_are_handled_from_registration";
