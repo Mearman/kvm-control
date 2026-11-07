@@ -20,7 +20,7 @@ const MAX_FRAME: usize = 16 * 1024 * 1024;
 const MAX_BOUNDARY: usize = 70;
 const PING_INTERVAL: Duration = Duration::from_secs(15);
 
-struct Mjpeg {
+struct Parser {
     response: reqwest::Response,
     boundary: Vec<u8>,
     buffer: Vec<u8>,
@@ -40,7 +40,7 @@ struct Mjpeg {
     proven: Arc<AtomicBool>,
 }
 
-impl Drop for Mjpeg {
+impl Drop for Parser {
     fn drop(&mut self) {
         self.lease.abort();
     }
@@ -158,7 +158,7 @@ pub(crate) async fn open(device: &Kvmd) -> Result<Box<dyn VideoStream>> {
         })
         .ok_or_else(|| Error::InvalidResponse("invalid multipart boundary".into()))?;
     let boundary = format!("--{boundary}").into_bytes();
-    Ok(Box::new(Mjpeg {
+    let parser = Parser {
         response,
         boundary,
         buffer: Vec::new(),
@@ -176,7 +176,67 @@ pub(crate) async fn open(device: &Kvmd) -> Result<Box<dyn VideoStream>> {
         first: true,
         ended: false,
         proven: device.video_proven.clone(),
-    }))
+    };
+    Ok(Box::new(Mjpeg::start(parser, device.config.timeout)))
+}
+
+// Requests carry no frame bytes; an abandoned consumer cannot retain an actor buffer.
+struct Mjpeg {
+    requests: tokio::sync::mpsc::Sender<tokio::sync::oneshot::Sender<Result<Option<Snapshot>>>>,
+    terminal: watch::Receiver<bool>,
+}
+
+impl Mjpeg {
+    fn start(mut parser: Parser, idle: Duration) -> Self {
+        let (requests, mut incoming) =
+            tokio::sync::mpsc::channel::<tokio::sync::oneshot::Sender<Result<Option<Snapshot>>>>(1);
+        let (terminal_tx, terminal) = watch::channel(false);
+        tokio::spawn(async move {
+            let mut pending = None;
+            loop {
+                let request = match tokio::time::timeout(idle, incoming.recv()).await {
+                    Ok(Some(request)) => request,
+                    Ok(None) => break,
+                    Err(_) => {
+                        let _ = terminal_tx.send(true);
+                        break;
+                    }
+                };
+                let result = match pending.take() {
+                    Some(result) => result,
+                    None => parser.next_frame().await,
+                };
+                let finished = !matches!(&result, Ok(Some(_))) || parser.ended;
+                if let Err(result) = request.send(result) {
+                    pending = Some(result);
+                } else if finished {
+                    break;
+                }
+            }
+        });
+        Self { requests, terminal }
+    }
+}
+
+#[async_trait]
+impl VideoStream for Mjpeg {
+    async fn next_frame(&mut self) -> Result<Option<Snapshot>> {
+        let (send, receive) = tokio::sync::oneshot::channel();
+        if self.requests.send(send).await.is_err() {
+            return if *self.terminal.borrow() {
+                Err(Error::Transport("video consumer idle timeout".into()))
+            } else {
+                Ok(None)
+            };
+        }
+        match receive.await {
+            Ok(result) => result,
+            Err(_) if *self.terminal.borrow() => {
+                Err(Error::Transport("video consumer idle timeout".into()))
+            }
+            Err(_) => Ok(None),
+        }
+    }
 }
 
 async fn send_ping<S: futures_util::Sink<Message> + Unpin>(
@@ -222,7 +282,7 @@ fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
         .position(|window| window == needle)
 }
 
-impl Mjpeg {
+impl Parser {
     fn absorb(&mut self, chunk: bytes::Bytes, limit: usize) -> Result<()> {
         absorb_chunk(&mut self.buffer, &mut self.pending, chunk, limit)
     }
@@ -285,7 +345,7 @@ impl Mjpeg {
 }
 
 #[async_trait]
-impl VideoStream for Mjpeg {
+impl VideoStream for Parser {
     async fn next_frame(&mut self) -> Result<Option<Snapshot>> {
         let result = self.read_frame().await;
         if result.is_err() || self.ended {
@@ -299,7 +359,7 @@ impl VideoStream for Mjpeg {
     }
 }
 
-impl Mjpeg {
+impl Parser {
     async fn read_frame(&mut self) -> Result<Option<Snapshot>> {
         if self.validation.is_some() {
             let result = self.validation.as_mut().expect("validation exists").await;
@@ -482,7 +542,7 @@ mod tests {
         let (_tx, lease_state) = watch::channel(true);
         let (progress_tx, mut progress_rx) = mpsc::unbounded_channel();
         let lease = tokio::spawn(std::future::pending());
-        let mut video = Mjpeg {
+        let mut video = Parser {
             response,
             boundary: b"--frame".to_vec(),
             buffer: Vec::new(),
@@ -518,6 +578,50 @@ mod tests {
         assert!(frame.len() > 64 * 258);
         assert!(video.proven.load(Ordering::Acquire));
         assert!(video.scanned < frame.len() + 64 * b"\r\n--frame".len() * 4);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn actor_idle_releases_storage_and_reports_timeout() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0; 1024];
+            socket.read(&mut request).await.unwrap();
+            socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: multipart/x-mixed-replace; boundary=frame\r\n\r\n").await.unwrap();
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        });
+        let response = reqwest::get(format!("http://{address}/")).await.unwrap();
+        let slots = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+        let storage = slots.clone().try_acquire_owned().unwrap();
+        let (_tx, lease_state) = watch::channel(true);
+        let parser = Parser {
+            response,
+            boundary: b"--frame".to_vec(),
+            buffer: Vec::new(),
+            pending: bytes::Bytes::new(),
+            storage: Some(std::sync::Arc::new(storage)),
+            validation: None,
+            scan_offset: 0,
+            scanned: 0,
+            scan_progress: None,
+            lease: tokio::spawn(std::future::pending()),
+            lease_state,
+            timeout: Duration::from_secs(1),
+            first: true,
+            ended: false,
+        };
+        let mut stream = Mjpeg::start(parser, Duration::from_millis(20));
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while slots.available_permits() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(stream.next_frame().await.is_err());
         server.await.unwrap();
     }
 
