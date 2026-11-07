@@ -358,8 +358,8 @@ struct Inputs {
     sequence: u64,
     // Set while an explicit release runs, so one interrupted by runtime shutdown is finished by the next lock holder.
     release_pending: bool,
-    // Whether a release has a failed or unconfirmed request that no caller or report has seen yet. Kept under the lock so a release interrupted by runtime shutdown, with no task left to report it, is reported or handed to a caller by the lock holder that finishes it, and cleared by whichever does so.
-    release_failed: bool,
+    // Whether a request has failed or was interrupted with no caller or report having seen it: a failed release, or any press, release or movement whose task was dropped mid-request (runtime shutdown). Kept under the lock so the next lock holder hands it to a waiting caller or reports it, and clears it by doing so.
+    unseen_failure: bool,
 }
 
 /// The release a press owes when its caller abandons it: the input and the sequence number of the request that pressed it.
@@ -465,6 +465,8 @@ impl Drop for InFlight<'_> {
         if !self.finished {
             self.inputs
                 .record(self.kind, self.name, self.pressed, false);
+            // No task remains to return or report this request's outcome.
+            self.inputs.unseen_failure = true;
         }
     }
 }
@@ -1050,18 +1052,14 @@ impl Kvmd {
         result
     }
 
-    /// Sends a release for every tracked input, the caller holding the input lock. `release_pending` stays set until every release has been attempted, and `release_failed` is set while a release is unconfirmed, so an interruption leaves both set; a release that finishes an interrupted one keeps its failure. The caller takes `release_failed` to hand it over or report it.
+    /// Sends a release for every tracked input, the caller holding the input lock. `release_pending` stays set until every release has been attempted, so an interruption leaves it set, and a failed release sets `unseen_failure` (an interrupted one sets it through `InFlight`). The caller takes `unseen_failure` to hand it over or report it.
     async fn release_held(&self, inputs: &mut Inputs) {
-        if !inputs.release_pending {
-            inputs.release_failed = false;
-        }
         inputs.release_pending = true;
         for kind in [Held::Key, Held::Button] {
             for name in inputs.held(kind).clone() {
-                let failed = inputs.release_failed;
-                inputs.release_failed = true;
-                let confirmed = self.send_held(inputs, kind, &name, false).await.is_ok();
-                inputs.release_failed = failed || !confirmed;
+                if self.send_held(inputs, kind, &name, false).await.is_err() {
+                    inputs.unseen_failure = true;
+                }
             }
         }
         inputs.release_pending = false;
@@ -1072,7 +1070,7 @@ impl Kvmd {
         let mut inputs = self.inputs.lock().await;
         self.settle_owed(&mut inputs).await;
         self.release_held(&mut inputs).await;
-        if std::mem::take(&mut inputs.release_failed) {
+        if std::mem::take(&mut inputs.unseen_failure) {
             self.report(
                 "Input cleanup uncertain: a release sent by a dropped owner was not confirmed",
             );
@@ -1081,12 +1079,12 @@ impl Kvmd {
 
     /// Sends cleanup owed to earlier requests, the caller holding the input lock: finishes an interrupted explicit release, then releases each input an abandoned press still holds unless a later request changed it. A confirmed owed release is recorded in `inputs.cleaned` unless the input is tracked as uncertain, since an earlier ambiguous press may still be applied after the release. An owed release interrupted by runtime shutdown is recorded as ambiguous by `send_held`, so it is never resent.
     async fn settle_owed(&self, inputs: &mut Inputs) {
-        // An interrupted release left its failure, or its unconfirmed request, unseen, since its task was dropped; no caller here receives it, so it is reported once together with any failure of the release that finishes it.
+        // A request interrupted by runtime shutdown, or the failure of a release whose task was then dropped, left no task to return or report it; no caller here receives it, so it is reported here, together with any failure of the release that finishes an interrupted one.
         if inputs.release_pending {
             self.release_held(inputs).await;
-            if std::mem::take(&mut inputs.release_failed) {
-                self.report("Input cleanup uncertain: an interrupted release was not confirmed");
-            }
+        }
+        if std::mem::take(&mut inputs.unseen_failure) {
+            self.report("Input cleanup uncertain: an interrupted request was not confirmed");
         }
         self.send_owed(inputs).await;
     }
@@ -1154,9 +1152,11 @@ impl Kvmd {
         if let Err(error) = checked {
             return Moved::NotSent(Err(error));
         }
-        // Marked before submission so a task dropped mid-request (runtime shutdown) leaves the session indeterminate.
+        // Marked before submission so a task dropped mid-request (runtime shutdown) leaves the session indeterminate and the interrupted movement unseen until the next lock holder reports it; once the outcome is known it goes to the caller or the reporter instead.
         let indeterminate = inputs.indeterminate;
+        let unseen = inputs.unseen_failure;
         inputs.indeterminate = true;
+        inputs.unseen_failure = true;
         let result = self
             .input_with(
                 &active.client,
@@ -1164,6 +1164,7 @@ impl Kvmd {
                 &[("to_x", x.to_string()), ("to_y", y.to_string())],
             )
             .await;
+        inputs.unseen_failure = unseen;
         if result.is_ok() {
             inputs.indeterminate = indeterminate;
         }
@@ -1565,9 +1566,9 @@ impl Device for Kvmd {
         };
         tokio::spawn(async move {
             worker.send_owed(&mut inputs).await;
-            // Finishes any interrupted release too, keeping its failure, so the caller is handed every failure no one has seen.
+            // Finishes any interrupted release too, so the caller is handed every failure or interrupted request no one has seen.
             worker.release_held(&mut inputs).await;
-            let failed = std::mem::take(&mut inputs.release_failed);
+            let failed = std::mem::take(&mut inputs.unseen_failure);
             let result = if failed || inputs.indeterminate {
                 Err(Error::AmbiguousInput(
                     "input session remains indeterminate after an ambiguous operation".into(),
@@ -1575,7 +1576,7 @@ impl Device for Kvmd {
             } else {
                 Ok(())
             };
-            // A caller that has gone is not handed the failure, so it is reported here instead; an indeterminate session with no new failure was already returned or reported.
+            // A caller that has gone is not handed the failure, so it is reported here instead; an indeterminate session with no unseen failure was already returned to a caller or reported.
             if let Err((Err(error), true)) = result_tx.send((result, failed)) {
                 worker.report_abandoned(&error);
             }

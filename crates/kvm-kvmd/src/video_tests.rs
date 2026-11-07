@@ -684,6 +684,74 @@ async fn failed_outcome_of_an_abandoned_press_is_reported_once() {
 }
 
 #[tokio::test]
+async fn owed_release_interrupted_by_runtime_shutdown_is_reported() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut device = input_device(listener.local_addr().unwrap());
+    let reports = capture_reports(&mut device);
+    let device = Arc::new(device);
+    let (pressed_tx, pressed_rx) = tokio::sync::oneshot::channel();
+    let (answer_tx, answer_rx) = tokio::sync::oneshot::channel();
+    let (releasing_tx, releasing_rx) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        let (mut press, _) = listener.accept().await.unwrap();
+        assert!(
+            read_input_request(&mut press)
+                .await
+                .contains("key=KeyA&state=true")
+        );
+        pressed_tx.send(()).unwrap();
+        answer_rx.await.unwrap();
+        respond(&mut press, "200 OK", b"{\"ok\":true}").await;
+        // The abandoned press's own task sends the release it owes, held unanswered while its runtime shuts down.
+        let (mut owed, _) = listener.accept().await.unwrap();
+        assert!(
+            read_input_request(&mut owed)
+                .await
+                .contains("key=KeyA&state=false")
+        );
+        releasing_tx.send(()).unwrap();
+        let (mut press, _) = listener.accept().await.unwrap();
+        assert!(
+            read_input_request(&mut press)
+                .await
+                .contains("key=KeyC&state=true")
+        );
+        respond(&mut press, "200 OK", b"{\"ok\":true}").await;
+        drop(owed);
+        listener
+    });
+    let pressing = device.clone();
+    tokio::task::spawn_blocking(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async move {
+            let press = tokio::spawn(async move { pressing.key("KeyA", true).await });
+            pressed_rx.await.unwrap();
+            press.abort();
+            assert!(press.await.unwrap_err().is_cancelled());
+            answer_tx.send(()).unwrap();
+            releasing_rx.await.unwrap();
+        });
+        // Shutdown drops the press's task with its owed release in flight; the owed entry is already taken and no release is pending, so only the interrupted request marks it.
+    })
+    .await
+    .unwrap();
+    assert_eq!(*reports.lock().unwrap(), Vec::<String>::new());
+    device.key("KeyC", true).await.unwrap();
+    let listener = tokio::time::timeout(INPUT_TIMEOUT, server)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        *reports.lock().unwrap(),
+        ["Input cleanup uncertain: an interrupted request was not confirmed"]
+    );
+    assert_no_waiting_connection(listener, "the interrupted owed release was sent again");
+}
+
+#[tokio::test]
 async fn release_interrupted_by_runtime_shutdown_is_reported_once_by_the_next_lock_holder() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let mut device = input_device(listener.local_addr().unwrap());
@@ -747,7 +815,7 @@ async fn release_interrupted_by_runtime_shutdown_is_reported_once_by_the_next_lo
         .unwrap();
     assert_eq!(
         *reports.lock().unwrap(),
-        ["Input cleanup uncertain: an interrupted release was not confirmed"]
+        ["Input cleanup uncertain: an interrupted request was not confirmed"]
     );
     assert_no_waiting_connection(listener, "the interrupted release was sent again");
 }
