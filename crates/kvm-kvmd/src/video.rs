@@ -329,13 +329,18 @@ impl VideoStream for Mjpeg {
                                 .expect("live delivery owns storage"),
                         )));
                         self.final_storage = Some(storage.clone());
-                        let result = delivery.result.clone();
+                        let result = std::sync::Arc::downgrade(&delivery.result);
+                        let storage = std::sync::Arc::downgrade(&storage);
                         let idle = self.idle;
                         tokio::spawn(async move {
                             tokio::time::sleep(idle).await;
-                            let mut result = result.lock().expect("delivery lock poisoned");
-                            result.take();
-                            storage.lock().expect("storage lock poisoned").take();
+                            if let Some(result) = result.upgrade() {
+                                let mut result = result.lock().expect("delivery lock poisoned");
+                                result.take();
+                                if let Some(storage) = storage.upgrade() {
+                                    storage.lock().expect("storage lock poisoned").take();
+                                }
+                            }
                         });
                         delivery
                             .claimed
@@ -865,6 +870,54 @@ mod tests {
             stream.next_frame().await.unwrap().unwrap().jpeg,
             vec![1, 2, 3]
         );
+        assert_eq!(slots.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn cancelled_terminal_result_drop_releases_capacity() {
+        let slots = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+        let permit = std::sync::Arc::new(slots.clone().try_acquire_owned().unwrap());
+        let (requests, mut incoming) =
+            tokio::sync::mpsc::channel::<tokio::sync::oneshot::Sender<Delivery>>(1);
+        let (_terminal_tx, terminal) = watch::channel(false);
+        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let actor = tokio::spawn(async move {
+            let request = incoming.recv().await.unwrap();
+            let (acknowledged, ack) = tokio::sync::oneshot::channel();
+            request
+                .send(Delivery {
+                    result: std::sync::Arc::new(std::sync::Mutex::new(Some(Ok(Some(Snapshot {
+                        jpeg: vec![1, 2, 3],
+                    }))))),
+                    acknowledged,
+                    finished: true,
+                    claimed: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                    storage: std::sync::Arc::downgrade(&permit),
+                })
+                .unwrap_or_else(|_| panic!("request closed"));
+            assert!(ack.await.unwrap());
+            ack_tx.send(()).unwrap();
+            release_rx.await.unwrap();
+            drop(permit);
+        });
+        let mut stream = Mjpeg {
+            requests,
+            terminal,
+            actor,
+            final_result: None,
+            final_storage: None,
+            idle: Duration::from_secs(60),
+        };
+        let mut first = Box::pin(stream.next_frame());
+        tokio::select! { result = &mut first => panic!("completed before cleanup: {result:?}"), result = ack_rx => result.unwrap() }
+        drop(first);
+        release_tx.send(()).unwrap();
+        while !stream.actor.is_finished() {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(slots.available_permits(), 0);
+        drop(stream);
         assert_eq!(slots.available_permits(), 1);
     }
 
