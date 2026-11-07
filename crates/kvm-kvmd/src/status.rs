@@ -2,7 +2,7 @@
 //!
 //! Response shapes follow PiKVM `kvmd` revision fcb903eb3be70d8eee4aee99e5fcc1c743e3ccef and GLKVM `glkvm` revision 3e8dd23c4bd638a4650433664cc3b0f3b4d29395: the [PiKVM](https://github.com/pikvm/kvmd/blob/fcb903eb3be70d8eee4aee99e5fcc1c743e3ccef/kvmd/apps/kvmd/info/__init__.py) and [GLKVM](https://github.com/gl-inet/glkvm/blob/3e8dd23c4bd638a4650433664cc3b0f3b4d29395/kvmd/apps/kvmd/info/__init__.py) info managers, the [PiKVM](https://github.com/pikvm/kvmd/blob/fcb903eb3be70d8eee4aee99e5fcc1c743e3ccef/kvmd/plugins/hid/otg/__init__.py) and [GLKVM](https://github.com/gl-inet/glkvm/blob/3e8dd23c4bd638a4650433664cc3b0f3b4d29395/kvmd/plugins/hid/otg/__init__.py) OTG HID plugins, the [PiKVM](https://github.com/pikvm/kvmd/blob/fcb903eb3be70d8eee4aee99e5fcc1c743e3ccef/kvmd/apps/kvmd/streamer/__init__.py) and [GLKVM](https://github.com/gl-inet/glkvm/blob/3e8dd23c4bd638a4650433664cc3b0f3b4d29395/kvmd/apps/kvmd/streamer.py) streamer managers with uStreamer's [state handler](https://github.com/pikvm/ustreamer/blob/11fd828ab00c01a39bd0843ef442ef0b6d3cac41/src/ustreamer/http/server.c), the [PiKVM](https://github.com/pikvm/kvmd/blob/fcb903eb3be70d8eee4aee99e5fcc1c743e3ccef/kvmd/plugins/atx/gpio.py) and [GLKVM](https://github.com/gl-inet/glkvm/blob/3e8dd23c4bd638a4650433664cc3b0f3b4d29395/kvmd/plugins/atx/gpio.py) ATX plugins, the [PiKVM](https://github.com/pikvm/kvmd/blob/fcb903eb3be70d8eee4aee99e5fcc1c743e3ccef/kvmd/apps/kvmd/switch/state.py) and [GLKVM](https://github.com/gl-inet/glkvm/blob/3e8dd23c4bd638a4650433664cc3b0f3b4d29395/kvmd/apps/kvmd/switch/state.py) switch state, the [PiKVM](https://github.com/pikvm/kvmd/blob/fcb903eb3be70d8eee4aee99e5fcc1c743e3ccef/kvmd/apps/kvmd/ugpio.py) and [GLKVM](https://github.com/gl-inet/glkvm/blob/3e8dd23c4bd638a4650433664cc3b0f3b4d29395/kvmd/apps/kvmd/ugpio.py) user GPIO, and the [PiKVM](https://github.com/pikvm/kvmd/blob/fcb903eb3be70d8eee4aee99e5fcc1c743e3ccef/kvmd/plugins/msd/otg/__init__.py) and [GLKVM](https://github.com/gl-inet/glkvm/blob/3e8dd23c4bd638a4650433664cc3b0f3b4d29395/kvmd/plugins/msd/otg/__init__.py) OTG media plugins. These are source revisions, not firmware releases, and no physical device has been read.
 //!
-//! Profile differences in those sources: only PiKVM reports per-button ATX activity (`acts`), only GLKVM reports a partition-backed media drive (`drive_partition`) and the `h265`, `zero_delay` and `venc_mode` streamer features, and GLKVM hard-codes the switch's `synced` flag and the streamer version in its system information, so those are reported as unknown for that profile. A field present in a response is read whatever the profile.
+//! Profile differences in those sources: only PiKVM reports per-button ATX activity (`acts`), only GLKVM reports a partition-backed media drive (`drive_partition`) and the `h265`, `zero_delay` and `venc_mode` streamer features, and GLKVM hard-codes the switch's `synced` flag and, in its system information, the streamer version and the platform type, so those are reported as unknown for that profile. A field present in a response is read whatever the profile.
 
 use kvm_core::{
     AtxStatus, DeviceProfile, DeviceStatus, Error, GpioInput, GpioOutput, GpioStatus, HidOutputs,
@@ -27,10 +27,12 @@ pub(crate) enum Read {
     /// The session may not read the route.
     #[default]
     Denied,
+    /// The route answered but its state could not be read: an HTTP error status, `ok: false`, a missing result, malformed JSON or an oversized body.
+    Failed,
 }
 
 impl Kvmd {
-    /// Reads every state route with GET requests only, so reading status sends no input or control request.
+    /// Reads every state route with GET requests only, so reading status sends no input or control request. A route that fails is reported unknown without discarding the others; only a transport failure, which leaves the connection itself in doubt, fails the whole status.
     pub(crate) async fn read_status(&self) -> Result<DeviceStatus> {
         let active = self.client.read().await;
         let mut reads: [Read; 7] = Default::default();
@@ -39,15 +41,21 @@ impl Kvmd {
                 Ok(state) => Read::State(state),
                 Err(Error::Http(404)) => Read::Absent,
                 Err(Error::Authentication) => Read::Denied,
-                Err(error) => return Err(error),
+                Err(error @ Error::Transport(_)) => return Err(error),
+                Err(_) => Read::Failed,
             };
         }
         parse(self.profile, reads)
     }
 }
 
-/// Builds a typed status from the route reads, in `ROUTES` order. Fails with an authentication error when no route could be read and at least one was denied, since such a session has observed nothing.
+/// Builds a typed status from the route reads, in `ROUTES` order.
+///
+/// Both inspected sources always serve the info route, so a 404 there means the endpoint is not a KVMD API and fails with that HTTP error rather than reporting every subsystem unsupported. Fails with an authentication error when no route could be read and at least one was denied, since such a session has observed nothing.
 pub(crate) fn parse(profile: DeviceProfile, reads: [Read; 7]) -> Result<DeviceStatus> {
+    if matches!(reads[0], Read::Absent) {
+        return Err(Error::Http(404));
+    }
     if !reads.iter().any(|read| matches!(read, Read::State(_)))
         && reads.iter().any(|read| matches!(read, Read::Denied))
     {
@@ -65,9 +73,7 @@ pub(crate) fn parse(profile: DeviceProfile, reads: [Read; 7]) -> Result<DeviceSt
         atx: section(atx, |state| {
             enabled(state, |state| atx_status(profile, state))
         }),
-        switch: section(switch, |state| {
-            Reported::Supported(switch_status(profile, state))
-        }),
+        switch: section(switch, |state| switch_status(profile, state)),
         gpio: section(gpio, |state| Reported::Supported(gpio_status(state))),
         media: section(msd, |state| {
             enabled(state, |state| media_status(profile, state))
@@ -75,11 +81,11 @@ pub(crate) fn parse(profile: DeviceProfile, reads: [Read; 7]) -> Result<DeviceSt
     })
 }
 
-/// A subsystem's status: unsupported when its route is absent, unknown when it was denied or is not an object.
+/// A subsystem's status: unsupported when its route is absent, unknown when it was denied, failed or is not an object.
 fn section<T>(read: Read, parse: impl FnOnce(&Value) -> Reported<T>) -> Reported<T> {
     match read {
         Read::State(state) if state.is_object() => parse(&state),
-        Read::State(_) | Read::Denied => Reported::Unknown,
+        Read::State(_) | Read::Denied | Read::Failed => Reported::Unknown,
         Read::Absent => Reported::Unsupported,
     }
 }
@@ -187,7 +193,11 @@ fn system_info(profile: DeviceProfile, state: &Value) -> SystemInfo {
         }),
         platform: match platform {
             Some(platform) if platform.is_object() => Reported::Supported(PlatformInfo {
-                kind: text(platform, "/type"),
+                kind: match profile {
+                    DeviceProfile::PiKvm => text(platform, "/type"),
+                    // GLKVM's system information reports the fixed type `rpi` whatever the hardware.
+                    DeviceProfile::GlKvm => Reported::Unknown,
+                },
                 base: text(platform, "/base"),
                 serial: text(platform, "/serial"),
                 model: text(platform, "/model"),
@@ -227,14 +237,22 @@ fn hid_status(state: &Value) -> HidStatus {
         busy: boolean(state, "/busy"),
         // PiKVM's OTG plugin reports `null` here, which is unknown rather than disconnected.
         connected: boolean(state, "/connected"),
-        keyboard: nested(state, "/keyboard", |keyboard| KeyboardStatus {
-            online: boolean(keyboard, "/online"),
-            leds: nested(keyboard, "/leds", |leds| KeyboardLeds {
-                caps: boolean(leds, "/caps"),
-                scroll: boolean(leds, "/scroll"),
-                num: boolean(leds, "/num"),
-            }),
-            outputs: hid_outputs(keyboard),
+        keyboard: nested(state, "/keyboard", |keyboard| {
+            let online = boolean(keyboard, "/online");
+            KeyboardStatus {
+                // The LEDs start as all off and are only updated by the attached host while the keyboard is online, so offline they are not an observation.
+                leds: if online == Reported::Supported(true) {
+                    nested(keyboard, "/leds", |leds| KeyboardLeds {
+                        caps: boolean(leds, "/caps"),
+                        scroll: boolean(leds, "/scroll"),
+                        num: boolean(leds, "/num"),
+                    })
+                } else {
+                    Reported::Unknown
+                },
+                online,
+                outputs: hid_outputs(keyboard),
+            }
         }),
         mouse: nested(state, "/mouse", |mouse| MouseStatus {
             online: boolean(mouse, "/online"),
@@ -308,19 +326,25 @@ fn streamer_status(profile: DeviceProfile, state: &Value) -> StreamerStatus {
             text(streamer, "/encoder/type")
         }),
         source: running.map_or(Reported::Unknown, |streamer| {
-            nested(streamer, "/source", |source| VideoSource {
-                online: boolean(source, "/online"),
-                resolution: {
-                    let width = source.pointer("/resolution/width").and_then(count32);
-                    let height = source.pointer("/resolution/height").and_then(count32);
-                    match (width, height) {
-                        (Some(width), Some(height)) => {
-                            Reported::Supported(Resolution { width, height })
+            nested(streamer, "/source", |source| {
+                let online = boolean(source, "/online");
+                VideoSource {
+                    // Without a signal uStreamer still reports a resolution, which is then not the source's.
+                    resolution: if online == Reported::Supported(true) {
+                        let width = source.pointer("/resolution/width").and_then(count32);
+                        let height = source.pointer("/resolution/height").and_then(count32);
+                        match (width, height) {
+                            (Some(width), Some(height)) => {
+                                Reported::Supported(Resolution { width, height })
+                            }
+                            _ => Reported::Unknown,
                         }
-                        _ => Reported::Unknown,
-                    }
-                },
-                captured_fps: number32(source, "/captured_fps"),
+                    } else {
+                        Reported::Unknown
+                    },
+                    online,
+                    captured_fps: number32(source, "/captured_fps"),
+                }
             })
         }),
         clients: running.map_or(Reported::Unknown, |streamer| {
@@ -341,8 +365,16 @@ fn atx_status(profile: DeviceProfile, state: &Value) -> AtxStatus {
     }
 }
 
-fn switch_status(profile: DeviceProfile, state: &Value) -> SwitchStatus {
-    SwitchStatus {
+/// A switch whose port list is empty is unsupported, as in capability discovery: PiKVM reports an empty list, with its initial `active_port: -1` and `synced: true`, when no switch is attached or its units are not ready.
+fn switch_status(profile: DeviceProfile, state: &Value) -> Reported<SwitchStatus> {
+    if state
+        .pointer("/model/ports")
+        .and_then(Value::as_array)
+        .is_some_and(Vec::is_empty)
+    {
+        return Reported::Unsupported;
+    }
+    Reported::Supported(SwitchStatus {
         ports: extract(state.pointer("/model/ports"), |ports| {
             Some(
                 (0_u32..)
@@ -371,7 +403,7 @@ fn switch_status(profile: DeviceProfile, state: &Value) -> SwitchStatus {
             // GLKVM's switch state always reports `true`, which is not an observation of synchronisation.
             DeviceProfile::GlKvm => Reported::Unknown,
         },
-    }
+    })
 }
 
 fn gpio_status(state: &Value) -> GpioStatus {
@@ -505,6 +537,7 @@ mod tests {
         assert_eq!(supported(&info.kernel).machine, some("aarch64"));
         // PiKVM's legacy info response carries the platform under `hw`.
         assert_eq!(supported(&info.platform).model, some("synthetic"));
+        assert_eq!(supported(&info.platform).kind, some("rpi"));
         assert_eq!(info.host, some("pikvm.example"));
 
         let hid = supported(&status.hid);
@@ -604,6 +637,8 @@ mod tests {
         let platform = supported(&info.platform);
         assert_eq!(platform.serial, some("1111111111111111"));
         assert_eq!(platform.model, Reported::Unknown);
+        // GLKVM reports the fixed platform type `rpi` whatever the hardware.
+        assert_eq!(platform.kind, Reported::Unknown);
         assert_eq!(info.host, some("glkvm.example"));
 
         let hid = supported(&status.hid);
@@ -633,7 +668,10 @@ mod tests {
         assert_eq!(atx.reset_busy, Reported::Unsupported);
 
         let switch = supported(&status.switch);
-        assert_eq!(supported(&switch.ports)[1].name, some("Lab"));
+        let ports = supported(&switch.ports);
+        assert_eq!(ports.len(), 4);
+        assert_eq!(ports[1].name, some("Lab"));
+        assert_eq!(ports[3].id, some("1.4"));
         assert_eq!(switch.active_port, Reported::Supported(None));
         assert_eq!(switch.synced, Reported::Unknown);
 
@@ -688,6 +726,7 @@ mod tests {
         let status = parse(
             DeviceProfile::GlKvm,
             ROUTES.map(|route| match route {
+                "info" => Read::State(json!({})),
                 "atx" => Read::State(json!({"leds": {"power": true}})),
                 "msd" => Read::State(json!({"online": true})),
                 _ => Read::Absent,
@@ -697,7 +736,81 @@ mod tests {
         // A subsystem that does not say whether it is enabled is unknown, as in capability discovery.
         assert_eq!(status.atx, Reported::Unknown);
         assert_eq!(status.media, Reported::Unknown);
-        assert_eq!(status.info.capability(), Capability::Unsupported);
+        assert_eq!(status.hid, Reported::Unsupported);
+        assert_eq!(status.switch, Reported::Unsupported);
+    }
+
+    #[test]
+    fn a_failed_route_is_unknown_without_discarding_the_others() {
+        for (index, route) in ROUTES.iter().enumerate() {
+            let responses = fixture(DeviceProfile::PiKvm);
+            let mut reads = reads(&responses);
+            reads[index] = Read::Failed;
+            let status = parse(DeviceProfile::PiKvm, reads).unwrap();
+            let capabilities = [
+                status.info.capability(),
+                status.hid.capability(),
+                status.streamer.capability(),
+                status.atx.capability(),
+                status.switch.capability(),
+                status.gpio.capability(),
+                status.media.capability(),
+            ];
+            for (other, capability) in capabilities.iter().enumerate() {
+                let expected = if other == index {
+                    Capability::Unknown
+                } else {
+                    Capability::Supported
+                };
+                assert_eq!(
+                    *capability, expected,
+                    "{route} failed, {} read",
+                    ROUTES[other]
+                );
+            }
+        }
+        // Only failures, with nothing denied, are an all-unknown status rather than an authentication failure.
+        let mut failed: [Read; 7] = std::array::from_fn(|_| Read::Failed);
+        assert_eq!(
+            parse(DeviceProfile::GlKvm, failed).unwrap().media,
+            Reported::Unknown
+        );
+        failed = std::array::from_fn(|_| Read::Failed);
+        failed[2] = Read::Denied;
+        assert!(matches!(
+            parse(DeviceProfile::GlKvm, failed),
+            Err(Error::Authentication)
+        ));
+    }
+
+    #[test]
+    fn an_empty_switch_inventory_is_unsupported() {
+        // PiKVM's switch state before any unit is ready, which is also what a device without a switch serves.
+        let responses = json!({"model": {"firmware": {"version": 7}, "units": [], "ports": [], "limits": {}}, "summary": {"active_port": -1, "active_id": "", "synced": true}});
+        for profile in [DeviceProfile::PiKvm, DeviceProfile::GlKvm] {
+            assert_eq!(switch_status(profile, &responses), Reported::Unsupported);
+        }
+        let mut responses = fixture(DeviceProfile::PiKvm);
+        responses["switch"]["model"]["ports"] = json!([]);
+        let status = parse(DeviceProfile::PiKvm, reads(&responses)).unwrap();
+        assert_eq!(status.switch, Reported::Unsupported);
+    }
+
+    #[test]
+    fn placeholder_values_of_offline_devices_are_unknown() {
+        let mut responses = fixture(DeviceProfile::PiKvm);
+        responses["hid"]["keyboard"]["online"] = json!(false);
+        responses["streamer"]["streamer"]["source"]["online"] = json!(false);
+        responses["streamer"]["streamer"]["source"]["captured_fps"] = json!(0);
+        let status = parse(DeviceProfile::PiKvm, reads(&responses)).unwrap();
+        let keyboard = supported(&supported(&status.hid).keyboard);
+        assert_eq!(keyboard.online, Reported::Supported(false));
+        assert_eq!(keyboard.leds, Reported::Unknown);
+        let source = supported(&supported(&status.streamer).source);
+        assert_eq!(source.online, Reported::Supported(false));
+        assert_eq!(source.resolution, Reported::Unknown);
+        // A source without a signal genuinely captures no frames.
+        assert_eq!(source.captured_fps, Reported::Supported(0));
     }
 
     #[test]
@@ -717,9 +830,17 @@ mod tests {
         let status = parse(DeviceProfile::PiKvm, partial).unwrap();
         assert_eq!(status.hid.capability(), Capability::Supported);
         assert_eq!(status.info, Reported::Unknown);
-        let absent = parse(DeviceProfile::PiKvm, ROUTES.map(|_| Read::Absent)).unwrap();
-        assert_eq!(absent.info, Reported::Unsupported);
-        assert_eq!(absent.media, Reported::Unsupported);
+        // Both sources always serve the info route, so its absence means the endpoint is not a KVMD API.
+        let mut info_absent = reads(&fixture(DeviceProfile::GlKvm));
+        info_absent[0] = Read::Absent;
+        assert!(matches!(
+            parse(DeviceProfile::GlKvm, info_absent),
+            Err(Error::Http(404))
+        ));
+        assert!(matches!(
+            parse(DeviceProfile::PiKvm, ROUTES.map(|_| Read::Absent)),
+            Err(Error::Http(404))
+        ));
     }
 
     #[test]
@@ -731,8 +852,8 @@ mod tests {
         }
     }
 
-    /// Keys the parser looks for, so generated responses reach its branches rather than only its unknown cases.
-    const KEYS: &str = "enabled online busy state leds power hdd acts model ports summary active_port synced inputs outputs drive image name storage images parts system platform hw streamer source features params limits keyboard mouse available active jiggler drive_partition scheme switch";
+    /// Every object key the parser reads, at any depth, so generated responses can reach its supported leaves rather than only its unknown cases.
+    const KEYS: &str = "enabled online busy connected state leds power hdd caps scroll num acts reset model ports unit channel id name summary active_port synced inputs outputs scheme switch drive drive_partition image cdrom rw size complete removable free writable storage images parts system kvmd version streamer app kernel release machine platform type base serial video board hw meta server host keyboard mouse absolute available active jiggler interval features quality resolution h264 h265 zero_delay venc_mode params desired_fps h264_bitrate h264_gop limits available_resolutions min max encoder source width height captured_fps stream clients";
 
     fn json_value() -> impl Strategy<Value = Value> {
         let leaf = prop_oneof![
@@ -854,14 +975,20 @@ mod tests {
             synced in any::<bool>(),
             profile in profile(),
         ) {
-            let switch = switch_status(profile, &json!({"summary": {"active_port": active, "synced": synced}}));
+            let switch = switch_status(profile, &json!({"model": {"ports": [{}]}, "summary": {"active_port": active, "synced": synced}}));
+            let Reported::Supported(switch) = switch else {
+                panic!("a switch with a port is supported");
+            };
             let expected = if active < 0 {
                 Reported::Supported(None)
             } else {
                 u32::try_from(active).map_or(Reported::Unknown, |port| Reported::Supported(Some(port)))
             };
             prop_assert_eq!(switch.active_port, expected);
-            prop_assert_eq!(switch.ports, Reported::Unknown);
+            let ports = switch.ports.value().unwrap();
+            prop_assert_eq!(ports.len(), 1);
+            prop_assert_eq!(ports[0].port, 0);
+            prop_assert_eq!(&ports[0].unit, &Reported::Unknown);
             let synced = if profile == DeviceProfile::PiKvm { Reported::Supported(synced) } else { Reported::Unknown };
             prop_assert_eq!(switch.synced, synced);
         }
