@@ -748,6 +748,63 @@ async fn owed_release_interrupted_by_runtime_shutdown_is_reported() {
     assert_no_waiting_connection(listener, "the interrupted owed release was sent again");
 }
 
+/// Records when a manually polled future is woken, which for an input request means its outcome was delivered.
+struct Woken(Notify);
+
+impl std::task::Wake for Woken {
+    fn wake(self: Arc<Self>) {
+        self.0.notify_one();
+    }
+}
+
+#[tokio::test]
+async fn failed_movement_delivered_but_uncollected_is_reported() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut device = input_device(listener.local_addr().unwrap());
+    let reports = capture_reports(&mut device);
+    let server = tokio::spawn(async move {
+        let (mut state, _) = listener.accept().await.unwrap();
+        assert!(read_request(&mut state).await.contains("/api/hid "));
+        respond(
+            &mut state,
+            "200 OK",
+            b"{\"ok\":true,\"result\":{\"enabled\":true,\"mouse\":{\"online\":true,\"absolute\":true}}}",
+        )
+        .await;
+        let (mut movement, _) = listener.accept().await.unwrap();
+        assert!(
+            read_request(&mut movement)
+                .await
+                .contains("send_mouse_move")
+        );
+        respond(&mut movement, "500 Internal Server Error", b"").await;
+    });
+    let woken = Arc::new(Woken(Notify::new()));
+    let waker = std::task::Waker::from(woken.clone());
+    let mut movement = Box::pin(device.mouse_move(1, 2));
+    assert!(
+        movement
+            .as_mut()
+            .poll(&mut std::task::Context::from_waker(&waker))
+            .is_pending()
+    );
+    // The failed outcome is delivered, waking the caller, which drops the future without reading it.
+    tokio::time::timeout(INPUT_TIMEOUT, woken.0.notified())
+        .await
+        .unwrap();
+    drop(movement);
+    tokio::time::timeout(INPUT_TIMEOUT, server)
+        .await
+        .unwrap()
+        .unwrap();
+    let reports = reports.lock().unwrap().clone();
+    assert_eq!(reports.len(), 1, "{reports:?}");
+    assert!(
+        reports[0].starts_with("Input outcome uncertain for an abandoned request: "),
+        "{reports:?}"
+    );
+}
+
 #[tokio::test]
 async fn movement_interrupted_by_runtime_shutdown_is_reported_by_the_next_lock_holder() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

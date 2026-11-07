@@ -511,7 +511,7 @@ impl Drop for TaskLock {
     }
 }
 
-/// Owns an explicit release's outcome for the caller, and whether it holds a failure no one has seen: a failed release, or a request interrupted by runtime shutdown. Dropped before collecting, it reports that failure, since no caller will see it; an outcome not yet delivered is reported by the release task when delivery fails.
+/// Owns an explicit release's or a movement's outcome for the caller, and whether a failed outcome needs reporting if no caller sees it: for a release, a failure no one has seen (a failed release, or a request interrupted by runtime shutdown); for a movement, a submitted movement. Dropped before collecting, it reports that failure, since no caller will see it; an outcome not yet delivered is reported by the release task when delivery fails.
 struct Handover<'a> {
     device: &'a Kvmd,
     outcome: Option<tokio::sync::oneshot::Receiver<(Result<()>, bool)>>,
@@ -1129,7 +1129,7 @@ impl Kvmd {
         mut inputs: tokio::sync::OwnedMutexGuard<Inputs>,
         x: i16,
         y: i16,
-        caller: &tokio::sync::oneshot::Sender<Result<()>>,
+        caller: &tokio::sync::oneshot::Sender<(Result<()>, bool)>,
     ) -> Moved {
         self.settle_owed(&mut inputs).await;
         if caller.is_closed() {
@@ -1378,21 +1378,22 @@ impl Device for Kvmd {
         self.capture_input_runtime();
         let worker = self.input_worker();
         let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+        // A delivered failure the caller never reads is reported when it drops the outcome, as for a key or button request.
+        let handover = Handover {
+            device: self,
+            outcome: Some(result_rx),
+        };
         tokio::spawn(async move {
             // Only a submitted movement has an outcome the device may still apply; a failed state read or capability check sent nothing, so an abandoned caller needs no report of it.
             let (result, submitted) = match worker.settled_move(inputs, x, y, &result_tx).await {
                 Moved::Sent(result) => (result, true),
                 Moved::NotSent(result) => (result, false),
             };
-            if let Err(Err(error)) = result_tx.send(result)
-                && submitted
-            {
+            if let Err((Err(error), true)) = result_tx.send((result, submitted)) {
                 worker.report_abandoned(&error);
             }
         });
-        result_rx
-            .await
-            .map_err(|_| Error::AmbiguousInput("input task failed".into()))?
+        handover.outcome().await
     }
 
     async fn control(
