@@ -353,19 +353,11 @@ async fn read_input_request(stream: &mut tokio::net::TcpStream) -> String {
         stream.read_exact(&mut byte).await.unwrap();
         request.push(byte[0]);
     }
-    let headers = std::str::from_utf8(&request).unwrap();
-    let length = headers
-        .lines()
-        .find_map(|line| {
-            let (name, value) = line.split_once(':')?;
-            name.eq_ignore_ascii_case("content-length")
-                .then(|| value.trim().parse::<usize>().unwrap())
-        })
-        .unwrap();
-    let mut body = vec![0; length];
-    stream.read_exact(&mut body).await.unwrap();
-    request.extend(body);
-    String::from_utf8(request).unwrap()
+    let request = String::from_utf8(request).unwrap();
+    let request_line = request.lines().next().unwrap();
+    assert!(request_line.starts_with("POST /api/hid/events/send_key?"));
+    assert!(request_line.ends_with(" HTTP/1.1"));
+    request
 }
 
 #[tokio::test]
