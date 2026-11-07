@@ -26,6 +26,15 @@ for package in data["packages"]:
         continue
     manifest = pathlib.Path(package["manifest_path"])
     text = manifest.read_text()
+    package_version = tomllib.loads(text)["package"].get("version")
+    if isinstance(package_version, str):
+        section = re.search(r"(?ms)^\[package\]\s*$.*?(?=^\[|\Z)", text)
+        if section is None:
+            raise SystemExit("Missing package section in " + str(manifest))
+        updated, count = re.subn(r"(?m)^(\s*version\s*=\s*)\"[^\"]+\"", lambda match: match.group(1) + "\"" + version + "\"", section.group())
+        if count != 1:
+            raise SystemExit("Cannot update package version in " + str(manifest))
+        text = text[:section.start()] + updated + text[section.end():]
     processed = set()
     for dependency in package["dependencies"]:
         if dependency["name"] not in packages or dependency["path"] is None or dependency["req"] == "*":

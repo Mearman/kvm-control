@@ -126,7 +126,7 @@ jobs:
       - name: Build all interfaces
         env:
           TARGET: ${{ matrix.target }}
-        run: cargo build --locked --release --target "$TARGET" --workspace --bins
+        run: cargo build --locked --release --target "$TARGET" --workspace --bins --message-format=json > build-messages.json
       - name: Create and verify archive
         shell: bash
         env:
@@ -136,7 +136,7 @@ jobs:
           set -euo pipefail
           name="kvm-control-${TAG}-${TARGET}.tar.gz"
           mkdir -p dist
-          cargo metadata --no-deps --format-version 1 | jq -r '.packages[].targets[] | select(.kind | index("bin")) | .name' > binaries.txt
+          jq -r 'select(.reason == "compiler-artifact" and (.target.kind | index("bin")) != null and .executable != null) | .target.name' build-messages.json | sort -u > binaries.txt
           test -s binaries.txt
           while IFS= read -r binary; do
             test -x "target/$TARGET/release/$binary"

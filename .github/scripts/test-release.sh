@@ -121,6 +121,20 @@ python3 -c 'import pathlib, sys; p = pathlib.Path(sys.argv[1]); s = p.read_text(
 (cd "$tmp/untagged" && git add crates/kvm-cli/Cargo.toml && git -c user.name=test -c user.email=test@example.com commit -qm 'test: enable binary feature')
 feature_plan=$(jq -cn --arg commit "$(git -C "$tmp/untagged" rev-parse HEAD)" '[{tag:"v0.2.0",commit:$commit}]')
 (cd "$tmp/untagged" && PLAN="$feature_plan" bash "$root/.github/scripts/check-release-binaries.sh")
+printf '%s\n' '[[bin]]' 'name = "optional-tool"' 'path = "src/main.rs"' 'required-features = ["optional-tool"]' >> "$tmp/untagged/crates/kvm-cli/Cargo.toml"
+python3 -c 'import pathlib, sys; p = pathlib.Path(sys.argv[1]); p.write_text(p.read_text().replace("[features]\n", "[features]\noptional-tool = []\n"))' "$tmp/untagged/crates/kvm-cli/Cargo.toml"
+(cd "$tmp/untagged" && cargo build --offline --workspace --bins --message-format=json > "$tmp/build-messages")
+jq -r 'select(.reason == "compiler-artifact" and (.target.kind | index("bin")) != null and .executable != null) | .target.name' "$tmp/build-messages" | sort -u > "$tmp/built-binaries"
+grep -qx kvm-cli "$tmp/built-binaries"
+if grep -qx optional-tool "$tmp/built-binaries"; then printf '%s\n' 'Inactive binary appeared in build messages.' >&2; exit 1; fi
+python3 -c 'import pathlib, sys; p = pathlib.Path(sys.argv[1]); p.write_text(p.read_text().replace("default = [\"extra\"]\n", ""))' "$tmp/untagged/crates/kvm-cli/Cargo.toml"
+printf '%s\n' '[target.'"'"'cfg(target_os = "macos")'"'"'.dependencies]' 'kvm-cli = { path = "../kvm-cli", features = ["extra"] }' >> "$tmp/untagged/crates/kvm-tui/Cargo.toml"
+(cd "$tmp/untagged" && cargo generate-lockfile --offline && git add Cargo.lock crates && git -c user.name=test -c user.email=test@example.com commit -qm 'test: target-specific binary feature')
+platform_plan=$(jq -cn --arg commit "$(git -C "$tmp/untagged" rev-parse HEAD)" '[{tag:"v0.2.0",commit:$commit}]')
+if (cd "$tmp/untagged" && PLAN="$platform_plan" bash "$root/.github/scripts/check-release-binaries.sh"); then
+  printf '%s\n' 'A feature enabled only on a different platform was accepted.' >&2
+  exit 1
+fi
 for invalid in '{' '[{}]' '[{"tag":"v0.1.0"}]'; do
   if (cd "$tmp/untagged" && PLAN="$invalid" bash "$root/.github/scripts/record-release-intent.sh"); then
     printf '%s\n' 'Invalid release plan was accepted.' >&2
