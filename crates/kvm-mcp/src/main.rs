@@ -58,10 +58,62 @@ fn shutdown_signal() -> std::io::Result<impl std::future::Future<Output = ()>> {
     })
 }
 
+/// The environment variables `kvm-mcp` cannot start without, each with what to set it to.
+const REQUIRED_SETTINGS: [(&str, &str); 4] = [
+    ("KVM_ENDPOINT", "the device HTTPS URL"),
+    ("KVM_PROFILE", "pikvm or glkvm"),
+    ("KVM_USERNAME", "the device account name"),
+    (
+        "KVM_PASSWORD_FD",
+        "the number of an inherited pipe descriptor, at least 3, holding the password",
+    ),
+];
+
+/// The values of [`REQUIRED_SETTINGS`].
+struct RequiredSettings {
+    endpoint: String,
+    profile: String,
+    username: String,
+    password_fd: String,
+}
+
+/// Reads every variable in [`REQUIRED_SETTINGS`].
+///
+/// # Errors
+///
+/// Returns one message naming each variable that is unset, with what to set it to, or not valid Unicode; variable values never appear in it.
+fn required_settings() -> Result<RequiredSettings, String> {
+    let read = REQUIRED_SETTINGS.map(|(name, expected)| {
+        env::var(name).map_err(|error| match error {
+            env::VarError::NotPresent => format!("{name} is not set (set it to {expected})"),
+            env::VarError::NotUnicode(_) => format!("{name} is not valid Unicode"),
+        })
+    });
+    match read {
+        [Ok(endpoint), Ok(profile), Ok(username), Ok(password_fd)] => Ok(RequiredSettings {
+            endpoint,
+            profile,
+            username,
+            password_fd,
+        }),
+        read => Err(read
+            .into_iter()
+            .filter_map(Result::err)
+            .collect::<Vec<_>>()
+            .join("; ")),
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
-    let endpoint = Url::parse(&env::var("KVM_ENDPOINT")?)?;
-    let profile = match env::var("KVM_PROFILE")?.as_str() {
+    let RequiredSettings {
+        endpoint,
+        profile,
+        username,
+        password_fd,
+    } = required_settings()?;
+    let endpoint = Url::parse(&endpoint)?;
+    let profile = match profile.as_str() {
         "pikvm" => DeviceProfile::PiKvm,
         "glkvm" => DeviceProfile::GlKvm,
         _ => return Err("KVM_PROFILE must be pikvm or glkvm".into()),
@@ -78,17 +130,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
         insecure_tls,
         timeout: Duration::from_secs(30),
     })?);
-    let password = read_password(&env::var("KVM_PASSWORD_FD")?)?;
+    let password = read_password(&password_fd)?;
     let totp = env::var("KVM_TOTP_FD")
         .ok()
         .map(|fd| read_password(&fd))
         .transpose()?;
     let login = device
-        .login_with_totp(
-            &env::var("KVM_USERNAME")?,
-            &password,
-            totp.as_deref().map(String::as_str),
-        )
+        .login_with_totp(&username, &password, totp.as_deref().map(String::as_str))
         .await?;
     drop(totp);
     drop(password);
