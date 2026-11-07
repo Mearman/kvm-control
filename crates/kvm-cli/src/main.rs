@@ -224,16 +224,43 @@ fn termination_signal() -> impl std::future::Future<Output = io::Result<()>> {
     }
 }
 
+/// Holds `press` until it completes or `interrupt` resolves, then always releases inputs. An interruption is reported in preference to the press's own result, both when it ends the press and when it arrives after the press has finished but before the release has, so a termination request is never discarded while the command is still running.
 async fn press_and_release<F, S>(device: &impl Device, press: F, interrupt: S) -> Result<(), String>
 where
     F: std::future::Future<Output = kvm_core::Result<()>>,
     S: std::future::Future<Output = io::Result<()>>,
 {
-    let result = tokio::select! {
-        result = press => result.map_err(|e| e.to_string()),
-        signal = interrupt => Err(match signal { Ok(()) => "interrupted; input outcome uncertain".into(), Err(e) => format!("signal handler failed: {e}; input outcome uncertain") }),
+    /// How the press phase ended: by a signal, whose registration may have failed, or by the press's own result.
+    enum Ended {
+        Signal(io::Result<()>),
+        Press(kvm_core::Result<()>),
+    }
+    fn interrupted(signal: io::Result<()>, outcome: &str) -> String {
+        match signal {
+            Ok(()) => format!("interrupted; {outcome}"),
+            Err(e) => format!("signal handler failed: {e}; {outcome}"),
+        }
+    }
+    let mut interrupt = std::pin::pin!(interrupt);
+    // Biased towards the signal, so a signal already received when the press also completes decides the outcome rather than a random branch order.
+    let ended = tokio::select! {
+        biased;
+        signal = &mut interrupt => Ended::Signal(signal),
+        result = press => Ended::Press(result),
     };
     let cleanup = device.release_inputs().await;
+    let result = match ended {
+        Ended::Signal(signal) => Err(interrupted(signal, "input outcome uncertain")),
+        // The release can outlast the press, so a signal received meanwhile is collected here rather than discarded by the handler that stays registered.
+        Ended::Press(pressed) => tokio::select! {
+            biased;
+            signal = &mut interrupt => Err(interrupted(signal, &match pressed {
+                Ok(()) => "press completed".into(),
+                Err(e) => format!("press: {e}"),
+            })),
+            () = std::future::ready(()) => pressed.map_err(|e| e.to_string()),
+        },
+    };
     result.map_err(|e| {
         format!(
             "{e}; cleanup: {}",
@@ -603,6 +630,57 @@ mod tests {
             .unwrap_err();
         assert!(error.contains("interrupted"));
         assert_eq!(*device.0.lock().unwrap(), ["release"]);
+    }
+
+    #[tokio::test]
+    async fn signal_ready_with_the_press_decides_the_outcome() {
+        let device = Fake(Default::default());
+        let error = press_and_release(
+            &device,
+            std::future::ready(Ok(())),
+            std::future::ready(Ok(())),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            error,
+            "interrupted; input outcome uncertain; cleanup: confirmed"
+        );
+        assert_eq!(*device.0.lock().unwrap(), ["release"]);
+    }
+
+    #[tokio::test]
+    async fn signal_during_release_is_reported_after_the_press() {
+        for (press, outcome) in [
+            (Ok(()), "press completed"),
+            (
+                Err(kvm_core::Error::AmbiguousInput("synthetic failure".into())),
+                "press: ",
+            ),
+        ] {
+            let device = Fake(Default::default());
+            // Resolves only once the release has been requested, so the signal arrives after the press has finished.
+            let interrupt = std::future::poll_fn(|_| {
+                if device
+                    .0
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|event| event == "release")
+                {
+                    std::task::Poll::Ready(Ok(()))
+                } else {
+                    std::task::Poll::Pending
+                }
+            });
+            let error = press_and_release(&device, std::future::ready(press), interrupt)
+                .await
+                .unwrap_err();
+            assert!(error.starts_with("interrupted; "), "{error}");
+            assert!(error.contains(outcome), "{error}");
+            assert!(error.ends_with("; cleanup: confirmed"), "{error}");
+            assert_eq!(*device.0.lock().unwrap(), ["release"]);
+        }
     }
 
     /// Signals this process after the handlers are registered but before their future is first polled: a handler registered only on first poll leaves the signal its default disposition, which kills the child, so its exit status shows the ordering.
