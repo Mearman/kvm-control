@@ -160,9 +160,14 @@ test "$(grep '^plan=' "$GITHUB_OUTPUT" | cut -d = -f 2- | jq -r '.[0].commit')" 
 test "$(grep '^plan=' "$GITHUB_OUTPUT" | cut -d = -f 2- | jq -r '.[1].commit')" = "$later"
 : > "$GITHUB_OUTPUT"
 (cd "$tmp/untagged" && ABANDON_INVALID_TAG=v0.1.0 bash "$root/.github/scripts/version.sh")
+test "$(grep '^plan=' "$GITHUB_OUTPUT" | cut -d = -f 2- | jq -r 'map(.tag) | join(",")')" = v0.1.1
+test "$(grep '^abandon=' "$GITHUB_OUTPUT" | cut -d = -f 2-)" = v0.1.0
+if git -C "$tmp/intent-origin" rev-parse -q --verify refs/tags/abandoned-release-v0.1.0 >/dev/null; then printf '%s\n' 'The plan pushed an abandonment marker.' >&2; exit 1; fi
+(cd "$tmp/untagged" && ABANDON=v0.1.0 PLAN="$(grep '^plan=' "$GITHUB_OUTPUT" | cut -d = -f 2-)" bash "$root/.github/scripts/record-release-intent.sh")
 test "$(git -C "$tmp/intent-origin" rev-list -n 1 v0.1.0)" = "$initial"
 test "$(git -C "$tmp/intent-origin" rev-list -n 1 abandoned-release-v0.1.0)" = "$initial"
-test "$(grep '^plan=' "$GITHUB_OUTPUT" | cut -d = -f 2- | jq -r 'map(.tag) | join(",")')" = v0.1.1
+test "$(git -C "$tmp/intent-origin" rev-list -n 1 v0.1.1)" = "$later"
+git -C "$tmp/untagged" tag -d v0.1.1 >/dev/null
 export MOCK_NEXT=0.1.0
 : > "$GITHUB_OUTPUT"
 (cd "$tmp/untagged" && bash "$root/.github/scripts/version.sh")
