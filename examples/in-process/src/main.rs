@@ -1,13 +1,18 @@
 //! Run with `cargo run --manifest-path examples/in-process/Cargo.toml` from the repository root.
 //! Test with `cargo test --manifest-path examples/in-process/Cargo.toml`.
-//! This consumer uses a synthetic device in process; it needs no hardware or credentials.
+//! This consumer uses a synthetic device in process; it needs no hardware or real credentials.
 
 use async_trait::async_trait;
 use kvm_core::{
-    Capabilities, Capability, Confirmation, Control, ControlOutcome, Device, DeviceStatus, Error,
-    MouseMode, Reported, Result, Snapshot, SwitchPort, SwitchStatus, VideoStream,
+    AuthScheme, Authenticate, CallerIdentity, Capabilities, Capability, Confirmation, Connected,
+    Connection, Connector, Control, ControlOutcome, Credentials, Device, DeviceIdentity,
+    DeviceProfile, DeviceStatus, Endpoint, Error, LoginState, MouseMode, PlatformInfo, Reported,
+    Result, ServerTrust, Snapshot, SwitchPort, SwitchStatus, SystemInfo, VideoStream,
 };
-use std::sync::Mutex;
+use std::{
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 #[derive(Default)]
 struct FakeDevice {
@@ -50,7 +55,21 @@ impl Device for FakeDevice {
             name: Reported::Unknown,
         };
         Ok(DeviceStatus {
-            info: Reported::Unknown,
+            info: Reported::Supported(SystemInfo {
+                kvmd_version: Reported::Unknown,
+                streamer_app: Reported::Unknown,
+                streamer_version: Reported::Unknown,
+                kernel: Reported::Unknown,
+                platform: Reported::Supported(PlatformInfo {
+                    kind: Reported::Unknown,
+                    base: Reported::Unknown,
+                    serial: Reported::Supported(SERIAL.into()),
+                    model: Reported::Unknown,
+                    video: Reported::Unknown,
+                    board: Reported::Unknown,
+                }),
+                host: Reported::Unknown,
+            }),
             hid: Reported::Unknown,
             streamer: Reported::Unknown,
             atx: Reported::Unsupported,
@@ -119,6 +138,166 @@ impl Device for FakeDevice {
             }
             _ => Err(Error::Unsupported("control".into())),
         }
+    }
+}
+
+/// The serial number the synthetic device reports.
+const SERIAL: &str = "SYNTHETIC-0001";
+/// The only credentials the synthetic device accepts.
+const USERNAME: &str = "operator";
+const PASSWORD: &str = "synthetic-password";
+
+/// A synthetic connection: the device behind a login. Every device call is refused with `Error::Authentication` unless the credentials in use are the device's own, as a device that requires authentication refuses them.
+struct FakeConnection {
+    device: FakeDevice,
+    endpoint: Endpoint,
+    /// The caller whose credentials the session uses.
+    caller: Mutex<Option<CallerIdentity>>,
+    /// Whether the credentials in use are the ones the device accepts.
+    accepted: Mutex<bool>,
+    /// The caller waiting for approval and how many more approval checks report it pending.
+    pending: Mutex<Option<(CallerIdentity, u32)>>,
+    /// How many approval checks a session login waits through; zero means no approval is asked for.
+    approval_checks: u32,
+}
+
+impl FakeConnection {
+    /// Fails with `Error::Authentication` unless the credentials in use are accepted.
+    fn authenticated(&self) -> Result<&FakeDevice> {
+        if *self.accepted.lock().unwrap() {
+            Ok(&self.device)
+        } else {
+            Err(Error::Authentication)
+        }
+    }
+
+    fn accept(&self, caller: CallerIdentity, accepted: bool) {
+        *self.caller.lock().unwrap() = Some(caller);
+        *self.accepted.lock().unwrap() = accepted;
+    }
+}
+
+#[async_trait]
+impl Device for FakeConnection {
+    async fn video(&self) -> Result<Box<dyn VideoStream>> {
+        self.authenticated()?.video().await
+    }
+    async fn status(&self) -> Result<DeviceStatus> {
+        self.authenticated()?.status().await
+    }
+    async fn capabilities(&self) -> Result<Capabilities> {
+        self.authenticated()?.capabilities().await
+    }
+    async fn snapshot(&self) -> Result<Snapshot> {
+        self.authenticated()?.snapshot().await
+    }
+    async fn key(&self, key: &str, pressed: bool) -> Result<()> {
+        self.authenticated()?.key(key, pressed).await
+    }
+    async fn mouse_button(&self, button: &str, pressed: bool) -> Result<()> {
+        self.authenticated()?.mouse_button(button, pressed).await
+    }
+    async fn mouse_move(&self, x: i16, y: i16) -> Result<()> {
+        self.authenticated()?.mouse_move(x, y).await
+    }
+    async fn release_inputs(&self) -> Result<()> {
+        self.authenticated()?.release_inputs().await
+    }
+    async fn control(
+        &self,
+        operation: Control,
+        confirmation: Confirmation,
+    ) -> Result<ControlOutcome> {
+        self.authenticated()?.control(operation, confirmation).await
+    }
+}
+
+#[async_trait]
+impl Authenticate for FakeConnection {
+    async fn login(&self, credentials: Credentials) -> Result<LoginState> {
+        // As in kvm-kvmd, a login that passes its local checks discards the previous session first.
+        let per_request = self.endpoint.auth != AuthScheme::Session;
+        if per_request && credentials.totp.is_some() {
+            return Err(Error::InvalidResponse(
+                "a one-time code requires session login".into(),
+            ));
+        }
+        *self.caller.lock().unwrap() = None;
+        *self.accepted.lock().unwrap() = false;
+        *self.pending.lock().unwrap() = None;
+        let valid =
+            credentials.caller.username == USERNAME && credentials.password.expose() == PASSWORD;
+        if per_request {
+            // Per-request credentials are only installed; the device judges them on each request.
+            self.accept(credentials.caller, valid);
+            return Ok(LoginState::Unverified);
+        }
+        if !valid {
+            return Err(Error::Authentication);
+        }
+        if self.approval_checks == 0 {
+            self.accept(credentials.caller, true);
+            return Ok(LoginState::Authenticated);
+        }
+        *self.pending.lock().unwrap() = Some((credentials.caller, self.approval_checks));
+        Ok(LoginState::ApprovalPending {
+            expires_in: Some(60),
+        })
+    }
+    async fn complete_approval(&self) -> Result<LoginState> {
+        let mut pending = self.pending.lock().unwrap();
+        let Some((_, remaining)) = pending.as_mut() else {
+            return Err(Error::InvalidResponse("no approval is pending".into()));
+        };
+        *remaining -= 1;
+        if *remaining > 0 {
+            return Ok(LoginState::ApprovalPending { expires_in: None });
+        }
+        if let Some((caller, _)) = pending.take() {
+            self.accept(caller, true);
+        }
+        Ok(LoginState::Authenticated)
+    }
+    async fn check_auth(&self) -> Result<()> {
+        self.authenticated().map(|_| ())
+    }
+    fn caller(&self) -> Option<CallerIdentity> {
+        self.caller.lock().unwrap().clone()
+    }
+}
+
+#[async_trait]
+impl Connection for FakeConnection {
+    fn endpoint(&self) -> &Endpoint {
+        &self.endpoint
+    }
+    async fn identity(&self) -> Result<DeviceIdentity> {
+        // Nothing in process authenticates the "server", so the address is not verified.
+        Ok(DeviceIdentity::observe(
+            &self.endpoint,
+            false,
+            &self.status().await?,
+        ))
+    }
+}
+
+/// Opens synthetic connections; `approval_checks` is passed to each one.
+#[derive(Default)]
+struct FakeConnector {
+    approval_checks: u32,
+}
+
+#[async_trait]
+impl Connector for FakeConnector {
+    async fn open(&self, endpoint: Endpoint) -> Result<Arc<dyn Connection>> {
+        Ok(Arc::new(FakeConnection {
+            device: FakeDevice::default(),
+            endpoint,
+            caller: Mutex::new(None),
+            accepted: Mutex::new(false),
+            pending: Mutex::new(None),
+            approval_checks: self.approval_checks,
+        }))
     }
 }
 
@@ -202,10 +381,54 @@ async fn consume(device: &dyn Device) -> std::result::Result<ControlOutcome, Con
         .await?)
 }
 
+/// The endpoint the example connects to; it carries no secret, so it could come from a configuration file.
+fn endpoint(auth: AuthScheme) -> Endpoint {
+    Endpoint {
+        label: Some("bench-kvm".into()),
+        address: "https://kvm.invalid/".parse().unwrap(),
+        profile: DeviceProfile::GlKvm,
+        auth,
+        trust: ServerTrust::Verified {
+            additional_ca_pem: None,
+        },
+        timeout: Duration::from_secs(5),
+    }
+}
+
+/// Connects through any connector, waits out a pending approval, then reads the device's identity. A consumer written against the contract alone, as this one is, works with any implementation.
+async fn connect(
+    connector: &dyn Connector,
+    endpoint: Endpoint,
+    credentials: Credentials,
+) -> Result<(Arc<dyn Connection>, DeviceIdentity)> {
+    let connection = match connector.connect(endpoint, credentials).await? {
+        Connected::Authenticated(connection) => connection,
+        Connected::ApprovalPending { connection, .. } => {
+            println!("Approve the login on the device");
+            // A real consumer would also wait between checks and give up when the approval expires.
+            while connection.complete_approval().await? != LoginState::Authenticated {}
+            connection
+        }
+    };
+    let identity = connection.identity().await?;
+    Ok((connection, identity))
+}
+
 #[tokio::main]
 async fn main() -> std::result::Result<(), ConsumeError> {
-    let device = FakeDevice::default();
-    let outcome = consume(&device).await?;
+    let connector = FakeConnector { approval_checks: 2 };
+    let (connection, identity) = connect(
+        &connector,
+        endpoint(AuthScheme::Session),
+        Credentials::new(USERNAME, PASSWORD),
+    )
+    .await?;
+    println!(
+        "Connected to {:?} as {:?}",
+        identity.id(),
+        connection.caller()
+    );
+    let outcome = consume(connection.as_ref()).await?;
     println!("Switch outcome: {outcome:?}");
     Ok(())
 }
@@ -231,6 +454,91 @@ mod tests {
         assert!(matches!(
             device.mouse_move(1, 1).await,
             Err(Error::Unsupported(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn consumer_connects_authenticates_and_identifies_through_the_contract() {
+        for approval_checks in [0, 3] {
+            let connector = FakeConnector { approval_checks };
+            let (connection, identity) = connect(
+                &connector,
+                endpoint(AuthScheme::Session),
+                Credentials::new(USERNAME, PASSWORD),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                connection.caller(),
+                Some(CallerIdentity {
+                    username: USERNAME.into()
+                })
+            );
+            assert_eq!(identity.label.as_deref(), Some("bench-kvm"));
+            assert_eq!(identity.profile, DeviceProfile::GlKvm);
+            assert!(!identity.address_verified);
+            assert_eq!(identity.serial, Reported::Supported(SERIAL.into()));
+            assert_eq!(identity.host, Reported::Unknown);
+            assert_eq!(identity.id().endpoint, "bench-kvm");
+            assert_eq!(
+                consume(connection.as_ref()).await.unwrap(),
+                ControlOutcome::Unverified
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn refused_and_unconfirmed_credentials_reach_no_device() {
+        let connector = FakeConnector::default();
+        assert!(matches!(
+            connect(
+                &connector,
+                endpoint(AuthScheme::Session),
+                Credentials::new(USERNAME, "wrong"),
+            )
+            .await,
+            Err(Error::Authentication)
+        ));
+        // A login that only installs per-request credentials leaves the check to the caller; the contract's `connect` makes it.
+        let connection = connector.open(endpoint(AuthScheme::Header)).await.unwrap();
+        assert!(connection.status().await.is_err());
+        assert_eq!(
+            connection
+                .login(Credentials::new(USERNAME, PASSWORD))
+                .await
+                .unwrap(),
+            LoginState::Unverified
+        );
+        connection.check_auth().await.unwrap();
+        connection
+            .login(Credentials::new(USERNAME, "wrong"))
+            .await
+            .unwrap();
+        assert!(matches!(
+            connection.check_auth().await,
+            Err(Error::Authentication)
+        ));
+        // A one-time code under a per-request scheme is refused before the session changes.
+        assert!(matches!(
+            connection
+                .login(Credentials::new(USERNAME, PASSWORD).with_totp("012345"))
+                .await,
+            Err(Error::InvalidResponse(_))
+        ));
+        assert_eq!(
+            connection.caller(),
+            Some(CallerIdentity {
+                username: USERNAME.into()
+            })
+        );
+        assert!(matches!(
+            connector
+                .connect(
+                    endpoint(AuthScheme::Basic),
+                    Credentials::new(USERNAME, "wrong")
+                )
+                .await,
+            Err(Error::Authentication)
         ));
     }
 
