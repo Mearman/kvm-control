@@ -69,20 +69,24 @@ enum Release {
 }
 
 impl InputEnded {
+    /// The release state comes first, since the line is cut off at the width and an uncertain cleanup (a key or button may still be held on the remote host) must stay visible on the narrowest screens.
     fn line(&self) -> String {
         let release = match &self.release {
-            Release::Pending => "releasing inputs".to_owned(),
-            Release::Done => "inputs released".to_owned(),
-            Release::Failed(error) => format!("input cleanup uncertain: {error}"),
+            Release::Pending => "Releasing inputs".to_owned(),
+            Release::Done => "Inputs released".to_owned(),
+            Release::Failed(error) => format!("Cleanup uncertain: {error}"),
         };
-        format!("Input mode ended ({}); {release}", self.cause)
+        format!("{release}; input mode ended ({})", self.cause)
     }
 }
+
+/// Shown while `i` waits for a pending release; replaced when the release finishes if it is still showing.
+const RELEASE_WAIT: &str = "Inputs are still being released; try again shortly";
 
 /// The message that replaces input mode's entry message when input mode ends.
 const INPUT_MODE_ENDED: &str = "Input mode ended; keys are client commands again";
 
-/// The outcome of reading capabilities and status, applied to an [`App`] by [`App::finish_refresh`].
+/// The outcome of reading capabilities and status, applied to an [`App`] by [`App::apply_refresh`] (or [`App::finish_refresh`], which also waits for any release it requires).
 pub struct Refresh {
     capabilities: kvm_core::Result<Capabilities>,
     status: kvm_core::Result<DeviceStatus>,
@@ -141,7 +145,7 @@ impl App {
         self.drag_modifiers.clear();
     }
 
-    /// Refreshes capability and status information through the shared device API, waiting for the read; the event loop instead runs [`Refresh::read`] as its own task and applies it with [`App::finish_refresh`].
+    /// Refreshes capability and status information through the shared device API, waiting for the read; the event loop instead runs [`Refresh::read`] as its own task, applies it with [`App::apply_refresh`] and runs any release it requires as another task.
     pub async fn refresh(&mut self, device: &dyn Device) {
         let refresh = Refresh::read(device, self.controls_completed).await;
         self.finish_refresh(device, refresh).await;
@@ -168,6 +172,10 @@ impl App {
             .map_err(|error| errors.push(error.to_string()))
             .ok();
         let mut ended = false;
+        // A notice whose release has finished has been shown; this outcome replaces it, so it does not sit in front of every later read.
+        if !self.input_release_pending() {
+            self.input_ended = None;
+        }
         if self.control
             && input_gates(capabilities.as_ref()) != input_gates(self.capabilities.as_ref())
         {
@@ -200,13 +208,30 @@ impl App {
         ended
     }
 
-    /// Records how the release after a refresh ended input mode went.
+    /// Records how the release after a refresh ended input mode went. A failed release also goes at the start of the message, which wraps, since a key or button may still be held on the remote host; a waiting `i`'s message is replaced either way.
     pub fn input_release_finished(&mut self, release: kvm_core::Result<()>) {
-        if let Some(ended) = &mut self.input_ended {
-            ended.release = match release {
-                Ok(()) => Release::Done,
-                Err(error) => Release::Failed(error.to_string()),
-            };
+        let waiting = self.message == RELEASE_WAIT;
+        let Some(ended) = &mut self.input_ended else {
+            return;
+        };
+        match release {
+            Ok(()) => {
+                ended.release = Release::Done;
+                if waiting {
+                    self.message = "Inputs released; i enters input mode".into();
+                }
+            }
+            Err(error) => {
+                let warning = format!(
+                    "Input cleanup uncertain, a key or button may still be held on the remote host: {error}"
+                );
+                ended.release = Release::Failed(error.to_string());
+                self.message = if waiting || self.message.is_empty() {
+                    warning
+                } else {
+                    format!("{warning}. {}", self.message)
+                };
+            }
         }
     }
 
@@ -575,7 +600,7 @@ impl App {
             KeyCode::Char('q') if !self.control => return false,
             KeyCode::Char('r') if !self.control => self.refresh_requested = true,
             KeyCode::Char('i') if !self.control && self.input_release_pending() => {
-                self.message = "Inputs are still being released; try again shortly".into();
+                self.message = RELEASE_WAIT.into();
             }
             KeyCode::Char('i') if !self.control => {
                 if self.capabilities.as_ref().is_some_and(|c| {
@@ -1857,8 +1882,10 @@ mod tests {
         mut next: impl FnMut(&Terminal<TestBackend>) -> io::Result<Option<Event>>,
     ) -> impl FnMut(&Terminal<TestBackend>) -> io::Result<Option<Event>> {
         let started = std::time::Instant::now();
+        // Only the start-up read is waited for; a later read that loses the capabilities is the test's to observe.
+        let mut shown = false;
         move |terminal| {
-            if screen_text(terminal).contains("Capabilities unknown") {
+            if !shown && screen_text(terminal).contains("Capabilities unknown") {
                 // The fake devices answer at once, so this bound only turns a regression into a failure instead of a hang.
                 assert!(
                     started.elapsed() < START_UP_READ_BOUND,
@@ -1867,6 +1894,7 @@ mod tests {
                 std::thread::yield_now();
                 return Ok(None);
             }
+            shown = true;
             next(terminal)
         }
     }
@@ -1892,6 +1920,11 @@ mod tests {
         status_capability_unknown: bool,
         /// Never answers a status read, as a device whose route never answers holds a read until its timeout.
         status_hangs: bool,
+        /// While set, the capability read waits for `capabilities_gate` and then fails, as a read of a device that dropped off does.
+        fail_capabilities: std::sync::atomic::AtomicBool,
+        capabilities_gate: tokio::sync::Notify,
+        /// Panics in `release_inputs`, so the task running it ends with a join error.
+        panic_release: bool,
         status_reads: std::sync::atomic::AtomicUsize,
         /// Makes the status read wait until video is requested, and video wait until the status read has finished, so the two can only both finish if the read progresses while the loop awaits video.
         video_waits_for_status: bool,
@@ -1965,6 +1998,13 @@ mod tests {
             })
         }
         async fn capabilities(&self) -> kvm_core::Result<Capabilities> {
+            if self
+                .fail_capabilities
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                self.capabilities_gate.notified().await;
+                return Err(kvm_core::Error::Transport("device request: timeout".into()));
+            }
             Ok(Capabilities {
                 status: if self.status_capability_unknown {
                     Capability::Unknown
@@ -2012,6 +2052,7 @@ mod tests {
             Ok(())
         }
         async fn release_inputs(&self) -> kvm_core::Result<()> {
+            assert!(!self.panic_release, "synthetic release failure");
             if self.delayed_cleanup {
                 println!("SIGTERM_RELEASE_WAITING");
                 use std::io::Write;
@@ -3691,7 +3732,7 @@ mod tests {
         );
         assert!(
             app.device_state_line()
-                .starts_with("Input mode ended (capabilities could not be read); inputs released")
+                .starts_with("Inputs released; input mode ended (capabilities could not be read)")
         );
     }
 
@@ -3728,7 +3769,7 @@ mod tests {
         assert_eq!(app.message, outcome);
         assert!(
             app.device_state_line().starts_with(
-                "Input mode ended (keyboard or mouse support changed); inputs released"
+                "Inputs released; input mode ended (keyboard or mouse support changed)"
             )
         );
     }
@@ -3764,6 +3805,15 @@ mod tests {
                 ratatui::layout::Rect::new(0, 0, 4, 4),
             )
             .await;
+            // The button press reached the device, so the release that follows is what lifts it.
+            assert!(
+                device
+                    .calls
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|call| call == "button:left:true")
+            );
             let refresh = read_with(&device, Ok(changed.clone()), 0).await;
             app.finish_refresh(&device, refresh).await;
             assert!(!app.control, "{changed:?}");
@@ -3800,7 +3850,7 @@ mod tests {
         let state_row = row(buffer.area.height - 2);
         assert!(
             state_row
-                .starts_with("Input mode ended (capabilities could not be read); inputs released"),
+                .starts_with("Inputs released; input mode ended (capabilities could not be read)"),
             "{state_row:?}"
         );
         let footer: String = (buffer.area.height - FOOTER_HEIGHT..buffer.area.height)
@@ -3845,6 +3895,216 @@ mod tests {
             .block_on(app.key(&FakeDevice::default(), KeyCode::Char('i')));
         assert!(app.control);
         assert!(app.input_ended.is_none());
+    }
+
+    /// Drives `run_loop` until a refresh ends input mode, as a user does: waits for the start-up refresh, presses `r` with the capability read held at the fake's gate, presses `i` while that read is in flight (input mode opens under the start-up capabilities), then lets the read fail, which ends input mode; the remaining events come from `then`.
+    fn end_input_mode_by_refresh(
+        device: std::sync::Arc<FakeDevice>,
+        mut then: impl FnMut(&Terminal<TestBackend>) -> Option<Event>,
+    ) -> impl FnMut(&Terminal<TestBackend>) -> io::Result<Option<Event>> {
+        let mut step = 0;
+        let key = |code| {
+            Some(Event::Key(crossterm::event::KeyEvent::new(
+                code,
+                crossterm::event::KeyModifiers::NONE,
+            )))
+        };
+        after_start_up_refresh(move |terminal| {
+            step += 1;
+            Ok(match step {
+                1 => {
+                    device
+                        .fail_capabilities
+                        .store(true, std::sync::atomic::Ordering::SeqCst);
+                    key(KeyCode::Char('r'))
+                }
+                2 => key(KeyCode::Char('i')),
+                3 => {
+                    // `i` was handled in the previous iteration, so input mode is on before the read fails.
+                    device.capabilities_gate.notify_one();
+                    None
+                }
+                _ => then(terminal),
+            })
+        })
+    }
+
+    // Breaks if the release a refresh requires is not run in the background, if `i` is accepted while it is pending, or if its completion is not shown.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_release_a_refresh_requires_runs_through_the_loop() {
+        let device = std::sync::Arc::new(FakeDevice {
+            delayed_cleanup: true,
+            ..FakeDevice::default()
+        });
+        let mut terminal = Terminal::new(TestBackend::new(80, 16)).unwrap();
+        let mut phase = 0;
+        let release = device.clone();
+        let key = |code| {
+            Some(Event::Key(crossterm::event::KeyEvent::new(
+                code,
+                crossterm::event::KeyModifiers::NONE,
+            )))
+        };
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            run_loop(
+                &mut terminal,
+                device.clone(),
+                &ImagePicker::halfblocks(),
+                false,
+                end_input_mode_by_refresh(device.clone(), move |terminal| {
+                    let text = screen_text(terminal);
+                    match phase {
+                        // The release is waiting on the fake, so the loop is still drawing: try to re-enter input mode.
+                        0 if text.contains("Releasing inputs; input mode ended") => {
+                            phase = 1;
+                            key(KeyCode::Char('i'))
+                        }
+                        1 if text.contains(RELEASE_WAIT) => {
+                            phase = 2;
+                            release.control_release.notify_one();
+                            None
+                        }
+                        2 if text.contains("Inputs released; input mode ended")
+                            && text.contains("Inputs released; i enters input mode") =>
+                        {
+                            phase = 3;
+                            key(KeyCode::Char('q'))
+                        }
+                        _ => {
+                            std::thread::yield_now();
+                            None
+                        }
+                    }
+                }),
+            ),
+        )
+        .await
+        .expect("the loop must finish")
+        .unwrap();
+        assert_eq!(
+            device
+                .calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|call| *call == "release")
+                .count(),
+            1
+        );
+    }
+
+    // Breaks if quitting waits for a release that never finishes, or if a release task that fails is not shown as an uncertain cleanup.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_pending_release_does_not_hold_quit_and_a_failed_one_is_shown() {
+        let device = std::sync::Arc::new(FakeDevice {
+            delayed_cleanup: true,
+            ..FakeDevice::default()
+        });
+        let mut terminal = Terminal::new(TestBackend::new(80, 16)).unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            run_loop(
+                &mut terminal,
+                device.clone(),
+                &ImagePicker::halfblocks(),
+                false,
+                end_input_mode_by_refresh(device.clone(), |terminal| {
+                    if screen_text(terminal).contains("Releasing inputs") {
+                        Some(Event::Key(crossterm::event::KeyEvent::new(
+                            KeyCode::Char('q'),
+                            crossterm::event::KeyModifiers::NONE,
+                        )))
+                    } else {
+                        std::thread::yield_now();
+                        None
+                    }
+                }),
+            ),
+        )
+        .await
+        .expect("quit must not wait for the release")
+        .unwrap();
+        // The release was still waiting at the fake when the loop ended.
+        assert!(
+            !device
+                .calls
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|call| call == "release")
+        );
+
+        let device = std::sync::Arc::new(FakeDevice {
+            panic_release: true,
+            ..FakeDevice::default()
+        });
+        let mut terminal = Terminal::new(TestBackend::new(30, 16)).unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            run_loop(
+                &mut terminal,
+                device.clone(),
+                &ImagePicker::halfblocks(),
+                false,
+                end_input_mode_by_refresh(device.clone(), |terminal| {
+                    if screen_text(terminal).contains("Cleanup uncertain") {
+                        Some(Event::Key(crossterm::event::KeyEvent::new(
+                            KeyCode::Char('q'),
+                            crossterm::event::KeyModifiers::NONE,
+                        )))
+                    } else {
+                        std::thread::yield_now();
+                        None
+                    }
+                }),
+            ),
+        )
+        .await
+        .expect("a failed release must be shown")
+        .unwrap();
+    }
+
+    fn state_row(app: &App, width: u16) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(width, 16)).unwrap();
+        terminal.draw(|frame| draw(frame, app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        (1..buffer.area.width - 1)
+            .map(|x| buffer[(x, buffer.area.height - 2)].symbol())
+            .collect()
+    }
+
+    // Breaks if an uncertain cleanup is cut off on narrow screens, or if a finished notice keeps hiding later refresh outcomes.
+    #[tokio::test]
+    async fn an_uncertain_cleanup_stays_visible_and_a_finished_notice_gives_way() {
+        let device = FakeDevice {
+            fail_cleanup: true,
+            ..FakeDevice::default()
+        };
+        let mut app = App::default();
+        app.refresh(&device).await;
+        app.key(&device, KeyCode::Char('i')).await;
+        let failed = Refresh {
+            capabilities: Err(kvm_core::Error::Transport("device request: timeout".into())),
+            status: Err(kvm_core::Error::Transport("device request: timeout".into())),
+            controls_before: 0,
+        };
+        app.finish_refresh(&device, failed).await;
+        for width in [20, 30, 52, 80] {
+            let row = state_row(&app, width);
+            assert!(
+                row.starts_with("Cleanup uncertain"),
+                "width {width}: {row:?}"
+            );
+        }
+        assert!(
+            app.message
+                .starts_with("Input cleanup uncertain, a key or button may still be held")
+        );
+        // The next refresh outcome replaces the finished notice.
+        let later = read_with(&device, Ok(fake_capabilities(Capability::Unsupported)), 0).await;
+        app.finish_refresh(&device, later).await;
+        assert_eq!(state_row(&app, 52).trim_end(), "Device state read");
     }
 
     // Breaks if a long help, message or command wraps the device-state line out of view.
