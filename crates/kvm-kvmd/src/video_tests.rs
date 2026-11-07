@@ -772,7 +772,7 @@ async fn failed_release_by_an_owner_dropped_on_another_runtime_is_reported_once(
     });
     device.key("KeyA", true).await.unwrap();
     let inputs = device.inputs.clone();
-    // Dropped on another runtime, the owner schedules the release on this one and a waiting task on its own, which must not report the failure again. That runtime keeps running until both tasks have finished, so the waiting task runs to completion; this runtime keeps running too, since the blocking thread is awaited rather than joined.
+    // Dropped on another runtime, the owner schedules the release on this one and a waiting task on its own. That runtime keeps running until both tasks have finished, so the waiting task runs to completion; this runtime keeps running too, since the blocking thread is awaited rather than joined. Whether the waiting task would release again after the first release finished cannot be seen here: a second release finds nothing held, so it sends and reports nothing either way.
     tokio::task::spawn_blocking(move || {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
