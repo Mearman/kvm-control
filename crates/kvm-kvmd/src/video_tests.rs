@@ -116,10 +116,51 @@ async fn read_request(stream: &mut tokio::net::TcpStream) -> String {
     String::from_utf8(bytes).unwrap()
 }
 
+/// The input test client's request timeout. An input task that has not finished within it would already have failed its request, so waiting longer cannot change a test's result.
+const INPUT_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Polls an input operation once and returns it spawned. Afterwards the operation is waiting for the input lock that `device` shows as held, so it cannot send a request until the holder finishes.
+async fn queued<F>(device: &Kvmd, future: F) -> tokio::task::JoinHandle<F::Output>
+where
+    F: std::future::Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    let mut future = Box::pin(future);
+    tokio::select! {
+        biased;
+        _ = &mut future => panic!("operation completed while the input lock was held"),
+        () = std::future::ready(()) => {}
+    }
+    assert!(device.inputs.try_lock().is_err(), "input lock is not held");
+    tokio::spawn(future)
+}
+
+/// Waits until every input task holding a clone of `inputs` has finished, so any request it would send has already been sent.
+async fn input_tasks_finished(inputs: &Arc<tokio::sync::Mutex<crate::Inputs>>) {
+    tokio::time::timeout(INPUT_TIMEOUT, async {
+        while Arc::strong_count(inputs) > 1 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("input task did not finish");
+}
+
+/// Asserts that no connection has been made to `listener` and not yet accepted, reading the kernel's accept queue without waiting.
+fn assert_no_waiting_connection(listener: TcpListener, message: &str) {
+    let listener = listener.into_std().unwrap();
+    listener.set_nonblocking(true).unwrap();
+    assert_eq!(
+        listener.accept().map(|_| ()).unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock,
+        "{message}"
+    );
+}
+
 fn input_device(address: std::net::SocketAddr) -> Kvmd {
     let endpoint = Url::parse(&format!("http://{address}/")).unwrap();
     let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(3))
+        .timeout(INPUT_TIMEOUT)
         .http1_only()
         .build()
         .unwrap();
@@ -158,16 +199,20 @@ async fn cancelled_press_finishes_before_concurrent_release() {
     let (accepted_tx, accepted_rx) = tokio::sync::oneshot::channel();
     let (finish_tx, finish_rx) = tokio::sync::oneshot::channel();
     let (checked_tx, checked_rx) = tokio::sync::oneshot::channel();
+    let (queued_tx, queued_rx) = tokio::sync::oneshot::channel();
     let server = tokio::spawn(async move {
         let (mut press, _) = listener.accept().await.unwrap();
         let first = read_request(&mut press).await;
         accepted_tx.send(()).unwrap();
-        assert!(
-            tokio::time::timeout(Duration::from_millis(100), listener.accept())
-                .await
-                .is_err(),
+        queued_rx.await.unwrap();
+        let listener = listener.into_std().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        assert_eq!(
+            listener.accept().map(|_| ()).unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock,
             "release arrived before press completion"
         );
+        let listener = TcpListener::from_std(listener).unwrap();
         checked_tx.send(()).unwrap();
         finish_rx.await.unwrap();
         press
@@ -223,21 +268,18 @@ async fn cancelled_press_finishes_before_concurrent_release() {
     accepted_rx.await.unwrap();
     task.abort();
     let releasing = device.clone();
-    let release = tokio::spawn(async move { releasing.release_inputs().await });
-    tokio::task::yield_now().await;
-    assert!(!release.is_finished());
+    let release = queued(&device, async move { releasing.release_inputs().await }).await;
+    queued_tx.send(()).unwrap();
     checked_rx.await.unwrap();
     finish_tx.send(()).unwrap();
     release.await.unwrap().unwrap();
     let (first, second, listener) = server.await.unwrap();
     assert!(first.contains("state=true"));
     assert!(second.contains("state=false"));
+    let inputs = device.inputs.clone();
     drop(device);
-    assert!(
-        tokio::time::timeout(Duration::from_millis(100), listener.accept())
-            .await
-            .is_err()
-    );
+    input_tasks_finished(&inputs).await;
+    assert_no_waiting_connection(listener, "dropping the owner sent a request");
 }
 
 #[tokio::test]
@@ -250,12 +292,15 @@ async fn concurrent_key_and_button_presses_are_serialised() {
         let (mut first, _) = listener.accept().await.unwrap();
         assert!(read_request(&mut first).await.contains("send_key"));
         accepted_tx.send(()).unwrap();
-        assert!(
-            tokio::time::timeout(Duration::from_millis(100), listener.accept())
-                .await
-                .is_err()
-        );
         proceed_rx.await.unwrap();
+        let listener = listener.into_std().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        assert_eq!(
+            listener.accept().map(|_| ()).unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock,
+            "button press arrived before key press completion"
+        );
+        let listener = TcpListener::from_std(listener).unwrap();
         first
             .write_all(
                 b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}",
@@ -279,8 +324,10 @@ async fn concurrent_key_and_button_presses_are_serialised() {
     let first = tokio::spawn(async move { first_device.key("KeyA", true).await });
     accepted_rx.await.unwrap();
     let second_device = device.clone();
-    let second = tokio::spawn(async move { second_device.mouse_button("left", true).await });
-    tokio::task::yield_now().await;
+    let second = queued(&device, async move {
+        second_device.mouse_button("left", true).await
+    })
+    .await;
     proceed_tx.send(()).unwrap();
     first.await.unwrap().unwrap();
     second.await.unwrap().unwrap();
@@ -309,24 +356,24 @@ async fn ambiguous_press_is_reported_and_last_owner_releases_it() {
         device.mouse_button("left", true).await,
         Err(kvm_core::Error::AmbiguousInput(_))
     ));
+    let inputs = device.inputs.clone();
     drop(device);
-    let listener = tokio::time::timeout(Duration::from_secs(3), server)
+    let listener = tokio::time::timeout(INPUT_TIMEOUT, server)
         .await
         .unwrap()
         .unwrap();
-    assert!(
-        tokio::time::timeout(Duration::from_millis(100), listener.accept())
-            .await
-            .is_err()
-    );
+    input_tasks_finished(&inputs).await;
+    assert_no_waiting_connection(listener, "the ambiguous press was released twice");
 }
 
 #[tokio::test]
 async fn timed_out_press_remains_indeterminate_after_release() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let mut device = input_device(listener.local_addr().unwrap());
+    // The server never answers the press, so any timeout makes it ambiguous; a short one keeps the test from waiting.
+    const UNANSWERED_PRESS_TIMEOUT: Duration = Duration::from_millis(100);
     let client = reqwest::Client::builder()
-        .timeout(Duration::from_millis(100))
+        .timeout(UNANSWERED_PRESS_TIMEOUT)
         .http1_only()
         .build()
         .unwrap();
@@ -414,6 +461,7 @@ async fn cancelled_move_finishes_before_button_press() {
     let (accepted_tx, accepted_rx) = tokio::sync::oneshot::channel();
     let (finish_tx, finish_rx) = tokio::sync::oneshot::channel();
     let (checked_tx, checked_rx) = tokio::sync::oneshot::channel();
+    let (queued_tx, queued_rx) = tokio::sync::oneshot::channel();
     let server = tokio::spawn(async move {
         let (mut state, _) = listener.accept().await.unwrap();
         assert!(read_request(&mut state).await.contains("/api/hid "));
@@ -436,11 +484,15 @@ async fn cancelled_move_finishes_before_button_press() {
                 .contains("send_mouse_move")
         );
         accepted_tx.send(()).unwrap();
-        assert!(
-            tokio::time::timeout(Duration::from_millis(100), listener.accept())
-                .await
-                .is_err()
+        queued_rx.await.unwrap();
+        let listener = listener.into_std().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        assert_eq!(
+            listener.accept().map(|_| ()).unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock,
+            "button press arrived before movement completion"
         );
+        let listener = TcpListener::from_std(listener).unwrap();
         checked_tx.send(()).unwrap();
         finish_rx.await.unwrap();
         movement
@@ -467,7 +519,12 @@ async fn cancelled_move_finishes_before_button_press() {
     accepted_rx.await.unwrap();
     movement.abort();
     let clicking = device.clone();
-    let button = tokio::spawn(async move { clicking.mouse_button("left", true).await });
+    let button = queued(
+        &device,
+        async move { clicking.mouse_button("left", true).await },
+    )
+    .await;
+    queued_tx.send(()).unwrap();
     checked_rx.await.unwrap();
     finish_tx.send(()).unwrap();
     button.await.unwrap().unwrap();
@@ -557,13 +614,11 @@ async fn ambiguous_release_is_not_replayed_on_drop() {
         device.release_inputs().await,
         Err(kvm_core::Error::AmbiguousInput(_))
     ));
+    let inputs = device.inputs.clone();
     drop(device);
     let listener = server.await.unwrap();
-    assert!(
-        tokio::time::timeout(Duration::from_millis(100), listener.accept())
-            .await
-            .is_err()
-    );
+    input_tasks_finished(&inputs).await;
+    assert_no_waiting_connection(listener, "the ambiguous release was replayed");
 }
 
 #[tokio::test]
