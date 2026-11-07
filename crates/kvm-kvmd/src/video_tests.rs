@@ -120,7 +120,7 @@ async fn read_request(stream: &mut tokio::net::TcpStream) -> String {
 /// The input test client's request timeout: `input_device` builds its client and its configuration with it. Input-test waits that neither the client timeout nor a `select!` already bounds are bounded by it too. A single request finishes within it, by reply or by the client's own timeout, so a wait for one request or its outcome that exceeds it means the awaited event did not happen. A wait that starts before anything is sent, or is blocked on the input lock, relies on this bound alone, and an input task that sends several requests (settlement, then its own) can legitimately run past it, so each such wait covers at most one request the server does not answer at once; requests it answers immediately may come before or after that one within the same wait.
 const INPUT_TIMEOUT: Duration = Duration::from_secs(3);
 
-/// The timeout set in the video test devices' configuration, and the bound on video-test waits for one request, stream or watcher to finish. The adapter applies the configured timeout to the lease request, the stream request, each read and consumer idleness. A device built by `Kvmd::new` also carries it as both clients' connect timeout and as the non-video client's request timeout; its video client has no request timeout. The hand-built test clients set no timeout of their own, so a snapshot request in those tests, and a wait on their server side, rely on this bound alone, and a wait exceeding it means the awaited event did not happen. `maximum_frame_with_maximum_headers_and_boundary` configures a longer timeout for its maximum-size frame.
+/// The timeout set in the video test devices' configuration, and the bound on video-test waits for one request, stream or watcher to finish. The adapter applies the configured timeout to the lease request, the stream request, each read and consumer idleness. A device built by `Kvmd::new` also carries it as both clients' connect timeout and as the non-video client's request timeout; its video client has no request timeout. The hand-built test clients set no timeout of their own, so a snapshot request in those tests, and a wait on their server side, rely on this bound alone, and a wait exceeding it means the awaited event did not happen, provided any earlier request in the same wait is answered immediately: a wait for a request to arrive, or for a lease upgrade followed by the stream request, covers requests the server answers at once and relies on the adapter's own timeouts for the rest. `maximum_frame_with_maximum_headers_and_boundary` configures a longer timeout for its maximum-size frame.
 const VIDEO_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Polls an input operation once and returns it spawned. Afterwards the operation is waiting for the input lock that `device` shows as held, so it cannot send a request until the holder finishes.
@@ -186,7 +186,7 @@ fn video_device(address: std::net::SocketAddr, profile: DeviceProfile) -> Kvmd {
         approval_token: Default::default(),
         snapshot_proven: Default::default(),
         video_proven: Default::default(),
-        cleanup_on_drop: true,
+        cleanup_on_drop: false,
         input_runtime: Default::default(),
         reporter: Default::default(),
         stream_storage: Arc::new(tokio::sync::Semaphore::new(crate::MAX_JPEG_VALIDATIONS)),
