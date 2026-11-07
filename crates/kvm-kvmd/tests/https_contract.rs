@@ -1080,7 +1080,7 @@ async fn request_abandoned_during_owed_cleanup_leaves_nothing_held() {
     drop(first);
     arrival(&calls).await;
     assert_eq!(input_events(&calls).last().unwrap(), "key=KeyA&state=false");
-    // Abandoning the second request while the owed release is in flight must leave its own press released too.
+    // Abandoning the second request while the owed release is in flight means its own press is never sent, so nothing is left to clean up.
     second.abort();
     assert!(second.await.unwrap_err().is_cancelled());
     calls.4.notify_one();
@@ -1094,8 +1094,6 @@ async fn request_abandoned_during_owed_cleanup_leaves_nothing_held() {
         [
             "key=KeyA&state=true",
             "key=KeyA&state=false",
-            "key=KeyB&state=true",
-            "key=KeyB&state=false",
             "key=KeyC&state=true",
             "key=KeyC&state=false",
         ]
@@ -1693,6 +1691,38 @@ fn cleanup_for_an_uncollected_press_records_its_runtime() {
             "key=KeyC&state=true",
             "key=KeyB&state=false",
             "key=KeyC&state=false",
+        ]
+    );
+    server.abort();
+}
+
+// Pinned to the current-thread runtime, as the key case is, so the movement's task runs its settlement after the movement is abandoned.
+#[tokio::test(flavor = "current_thread")]
+async fn movement_abandoned_during_owed_cleanup_is_not_sent() {
+    let (mut endpoint, ca, calls, server) = fixture().await;
+    endpoint.set_path("/gated/");
+    let device = Arc::new(client(endpoint, Some(ca)));
+    device.login("test-user", "test-password").await.unwrap();
+    let woken = Arc::new(Woken(tokio::sync::Notify::new()));
+    let mut press = Box::pin(device.key("KeyA", true));
+    poll_once(press.as_mut(), &woken);
+    arrival(&calls).await;
+    calls.4.notify_one();
+    within("the outcome to be delivered", woken.0.notified()).await;
+    let mover = device.clone();
+    let movement = queue(async move { mover.mouse_move(1, 2).await }).await;
+    drop(press);
+    arrival(&calls).await;
+    movement.abort();
+    assert!(movement.await.unwrap_err().is_cancelled());
+    calls.4.notify_one();
+    drive(&calls, device.key("KeyC", true)).await.unwrap();
+    assert_eq!(
+        movement_events(&calls),
+        [
+            "hid/events/send_key?key=KeyA&state=true",
+            "hid/events/send_key?key=KeyA&state=false",
+            "hid/events/send_key?key=KeyC&state=true",
         ]
     );
     server.abort();
