@@ -36,9 +36,10 @@ async fn gated_input(State(calls): State<Calls>, uri: Uri) -> impl IntoResponse 
     calls.3.notify_one();
     calls.4.notified().await;
     let query = uri.query().unwrap();
-    // "ambiguous" fails its release and "late" its press, standing for requests a server may still apply after the timeout.
+    // "ambiguous" fails its release, "late" its press and a move to x = -1 the movement, standing for requests a server may still apply after the timeout.
     if (query.contains("ambiguous") && query.contains("state=false"))
         || (query.contains("late") && query.contains("state=true"))
+        || query.contains("to_x=-1")
     {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -321,6 +322,8 @@ async fn fixture() -> (Url, Vec<u8>, Calls, tokio::task::JoinHandle<()>) {
         .route("/gated/api/auth/check", get(status))
         .route("/gated/api/hid/events/send_key", post(gated_input))
         .route("/gated/api/hid/events/send_mouse_button", post(gated_input))
+        .route("/gated/api/hid", get(status))
+        .route("/gated/api/hid/events/send_mouse_move", post(gated_input))
         .route("/api/hid/events/send_key", post(status))
         .route("/api/hid/events/send_mouse_move", post(control))
         .route("/api/atx/power", post(control))
@@ -1198,6 +1201,95 @@ fn release_interrupted_by_runtime_shutdown_is_finished_by_the_next_lock_holder()
             "key=KeyC&state=true",
         ]
     );
+    server.abort();
+}
+
+/// Returns the recorded movement requests and HID state reads, in order.
+fn movement_events(calls: &Calls) -> Vec<String> {
+    calls
+        .0
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|v| v.starts_with("/gated/api/hid"))
+        .map(|v| v.trim_start_matches("/gated/api/").to_owned())
+        .collect()
+}
+
+#[tokio::test]
+async fn owed_release_is_sent_before_mouse_movement() {
+    let (mut endpoint, ca, calls, server) = fixture().await;
+    endpoint.set_path("/gated/");
+    let device = client(endpoint, Some(ca));
+    device.login("test-user", "test-password").await.unwrap();
+    let woken = Arc::new(Woken(tokio::sync::Notify::new()));
+    let mut press = Box::pin(device.key("KeyA", true));
+    poll_once(press.as_mut(), &woken);
+    arrival(&calls).await;
+    calls.4.notify_one();
+    within("the outcome to be delivered", woken.0.notified()).await;
+    drop(press);
+    drive(&calls, device.mouse_move(1, 2)).await.unwrap();
+    assert_eq!(
+        movement_events(&calls),
+        [
+            "hid/events/send_key?key=KeyA&state=true",
+            "hid/events/send_key?key=KeyA&state=false",
+            "hid",
+            "hid/events/send_mouse_move?to_x=1&to_y=2",
+        ]
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn failed_mouse_movement_leaves_the_session_indeterminate() {
+    let (mut endpoint, ca, calls, server) = fixture().await;
+    endpoint.set_path("/gated/");
+    let device = client(endpoint, Some(ca));
+    device.login("test-user", "test-password").await.unwrap();
+    assert!(matches!(
+        drive(&calls, device.mouse_move(-1, 2)).await,
+        Err(Error::AmbiguousInput(_))
+    ));
+    assert!(matches!(
+        device.release_inputs().await,
+        Err(Error::AmbiguousInput(_))
+    ));
+    server.abort();
+}
+
+#[test]
+fn mouse_movement_interrupted_by_runtime_shutdown_leaves_the_session_indeterminate() {
+    let server_runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let (mut endpoint, ca, calls, server) = server_runtime.block_on(fixture());
+    endpoint.set_path("/gated/");
+    let device = client(endpoint, Some(ca));
+    server_runtime
+        .block_on(device.login("test-user", "test-password"))
+        .unwrap();
+    let input_runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let mut movement = Box::pin(device.mouse_move(1, 2));
+    input_runtime.block_on(async {
+        tokio::select! {
+            result = &mut movement => panic!("movement completed unexpectedly: {result:?}"),
+            () = arrival(&calls) => {}
+        }
+    });
+    // Shutdown drops the movement task with its request in flight, so the device may still apply it.
+    drop(movement);
+    drop(input_runtime);
+    calls.4.notify_one();
+    assert!(matches!(
+        server_runtime.block_on(device.release_inputs()),
+        Err(Error::AmbiguousInput(_))
+    ));
     server.abort();
 }
 
