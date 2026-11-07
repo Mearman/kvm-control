@@ -93,6 +93,7 @@ async fn device(body: impl Into<Vec<u8>>) -> (Kvmd, Arc<Notify>, tokio::task::Jo
         snapshot_proven: Default::default(),
         video_proven: Default::default(),
         cleanup_on_drop: false,
+        input_runtime: Default::default(),
     };
     (device, closed, task)
 }
@@ -123,6 +124,7 @@ fn input_device(address: std::net::SocketAddr) -> Kvmd {
         auth_headers: Default::default(),
         approval_token: Default::default(),
         cleanup_on_drop: true,
+        input_runtime: Default::default(),
     }
 }
 
@@ -189,6 +191,7 @@ async fn cancelled_press_finishes_before_concurrent_release() {
         auth_headers: Default::default(),
         approval_token: Default::default(),
         cleanup_on_drop: true,
+        input_runtime: Default::default(),
     });
     let pressing = device.clone();
     let task = tokio::spawn(async move { pressing.key("KeyA", true).await });
@@ -293,6 +296,118 @@ async fn ambiguous_press_is_reported_and_last_owner_releases_it() {
             .await
             .is_err()
     );
+}
+
+#[tokio::test]
+async fn timed_out_press_remains_indeterminate_after_release() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut device = input_device(listener.local_addr().unwrap());
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_millis(100))
+        .http1_only()
+        .build()
+        .unwrap();
+    device.client = Arc::new(tokio::sync::RwLock::new(crate::Session {
+        client: client.clone(),
+        video: client,
+        cookies: Default::default(),
+    }));
+    let (applied_tx, applied_rx) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        let (mut press, _) = listener.accept().await.unwrap();
+        let mut buffer = [0; 4096];
+        let n = press.read(&mut buffer).await.unwrap();
+        assert!(String::from_utf8_lossy(&buffer[..n]).contains("state=true"));
+        let (mut release, _) = listener.accept().await.unwrap();
+        let n = release.read(&mut buffer).await.unwrap();
+        assert!(String::from_utf8_lossy(&buffer[..n]).contains("state=false"));
+        release
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}",
+            )
+            .await
+            .unwrap();
+        applied_rx.await.unwrap();
+        drop(press);
+    });
+    assert!(matches!(
+        device.key("KeyA", true).await,
+        Err(kvm_core::Error::AmbiguousInput(_))
+    ));
+    assert!(matches!(
+        device.release_inputs().await,
+        Err(kvm_core::Error::AmbiguousInput(_))
+    ));
+    applied_tx.send(()).unwrap();
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn ambiguous_release_is_not_replayed_on_drop() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let device = input_device(listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        let mut buffer = [0; 4096];
+        let (mut press, _) = listener.accept().await.unwrap();
+        press.read(&mut buffer).await.unwrap();
+        press
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}",
+            )
+            .await
+            .unwrap();
+        let (mut release, _) = listener.accept().await.unwrap();
+        release.read(&mut buffer).await.unwrap();
+        release
+            .write_all(b"HTTP/1.1 500 Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        listener
+    });
+    device.key("KeyA", true).await.unwrap();
+    assert!(matches!(
+        device.release_inputs().await,
+        Err(kvm_core::Error::AmbiguousInput(_))
+    ));
+    drop(device);
+    let listener = server.await.unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), listener.accept())
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn drop_on_ordinary_thread_uses_captured_runtime() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let device = input_device(listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        let mut buffer = [0; 4096];
+        let (mut press, _) = listener.accept().await.unwrap();
+        press.read(&mut buffer).await.unwrap();
+        press
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}",
+            )
+            .await
+            .unwrap();
+        let (mut release, _) = listener.accept().await.unwrap();
+        let n = release.read(&mut buffer).await.unwrap();
+        assert!(String::from_utf8_lossy(&buffer[..n]).contains("state=false"));
+        release
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}",
+            )
+            .await
+            .unwrap();
+    });
+    device.key("KeyA", true).await.unwrap();
+    std::thread::spawn(move || drop(device)).join().unwrap();
+    tokio::time::timeout(Duration::from_secs(3), server)
+        .await
+        .unwrap()
+        .unwrap();
 }
 
 #[tokio::test]
@@ -557,6 +672,7 @@ async fn cancelled_partial_frame_can_resume() {
         snapshot_proven: Default::default(),
         video_proven: Default::default(),
         cleanup_on_drop: false,
+        input_runtime: Default::default(),
     };
     let mut video = device.video().await.unwrap();
     assert!(
@@ -627,6 +743,7 @@ async fn relogin_waits_for_video_establishment() {
         snapshot_proven: Default::default(),
         video_proven: Default::default(),
         cleanup_on_drop: false,
+        input_runtime: Default::default(),
     });
     let video_device = device.clone();
     let video_task = tokio::spawn(async move { video_device.video().await });
@@ -697,6 +814,7 @@ async fn coalesced_http_response_delivers_multiple_frames() {
         snapshot_proven: Default::default(),
         video_proven: Default::default(),
         cleanup_on_drop: false,
+        input_runtime: Default::default(),
     };
     let mut video = device.video().await.unwrap();
     assert_eq!(video.next_frame().await.unwrap().unwrap().jpeg, jpeg());
@@ -775,6 +893,7 @@ async fn maximum_frame_with_maximum_headers_and_boundary() {
         snapshot_proven: Default::default(),
         video_proven: Default::default(),
         cleanup_on_drop: false,
+        input_runtime: Default::default(),
     };
     let mut video = device.video().await.unwrap();
     assert_eq!(video.next_frame().await.unwrap().unwrap().jpeg.len(), FRAME);

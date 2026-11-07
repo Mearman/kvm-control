@@ -144,7 +144,7 @@ impl reqwest::cookie::CookieStore for SessionCookies {
 
 /// A KVMD connection with an explicitly authenticated session.
 ///
-/// Input requests already submitted continue after caller cancellation. Dropping the last owner attempts to release tracked inputs while the Tokio runtime remains alive; process or runtime termination provides no cleanup guarantee.
+/// Input requests already submitted continue after caller cancellation. Ambiguous outcomes permanently render cleanup indeterminate because a server may apply a timed-out request later. An ambiguous release is not replayed automatically. Dropping the last owner attempts to release tracked inputs on the captured runtime; process or runtime termination provides no cleanup guarantee.
 ///
 /// Cookies are accepted only from login or approval responses. Later `Set-Cookie` headers, including rotation and expiry updates, are ignored. The inspected [PiKVM](https://github.com/pikvm/kvmd/blob/fcb903eb3be70d8eee4aee99e5fcc1c743e3ccef/kvmd/apps/kvmd/api/auth.py) and [GLKVM](https://github.com/gl-inet/glkvm/blob/3e8dd23c4bd638a4650433664cc3b0f3b4d29395/kvmd/apps/kvmd/api/auth.py) revisions issue authentication cookies on login, and GLKVM also issues them on approval. Other firmware requiring cookie rotation is not supported. Server-side expiry or revocation can return an authentication error; call `login` again with fresh credentials and complete any approval. Consequential and input requests are never automatically replayed, and ambiguous outcomes require observation before a caller decides what to do.
 pub struct Kvmd {
@@ -158,6 +158,7 @@ pub struct Kvmd {
     snapshot_proven: AtomicBool,
     video_proven: Arc<AtomicBool>,
     cleanup_on_drop: bool,
+    input_runtime: Arc<std::sync::Mutex<Option<tokio::runtime::Handle>>>,
 }
 
 impl std::ops::Deref for Session {
@@ -171,6 +172,9 @@ impl std::ops::Deref for Session {
 struct Inputs {
     keys: BTreeSet<String>,
     buttons: BTreeSet<String>,
+    uncertain_keys: BTreeSet<String>,
+    uncertain_buttons: BTreeSet<String>,
+    indeterminate: bool,
 }
 
 impl Kvmd {
@@ -200,6 +204,7 @@ impl Kvmd {
             snapshot_proven: AtomicBool::new(false),
             video_proven: Arc::new(AtomicBool::new(false)),
             cleanup_on_drop: true,
+            input_runtime: Arc::new(std::sync::Mutex::new(None)),
         })
     }
 
@@ -506,7 +511,15 @@ impl Kvmd {
             auth_headers: self.auth_headers.clone(),
             approval_token: Mutex::new(None),
             cleanup_on_drop: false,
+            input_runtime: self.input_runtime.clone(),
         }
+    }
+
+    fn capture_input_runtime(&self) {
+        *self
+            .input_runtime
+            .lock()
+            .expect("input runtime lock poisoned") = Some(tokio::runtime::Handle::current());
     }
 
     async fn input(&self, path: &str, params: &[(&str, String)]) -> Result<()> {
@@ -634,46 +647,74 @@ impl Device for Kvmd {
     }
 
     async fn key(&self, key: &str, pressed: bool) -> Result<()> {
+        self.capture_input_runtime();
         let mut inputs = self.inputs.clone().lock_owned().await;
         let worker = self.input_worker();
         let key = key.to_owned();
         tokio::spawn(async move {
-            if pressed {
-                inputs.keys.insert(key.clone());
-            }
-            worker
+            let result = worker
                 .input(
                     "hid/events/send_key",
                     &[("key", key.clone()), ("state", pressed.to_string())],
                 )
-                .await?;
-            if !pressed {
-                inputs.keys.remove(&key);
+                .await;
+            match result {
+                Ok(()) => {
+                    if pressed {
+                        inputs.keys.insert(key);
+                    } else {
+                        inputs.keys.remove(&key);
+                    }
+                    Ok(())
+                }
+                Err(error) => {
+                    if pressed {
+                        inputs.keys.insert(key.clone());
+                    } else {
+                        inputs.keys.remove(&key);
+                    }
+                    inputs.uncertain_keys.insert(key);
+                    inputs.indeterminate = true;
+                    Err(error)
+                }
             }
-            Ok(())
         })
         .await
         .map_err(|_| Error::AmbiguousInput("input task failed".into()))?
     }
 
     async fn mouse_button(&self, button: &str, pressed: bool) -> Result<()> {
+        self.capture_input_runtime();
         let mut inputs = self.inputs.clone().lock_owned().await;
         let worker = self.input_worker();
         let button = button.to_owned();
         tokio::spawn(async move {
-            if pressed {
-                inputs.buttons.insert(button.clone());
-            }
-            worker
+            let result = worker
                 .input(
                     "hid/events/send_mouse_button",
                     &[("button", button.clone()), ("state", pressed.to_string())],
                 )
-                .await?;
-            if !pressed {
-                inputs.buttons.remove(&button);
+                .await;
+            match result {
+                Ok(()) => {
+                    if pressed {
+                        inputs.buttons.insert(button);
+                    } else {
+                        inputs.buttons.remove(&button);
+                    }
+                    Ok(())
+                }
+                Err(error) => {
+                    if pressed {
+                        inputs.buttons.insert(button.clone());
+                    } else {
+                        inputs.buttons.remove(&button);
+                    }
+                    inputs.uncertain_buttons.insert(button);
+                    inputs.indeterminate = true;
+                    Err(error)
+                }
             }
-            Ok(())
         })
         .await
         .map_err(|_| Error::AmbiguousInput("input task failed".into()))?
@@ -815,6 +856,7 @@ impl Device for Kvmd {
     }
 
     async fn release_inputs(&self) -> Result<()> {
+        self.capture_input_runtime();
         let mut inputs = self.inputs.clone().lock_owned().await;
         let worker = self.input_worker();
         tokio::spawn(async move {
@@ -830,6 +872,9 @@ impl Device for Kvmd {
                 {
                     inputs.keys.remove(&key);
                 } else {
+                    inputs.keys.remove(&key);
+                    inputs.uncertain_keys.insert(key);
+                    inputs.indeterminate = true;
                     failed = true;
                 }
             }
@@ -844,12 +889,15 @@ impl Device for Kvmd {
                 {
                     inputs.buttons.remove(&button);
                 } else {
+                    inputs.buttons.remove(&button);
+                    inputs.uncertain_buttons.insert(button);
+                    inputs.indeterminate = true;
                     failed = true;
                 }
             }
-            if failed {
+            if failed || inputs.indeterminate {
                 Err(Error::AmbiguousInput(
-                    "one or more releases could not be confirmed".into(),
+                    "input session remains indeterminate after an ambiguous operation".into(),
                 ))
             } else {
                 Ok(())
@@ -863,7 +911,12 @@ impl Device for Kvmd {
 impl Drop for Kvmd {
     fn drop(&mut self) {
         if self.cleanup_on_drop {
-            if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            if let Some(runtime) = self
+                .input_runtime
+                .lock()
+                .expect("input runtime lock poisoned")
+                .clone()
+            {
                 let worker = self.input_worker();
                 runtime.spawn(async move {
                     if let Err(error) = worker.release_inputs().await {
