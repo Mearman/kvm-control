@@ -283,7 +283,7 @@ impl Kvmd {
         self.profile
     }
 
-    /// Authenticates using KVMD's cookie login. Rejection does not identify whether TOTP is required.
+    /// Authenticates using KVMD's cookie login. Rejection does not identify whether TOTP is required. Tracked inputs must first be released; an ambiguous release permits reauthentication but leaves the input session indeterminate.
     pub async fn login(&self, username: &str, password: &str) -> Result<LoginState> {
         self.login_with_totp(username, password, None).await
     }
@@ -315,8 +315,10 @@ impl Kvmd {
             ));
         }
         let inputs = self.inputs.lock().await;
-        if !inputs.keys.is_empty() || !inputs.buttons.is_empty() || inputs.indeterminate {
-            return Err(Error::AmbiguousInput("release inputs before changing authentication; an indeterminate session cannot be reauthenticated safely".into()));
+        if !inputs.keys.is_empty() || !inputs.buttons.is_empty() {
+            return Err(Error::AmbiguousInput(
+                "release tracked inputs before changing authentication".into(),
+            ));
         }
         let mut pending = self.approval_token.lock().await;
         *pending = None;
@@ -369,8 +371,10 @@ impl Kvmd {
     /// Checks a pending GLKVM approval without exposing its temporary token.
     pub async fn complete_approval(&self) -> Result<LoginState> {
         let inputs = self.inputs.lock().await;
-        if !inputs.keys.is_empty() || !inputs.buttons.is_empty() || inputs.indeterminate {
-            return Err(Error::AmbiguousInput("release inputs before changing authentication; an indeterminate session cannot be reauthenticated safely".into()));
+        if !inputs.keys.is_empty() || !inputs.buttons.is_empty() {
+            return Err(Error::AmbiguousInput(
+                "release tracked inputs before changing authentication".into(),
+            ));
         }
         let mut pending = self.approval_token.lock().await;
         let token = pending

@@ -494,8 +494,16 @@ async fn expired_session_requires_explicit_reauthentication() {
         device.check_auth().await,
         Err(Error::Authentication)
     ));
+    assert!(matches!(
+        device.release_inputs().await,
+        Err(Error::AmbiguousInput(_))
+    ));
     device.login("test-user", "test-password").await.unwrap();
     device.check_auth().await.unwrap();
+    assert!(matches!(
+        device.release_inputs().await,
+        Err(Error::AmbiguousInput(_))
+    ));
     let paths = calls.0.lock().unwrap();
     assert_eq!(
         paths

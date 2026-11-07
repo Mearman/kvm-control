@@ -280,13 +280,10 @@ async fn ambiguous_press_is_reported_and_last_owner_releases_it() {
     let device = input_device(listener.local_addr().unwrap());
     let server = tokio::spawn(async move {
         let (mut press, _) = listener.accept().await.unwrap();
-        let mut request = [0; 4096];
-        let n = press.read(&mut request).await.unwrap();
-        assert!(String::from_utf8_lossy(&request[..n]).contains("state=true"));
+        assert!(read_request(&mut press).await.contains("state=true"));
         press.write_all(b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.unwrap();
         let (mut release, _) = listener.accept().await.unwrap();
-        let n = release.read(&mut request).await.unwrap();
-        assert!(String::from_utf8_lossy(&request[..n]).contains("state=false"));
+        assert!(read_request(&mut release).await.contains("state=false"));
         release
             .write_all(
                 b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}",
@@ -328,12 +325,9 @@ async fn timed_out_press_remains_indeterminate_after_release() {
     let (applied_tx, applied_rx) = tokio::sync::oneshot::channel();
     let server = tokio::spawn(async move {
         let (mut press, _) = listener.accept().await.unwrap();
-        let mut buffer = [0; 4096];
-        let n = press.read(&mut buffer).await.unwrap();
-        assert!(String::from_utf8_lossy(&buffer[..n]).contains("state=true"));
+        assert!(read_request(&mut press).await.contains("state=true"));
         let (mut release, _) = listener.accept().await.unwrap();
-        let n = release.read(&mut buffer).await.unwrap();
-        assert!(String::from_utf8_lossy(&buffer[..n]).contains("state=false"));
+        assert!(read_request(&mut release).await.contains("state=false"));
         release
             .write_all(
                 b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}",
@@ -474,7 +468,6 @@ async fn cancelled_waiter_cannot_replace_cleanup_runtime() {
     let (accepted_tx, accepted_rx) = tokio::sync::oneshot::channel();
     let (finish_tx, finish_rx) = tokio::sync::oneshot::channel();
     let server = tokio::spawn(async move {
-        let mut buffer = [0; 4096];
         let (mut press, _) = listener.accept().await.unwrap();
         assert!(read_input_request(&mut press).await.contains("state=true"));
         accepted_tx.send(()).unwrap();
@@ -486,8 +479,7 @@ async fn cancelled_waiter_cannot_replace_cleanup_runtime() {
             .await
             .unwrap();
         let (mut release, _) = listener.accept().await.unwrap();
-        let n = release.read(&mut buffer).await.unwrap();
-        assert!(String::from_utf8_lossy(&buffer[..n]).contains("state=false"));
+        assert!(read_request(&mut release).await.contains("state=false"));
         release
             .write_all(
                 b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}",
@@ -566,7 +558,6 @@ async fn drop_on_ordinary_thread_uses_captured_runtime() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let device = input_device(listener.local_addr().unwrap());
     let server = tokio::spawn(async move {
-        let mut buffer = [0; 4096];
         let (mut press, _) = listener.accept().await.unwrap();
         assert!(read_input_request(&mut press).await.contains("state=true"));
         press
@@ -576,8 +567,7 @@ async fn drop_on_ordinary_thread_uses_captured_runtime() {
             .await
             .unwrap();
         let (mut release, _) = listener.accept().await.unwrap();
-        let n = release.read(&mut buffer).await.unwrap();
-        assert!(String::from_utf8_lossy(&buffer[..n]).contains("state=false"));
+        assert!(read_request(&mut release).await.contains("state=false"));
         release
             .write_all(
                 b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}",
