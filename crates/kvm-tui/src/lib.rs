@@ -50,8 +50,10 @@ pub struct App {
     controls_completed: u64,
     /// The message shown when input mode was entered, so leaving input mode can replace it while it is still shown, but not a message written since (a control's outcome, a failed key).
     input_entry_message: Option<String>,
-    /// Why a refresh ended input mode, and how its release of inputs went; shown first on the device-state line. A pending or uncertain release keeps it there until input mode is entered again or a later release succeeds, since a key or button may still be held on the remote host; once a release has succeeded, the next refresh outcome replaces it.
+    /// Why a refresh ended input mode, and whether the release it requires is still running; shown on the device-state line after any uncertain cleanup. A pending release keeps it until the release finishes, since `i` waits on it; the next refresh outcome replaces a finished one.
     input_ended: Option<InputEnded>,
+    /// The error of the last release of inputs that failed, from any source (a refresh ending input mode, `F12`, focus loss, a closing stream, a failed input), until a later release succeeds. It leads the device-state line, since a key or button may still be held on the remote host. The device's contract (`Device::release_inputs`) is that a release succeeds only once no earlier input is unconfirmed; with `kvm-kvmd` that is never, once the session is indeterminate, so the warning stays for the run.
+    cleanup_uncertain: Option<String>,
 }
 
 /// A refresh that ended input mode: the cause and the state of the release it requires.
@@ -61,22 +63,23 @@ struct InputEnded {
     release: Release,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Release {
     Pending,
-    Done,
-    Failed(String),
+    /// Finished; whether it succeeded is recorded in `App::cleanup_uncertain`.
+    Finished,
 }
 
 impl InputEnded {
-    /// The release state comes first, since the line is cut off at the width and an uncertain cleanup (a key or button may still be held on the remote host) must stay visible on the narrowest screens.
-    fn line(&self) -> String {
-        let release = match &self.release {
-            Release::Pending => "Releasing inputs".to_owned(),
-            Release::Done => "Inputs released".to_owned(),
-            Release::Failed(error) => format!("Cleanup uncertain: {error}"),
-        };
-        format!("{release}; input mode ended ({})", self.cause)
+    /// The release state comes first, since the line is cut off at the width; a failed release is shown by the uncertain-cleanup warning before this.
+    fn line(&self, cleanup_uncertain: bool) -> String {
+        match (self.release, cleanup_uncertain) {
+            (Release::Pending, _) => format!("Releasing inputs; input mode ended ({})", self.cause),
+            (Release::Finished, false) => {
+                format!("Inputs released; input mode ended ({})", self.cause)
+            }
+            (Release::Finished, true) => format!("Input mode ended ({})", self.cause),
+        }
     }
 }
 
@@ -130,6 +133,7 @@ impl Default for App {
             controls_completed: 0,
             input_entry_message: None,
             input_ended: None,
+            cleanup_uncertain: None,
         }
     }
 }
@@ -210,21 +214,24 @@ impl App {
         if self
             .input_ended
             .as_ref()
-            .is_some_and(|ended| ended.release == Release::Done)
+            .is_some_and(|ended| ended.release == Release::Finished)
         {
             self.input_ended = None;
         }
     }
 
-    /// Releases every tracked input. A success also settles an uncertain cleanup on the notice, which then gives way to the next outcome.
+    /// Records a release's result: a failure sets the uncertain-cleanup warning and only a success clears it, as `Device::release_inputs` reports a success only once no earlier input is unconfirmed.
+    fn record_release(&mut self, release: &kvm_core::Result<()>) {
+        match release {
+            Ok(()) => self.cleanup_uncertain = None,
+            Err(error) => self.cleanup_uncertain = Some(error.to_string()),
+        }
+    }
+
+    /// Releases every tracked input and records the result; every release the client makes goes through here, or through `input_release_finished` for the one a refresh requires.
     async fn release_tracked(&mut self, device: &dyn Device) -> kvm_core::Result<()> {
         let release = device.release_inputs().await;
-        if release.is_ok()
-            && let Some(ended) = &mut self.input_ended
-            && matches!(ended.release, Release::Failed(_))
-        {
-            ended.release = Release::Done;
-        }
+        self.record_release(&release);
         release
     }
 
@@ -237,13 +244,14 @@ impl App {
 
     /// Records how the release after a refresh ended input mode went. A failed release also goes at the start of the message, which wraps, since a key or button may still be held on the remote host; a waiting `i`'s message is replaced either way.
     pub fn input_release_finished(&mut self, release: kvm_core::Result<()>) {
+        self.record_release(&release);
         let waiting = self.message == RELEASE_WAIT;
         let Some(ended) = &mut self.input_ended else {
             return;
         };
+        ended.release = Release::Finished;
         match release {
             Ok(()) => {
-                ended.release = Release::Done;
                 if waiting {
                     self.message = if self.input_available() {
                         "Inputs released; i enters input mode".into()
@@ -255,7 +263,6 @@ impl App {
             Err(error) => {
                 // Short, so a message written earlier (a control's outcome) still fits beside it; the device-state line carries it durably.
                 let warning = format!("Cleanup uncertain: {error}");
-                ended.release = Release::Failed(error.to_string());
                 self.message = if waiting || self.message.is_empty() {
                     warning
                 } else {
@@ -281,17 +288,21 @@ impl App {
         }
     }
 
-    /// The device-state line: an end of input mode first, since the line is cut off at the width and that is what the user must see, then a read in flight or the outcome of the last one.
+    /// The device-state line, cut off at the width, so it is ordered by what the user must see: an uncertain cleanup first, then an end of input mode, then a read in flight or the outcome of the last one.
     fn device_state_line(&self) -> String {
-        let state = if self.refreshing {
+        let mut parts = Vec::new();
+        if let Some(error) = &self.cleanup_uncertain {
+            parts.push(format!("Cleanup uncertain: {error}"));
+        }
+        if let Some(ended) = &self.input_ended {
+            parts.push(ended.line(self.cleanup_uncertain.is_some()));
+        }
+        parts.push(if self.refreshing {
             "Refreshing device state".to_owned()
         } else {
             self.refresh_note.clone()
-        };
-        match &self.input_ended {
-            Some(ended) => format!("{}; {state}", ended.line()),
-            None => state,
-        }
+        });
+        parts.join("; ")
     }
 
     /// Records a control's outcome as the message, so it is not replaced by a refresh, and marks the device state shown as predating it.
@@ -647,6 +658,11 @@ impl App {
                     if !self.enhanced_keyboard {
                         self.message
                             .push_str("; terminal lacks key releases, keys are tapped");
+                    }
+                    // Entering input mode settles nothing: the uncertain-cleanup warning stays, and the message repeats it.
+                    if self.cleanup_uncertain.is_some() {
+                        self.message
+                            .push_str("; cleanup is uncertain, earlier inputs may still be held");
                     }
                     self.input_entry_message = Some(self.message.clone());
                     self.input_ended = None;
@@ -4159,16 +4175,164 @@ mod tests {
         app.finish_refresh(&device, later).await;
         assert_eq!(app.device_state_line(), "Device state read");
 
-        // An uncertain cleanup is settled by the next successful release, here from focus loss's path, and then gives way.
-        app.input_ended = Some(InputEnded {
-            cause: "capabilities could not be read",
-            release: Release::Failed("cleanup failed".into()),
-        });
+        // An uncertain cleanup is settled only by a later successful release, through the helper every release site uses.
+        app.cleanup_uncertain = Some("cleanup failed".into());
         app.release_tracked(&device).await.unwrap();
-        assert!(app.device_state_line().starts_with("Inputs released"));
-        let later = read_with(&device, Ok(fake_capabilities(Capability::Supported)), 0).await;
-        app.finish_refresh(&device, later).await;
         assert_eq!(app.device_state_line(), "Device state read");
+    }
+
+    fn failing_cleanup() -> FakeDevice {
+        FakeDevice {
+            fail_cleanup: true,
+            ..FakeDevice::default()
+        }
+    }
+
+    // Scenario A: a key request is ambiguous and the release after it fails; a control's outcome then replaces the message, and the warning must stay on the row.
+    #[tokio::test]
+    async fn a_failed_release_after_an_ambiguous_key_stays_on_screen() {
+        let device = FakeDevice {
+            fail_key: true,
+            fail_cleanup: true,
+            ..FakeDevice::default()
+        };
+        let mut app = App::default();
+        app.refresh(&device).await;
+        app.key(&device, KeyCode::Char('i')).await;
+        app.key(&device, KeyCode::Char('a')).await;
+        assert!(!app.control);
+        app.control_finished(Ok(kvm_core::ControlOutcome::Unverified));
+        assert!(!app.message.contains("cleanup"));
+        for width in [20, 52, 80] {
+            assert!(
+                state_row(&app, width).starts_with("Cleanup uncertain"),
+                "width {width}"
+            );
+        }
+    }
+
+    // Scenario B, and `i` not clearing the warning: a refresh's release fails, `i` re-enters input mode, F12's release fails too and a control's outcome replaces the message.
+    #[tokio::test]
+    async fn entering_input_mode_keeps_an_uncertain_cleanup() {
+        let device = failing_cleanup();
+        let mut app = App::default();
+        app.refresh(&device).await;
+        app.key(&device, KeyCode::Char('i')).await;
+        let changed = read_with(
+            &device,
+            Ok(with_mode(
+                kvm_core::MouseMode::Relative,
+                Capability::Supported,
+            )),
+            0,
+        )
+        .await;
+        app.finish_refresh(&device, changed).await;
+        assert!(app.device_state_line().starts_with("Cleanup uncertain"));
+        app.key(&device, KeyCode::Char('i')).await;
+        assert!(app.control);
+        assert!(app.message.contains("cleanup is uncertain"));
+        assert!(state_row(&app, 20).starts_with("Cleanup uncertain"));
+        app.key(&device, KeyCode::F(12)).await;
+        app.control_finished(Ok(kvm_core::ControlOutcome::Unverified));
+        assert!(state_row(&app, 20).starts_with("Cleanup uncertain"));
+    }
+
+    // Breaks if a release site stops recording its result: each of F12, focus loss's path and a failed input's cleanup must set the warning on failure and clear it on success.
+    #[tokio::test]
+    async fn every_release_site_records_its_result() {
+        // F12.
+        let mut app = App::default();
+        app.refresh(&failing_cleanup()).await;
+        app.key(&failing_cleanup(), KeyCode::Char('i')).await;
+        app.key(&failing_cleanup(), KeyCode::F(12)).await;
+        assert!(app.cleanup_uncertain.is_some());
+        app.key(&FakeDevice::default(), KeyCode::Char('i')).await;
+        app.key(&FakeDevice::default(), KeyCode::F(12)).await;
+        assert!(app.cleanup_uncertain.is_none());
+        // A failed key's cleanup.
+        let failing_key = FakeDevice {
+            fail_key: true,
+            fail_cleanup: true,
+            ..FakeDevice::default()
+        };
+        app.key(&failing_key, KeyCode::Char('i')).await;
+        app.key(&failing_key, KeyCode::Char('a')).await;
+        assert!(app.cleanup_uncertain.is_some());
+        let clean_key = FakeDevice {
+            fail_key: true,
+            ..FakeDevice::default()
+        };
+        app.key(&clean_key, KeyCode::Char('i')).await;
+        app.key(&clean_key, KeyCode::Char('a')).await;
+        assert!(app.cleanup_uncertain.is_none());
+        // A mouse release outside the video, with no viewport to map it to.
+        app.key(&failing_cleanup(), KeyCode::Char('i')).await;
+        app.mouse(
+            &failing_cleanup(),
+            MouseEvent {
+                kind: MouseEventKind::Up(MouseButton::Left),
+                column: 0,
+                row: 0,
+                modifiers: crossterm::event::KeyModifiers::NONE,
+            },
+            ratatui::layout::Rect::new(0, 0, 4, 4),
+        )
+        .await;
+        assert!(app.cleanup_uncertain.is_some());
+    }
+
+    // Breaks if a non-test release bypasses the recording helper: the only direct calls allowed are the helper itself, the waited and background refresh releases (recorded by `input_release_finished`), the exit cleanup and the drop guard.
+    #[test]
+    fn releases_go_through_the_recording_helper() {
+        let source = include_str!("lib.rs");
+        let code = &source[..source.find("#[cfg(test)]\nmod tests").unwrap()];
+        let direct = code.matches(".release_inputs().await").count();
+        let allowed = [
+            "let release = device.release_inputs().await;\n        self.record_release",
+            "let release = device.release_inputs().await;\n            self.input_release_finished",
+            "device.release_inputs().await\n                        })));",
+            "let cleanup = device.release_inputs().await.map_err(io::Error::other);",
+            "if let Err(error) = device.release_inputs().await {\n                    eprintln!(\"Input cleanup uncertain after cancellation",
+        ];
+        for site in allowed {
+            assert_eq!(code.matches(site).count(), 1, "{site}");
+        }
+        assert_eq!(direct, allowed.len());
+    }
+
+    // T1: after a change of only the mouse mode, input support remains, so the finished release offers `i` again; after a failed read it does not.
+    #[tokio::test]
+    async fn a_finished_release_offers_i_only_when_it_would_enter_input_mode() {
+        let device = FakeDevice::default();
+        let mut app = App::default();
+        app.refresh(&device).await;
+        app.key(&device, KeyCode::Char('i')).await;
+        assert!(
+            app.apply_refresh(
+                read_with(
+                    &device,
+                    Ok(with_mode(
+                        kvm_core::MouseMode::Relative,
+                        Capability::Supported
+                    )),
+                    0
+                )
+                .await
+            )
+        );
+        app.key(&device, KeyCode::Char('i')).await;
+        assert_eq!(app.message, RELEASE_WAIT);
+        app.input_release_finished(Ok(()));
+        assert_eq!(app.message, "Inputs released; i enters input mode");
+
+        let mut app = App::default();
+        app.refresh(&device).await;
+        app.key(&device, KeyCode::Char('i')).await;
+        assert!(app.apply_refresh(failed_read()));
+        app.key(&device, KeyCode::Char('i')).await;
+        app.input_release_finished(Ok(()));
+        assert_eq!(app.message, "Inputs released");
     }
 
     // Breaks if a read applied while the release is pending drops the notice, which would let `i` re-enter input mode and the release lift what is pressed next.
