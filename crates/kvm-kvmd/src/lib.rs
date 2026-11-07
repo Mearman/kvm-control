@@ -519,7 +519,6 @@ impl Drop for Collect<'_> {
             return;
         }
         // Set only after the task recorded this outcome, and the task never takes the flag after delivering it, so whichever lock holder takes the flag next releases this input.
-        self.device.cleanup_pending.store(true, Ordering::SeqCst);
         if let Some(runtime) = self
             .device
             .input_runtime
