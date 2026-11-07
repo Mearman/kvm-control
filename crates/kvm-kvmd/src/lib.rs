@@ -1151,9 +1151,6 @@ impl Kvmd {
             Err(error) => Err(error),
         };
         // Nothing has been submitted yet, so an abandoned caller needs neither the movement nor a report of why it would not have been sent.
-        if caller.is_closed() {
-            return Moved::NotSent(Ok(()));
-        }
         if let Err(error) = checked {
             return Moved::NotSent(Err(error));
         }
