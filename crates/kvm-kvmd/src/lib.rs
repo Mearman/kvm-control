@@ -779,7 +779,7 @@ impl Kvmd {
                 "cookie login cannot replace configured header credentials".into(),
             ));
         }
-        let mut inputs = self.settled_inputs().await?;
+        let inputs = self.settled_inputs().await?;
         if !inputs.keys.is_empty() || !inputs.buttons.is_empty() {
             return Err(Error::AmbiguousInput(
                 "release tracked inputs before changing authentication".into(),
@@ -791,8 +791,6 @@ impl Kvmd {
         let empty = Self::build_client(&self.config)?;
         empty.cookies.sealed.store(true, Ordering::Release);
         *active = empty;
-        // A release skipped because cleanup already sent it belongs to the session just replaced.
-        inputs.cleaned.clear();
         let candidate = Self::build_client(&self.config)?;
         let url = self.url("auth/login")?;
         let response = candidate
