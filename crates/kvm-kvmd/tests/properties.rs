@@ -5,7 +5,10 @@
 use std::{
     collections::BTreeSet,
     future::Future,
-    sync::{Arc, Mutex, OnceLock},
+    sync::{
+        Arc, Mutex, OnceLock,
+        atomic::{AtomicU64, Ordering},
+    },
     time::Duration,
 };
 
@@ -55,7 +58,18 @@ enum LoginMode {
     Pending,
 }
 
+/// Lets a test abandon an input call after the device has the request, then let the device answer.
+struct Gate {
+    /// Signalled when a gated input request has reached the device and been applied.
+    arrived: Notify,
+    /// Held by a gated input request until the test lets its response out.
+    release: Notify,
+}
+
 struct FakeDevice {
+    /// Requests are served only under `/g<generation>/`, so a request that a previous case's connection sends late reaches a device that no longer exists instead of corrupting the current case.
+    generation: u64,
+    gate: Arc<Gate>,
     requests: Vec<Request>,
     next_session: u64,
     sessions: BTreeSet<u64>,
@@ -75,8 +89,13 @@ struct FakeDevice {
 }
 
 impl FakeDevice {
-    fn new() -> Self {
+    fn new(generation: u64) -> Self {
         Self {
+            generation,
+            gate: Arc::new(Gate {
+                arrived: Notify::new(),
+                release: Notify::new(),
+            }),
             requests: Vec::new(),
             next_session: 0,
             sessions: BTreeSet::from([POISON_SESSION]),
@@ -107,10 +126,6 @@ impl FakeDevice {
 
 struct Shared {
     device: Mutex<FakeDevice>,
-    /// Signalled when a gated input request has reached the device and been applied.
-    arrived: Notify,
-    /// Held by a gated input request until the test lets its response out.
-    gate: Notify,
 }
 
 fn pairs(raw: &str) -> Vec<Pair> {
@@ -223,7 +238,19 @@ fn input(device: &mut FakeDevice, query: &[Pair], param: &str) -> (Response, boo
 }
 
 /// Returns the response and whether the request must wait at the gate before it is sent.
-fn respond(device: &mut FakeDevice, request: Request) -> (Response, bool) {
+fn respond(device: &mut FakeDevice, mut request: Request) -> (Response, bool) {
+    let prefix = format!("/g{}", device.generation);
+    let path = request
+        .path
+        .strip_prefix(&prefix)
+        .filter(|rest| rest.starts_with('/'))
+        .map(str::to_owned);
+    let target = request.target.strip_prefix(&prefix).map(str::to_owned);
+    let (Some(path), Some(target)) = (path, target) else {
+        return (StatusCode::GONE.into_response(), false);
+    };
+    request.path = path;
+    request.target = target;
     device.requests.push(request.clone());
     if let Some(code) = device.fail_status {
         let echo = json!({"ok": false, "result": {"echo": [request.user, request.passwd, request.authorization]}});
@@ -325,13 +352,14 @@ async fn handle(
         passwd: header("x-kvmd-passwd"),
         authorization: header("authorization"),
     };
-    let (response, gated) = {
+    let (response, gate) = {
         let mut device = shared.device.lock().unwrap();
-        respond(&mut device, request)
+        let (response, gated) = respond(&mut device, request);
+        (response, gated.then(|| device.gate.clone()))
     };
-    if gated {
-        shared.arrived.notify_one();
-        shared.gate.notified().await;
+    if let Some(gate) = gate {
+        gate.arrived.notify_one();
+        gate.release.notified().await;
     }
     response
 }
@@ -362,6 +390,7 @@ struct Fixture {
     endpoint: Url,
     ca: Vec<u8>,
     shared: Arc<Shared>,
+    generations: AtomicU64,
 }
 
 impl Fixture {
@@ -372,9 +401,7 @@ impl Fixture {
             .build()
             .unwrap();
         let shared = Arc::new(Shared {
-            device: Mutex::new(FakeDevice::new()),
-            arrived: Notify::new(),
-            gate: Notify::new(),
+            device: Mutex::new(FakeDevice::new(0)),
         });
         let (endpoint, ca) = runtime.block_on(serve(shared.clone()));
         Self {
@@ -382,11 +409,14 @@ impl Fixture {
             endpoint,
             ca,
             shared,
+            generations: AtomicU64::new(0),
         }
     }
 
+    /// Replaces the device with a fresh one. Devices built before the reset keep addressing the old generation and are refused.
     fn reset(&self) {
-        *self.shared.device.lock().unwrap() = FakeDevice::new();
+        let generation = self.generations.fetch_add(1, Ordering::SeqCst) + 1;
+        *self.shared.device.lock().unwrap() = FakeDevice::new(generation);
     }
 
     fn with<T>(&self, action: impl FnOnce(&mut FakeDevice) -> T) -> T {
@@ -405,8 +435,10 @@ impl Fixture {
     }
 
     fn config(&self, profile: DeviceProfile) -> Config {
+        let mut endpoint = self.endpoint.clone();
+        endpoint.set_path(&format!("/g{}/", self.with(|device| device.generation)));
         Config {
-            endpoint: self.endpoint.clone(),
+            endpoint,
             profile,
             trusted_ca_pem: Some(self.ca.clone()),
             insecure_tls: false,
@@ -846,6 +878,7 @@ proptest! {
     fn tracked_inputs_match_what_the_device_holds(acts in vec(act(), 1..14)) {
         let fx = fixture!();
         let device = fx.device(DeviceProfile::PiKvm);
+        let gate = fx.with(|device| device.gate.clone());
         let mut held: BTreeSet<(bool, String)> = BTreeSet::new();
         let mut cleanup_pending = false;
         for act in acts {
@@ -877,10 +910,10 @@ proptest! {
                         fx.run(async {
                             tokio::select! {
                                 _ = send(&device, button, &name, press) => {}
-                                () = fx.shared.arrived.notified() => {}
+                                () = gate.arrived.notified() => {}
                             }
                         });
-                        fx.shared.gate.notify_one();
+                        gate.release.notify_one();
                         if press {
                             held.insert((button, name));
                         } else {
