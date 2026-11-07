@@ -510,6 +510,8 @@ impl Kvmd {
             inputs: self.inputs.clone(),
             auth_headers: self.auth_headers.clone(),
             approval_token: Mutex::new(None),
+            snapshot_proven: AtomicBool::new(false),
+            video_proven: self.video_proven.clone(),
             cleanup_on_drop: false,
             input_runtime: self.input_runtime.clone(),
         }

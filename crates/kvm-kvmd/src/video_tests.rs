@@ -123,6 +123,8 @@ fn input_device(address: std::net::SocketAddr) -> Kvmd {
         inputs: Default::default(),
         auth_headers: Default::default(),
         approval_token: Default::default(),
+        snapshot_proven: Default::default(),
+        video_proven: Default::default(),
         cleanup_on_drop: true,
         input_runtime: Default::default(),
     }
@@ -190,6 +192,8 @@ async fn cancelled_press_finishes_before_concurrent_release() {
         inputs: Default::default(),
         auth_headers: Default::default(),
         approval_token: Default::default(),
+        snapshot_proven: Default::default(),
+        video_proven: Default::default(),
         cleanup_on_drop: true,
         input_runtime: Default::default(),
     });
