@@ -27,12 +27,14 @@ pub(crate) enum Read {
     /// The session may not read the route.
     #[default]
     Denied,
-    /// The route's state could not be read although the connection was established: an HTTP error status, `ok: false`, a missing result, malformed JSON, an oversized body, no complete response within the response phase, a body that broke off, or a reused connection that had closed.
+    /// The route's state could not be read although the connection was established: an HTTP error status, `ok: false`, a missing result, malformed JSON, an oversized body, no complete response by the request's overall deadline, a body that broke off, or a reused connection that had closed.
     Failed(Error),
 }
 
 impl Kvmd {
-    /// Reads every state route with GET requests only, so reading status sends no input or control request. A connection failure (no connection or TLS session established within the connect phase of `Config::timeout`) fails the whole status at once, including after earlier routes were read, since the device can no longer be reached. A route that did not answer completely within the response phase, or whose body broke off, failed on its own, like one answering an error status; how such outcomes combine is described at [`parse`].
+    /// Reads every state route with GET requests only, so reading status sends no input or control request. A connection failure (no connection or TLS session established within `Config::timeout`) fails the whole status at once, including after earlier routes were read, since the device can no longer be reached. A route that did not answer completely by its overall deadline (twice `Config::timeout` from sending), or whose body broke off, failed on its own, like one answering an error status; how such outcomes combine is described at [`parse`].
+    ///
+    /// The session's read lock is held for the whole read, so every route is read with one session's credentials and the status describes one session. A login waits behind it, at most seven routes' deadlines; the read is not cut short sooner, because that would drop the slow routes of a healthy device.
     pub(crate) async fn read_status(&self) -> Result<DeviceStatus> {
         let active = self.client.read().await;
         let mut reads: [Read; 7] = Default::default();
