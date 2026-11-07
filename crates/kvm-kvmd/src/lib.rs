@@ -861,31 +861,31 @@ impl Device for Kvmd {
             .map_err(|_| {
                 Error::AmbiguousControl("request acknowledged but observation failed".into())
             })?;
-        if let Control::Switch { port } = &observed {
-            if self.profile == DeviceProfile::PiKvm {
-                // The PiKVM handler queues the switch; poll read-only state without replaying the request.
-                for _ in 0..4 {
-                    if state
-                        .pointer("/summary/synced")
-                        .and_then(serde_json::Value::as_bool)
-                        == Some(true)
-                        && state
-                            .pointer("/summary/active_port")
-                            .and_then(serde_json::Value::as_u64)
-                            == Some(u64::from(*port))
-                    {
-                        break;
-                    }
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                    state = self
-                        .json_with(&active.client, capability)
-                        .await
-                        .map_err(|_| {
-                            Error::AmbiguousControl(
-                                "request acknowledged but observation failed".into(),
-                            )
-                        })?;
+        if let Control::Switch { port } = &observed
+            && self.profile == DeviceProfile::PiKvm
+        {
+            // The PiKVM handler queues the switch; poll read-only state without replaying the request.
+            for _ in 0..4 {
+                if state
+                    .pointer("/summary/synced")
+                    .and_then(serde_json::Value::as_bool)
+                    == Some(true)
+                    && state
+                        .pointer("/summary/active_port")
+                        .and_then(serde_json::Value::as_u64)
+                        == Some(u64::from(*port))
+                {
+                    break;
                 }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                state = self
+                    .json_with(&active.client, capability)
+                    .await
+                    .map_err(|_| {
+                        Error::AmbiguousControl(
+                            "request acknowledged but observation failed".into(),
+                        )
+                    })?;
             }
         }
         let verified = match observed {
