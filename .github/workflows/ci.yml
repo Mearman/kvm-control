@@ -41,6 +41,9 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
+          workspaces: |
+            . -> target
+            examples/in-process -> target
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Check formatting
         run: cargo fmt --all --check
@@ -48,6 +51,11 @@ jobs:
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Test workspace
         run: cargo test --workspace --locked
+      # The example is its own workspace, so the workspace-wide steps above do not reach it.
+      - name: Check independent consumer formatting
+        run: cargo fmt --check --manifest-path examples/in-process/Cargo.toml
+      - name: Check independent consumer Clippy
+        run: cargo clippy --locked --all-targets --manifest-path examples/in-process/Cargo.toml -- -D warnings
       - name: Test independent consumer
         run: cargo test --locked --manifest-path examples/in-process/Cargo.toml
       - name: Test release version stamping
