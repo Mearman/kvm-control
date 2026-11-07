@@ -123,7 +123,7 @@ jobs:
             printf 'Expected kvm-mcp to reject missing configuration\n' >&2
             exit 1
           fi
-          grep -F 'environment variable not found' mcp.stderr
+          grep -Fx 'Error: NotPresent' mcp.stderr
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: validation-${{ matrix.target }}
