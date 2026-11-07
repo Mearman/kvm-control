@@ -1071,17 +1071,23 @@ impl Kvmd {
             return Ok(());
         }
         let active = self.client.read().await;
-        let state = self.json_with(&active.client, "hid").await?;
-        if hid_capability(&state, "mouse") != Capability::Supported
-            || mouse_mode(&state) != MouseMode::Absolute
-        {
-            return Err(Error::Unsupported(
+        let checked = match self.json_with(&active.client, "hid").await {
+            Ok(state)
+                if hid_capability(&state, "mouse") == Capability::Supported
+                    && mouse_mode(&state) == MouseMode::Absolute =>
+            {
+                Ok(())
+            }
+            Ok(_) => Err(Error::Unsupported(
                 "absolute mouse movement requires an online absolute-mode mouse".into(),
-            ));
-        }
+            )),
+            Err(error) => Err(error),
+        };
+        // Nothing has been submitted yet, so an abandoned caller needs neither the movement nor a report of why it would not have been sent.
         if caller.is_closed() {
             return Ok(());
         }
+        checked?;
         // Marked before submission so a task dropped mid-request (runtime shutdown) leaves the session indeterminate.
         let indeterminate = inputs.indeterminate;
         inputs.indeterminate = true;
