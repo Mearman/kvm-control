@@ -5,6 +5,7 @@ tmp=$(mktemp -d "${TMPDIR:-/tmp}/release-test.XXXXXXXX")
 trap 'rm -rf "$tmp"' EXIT
 mkdir -p "$tmp/bin" "$tmp/repo"
 export PATH="$tmp/bin:$PATH" GITHUB_REPOSITORY=example/project ATTEMPT=1 GITHUB_OUTPUT="$tmp/output" MOCK_ASSETS="$tmp/assets" MOCK_LOG="$tmp/log" MOCK_RELEASES="$tmp/releases"
+export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.hooksPath GIT_CONFIG_VALUE_0=/dev/null
 git -C "$tmp/repo" init -q
 git -C "$tmp/repo" -c user.name=test -c user.email=test@example.com commit --allow-empty -qm 'feat: baseline'
 export MOCK_NEXT=0.1.0
@@ -73,8 +74,9 @@ cp "$MOCK_REMOTE/kvm-control-v1.1.0-aarch64-unknown-linux-gnu.tar.gz.sha256" "$M
 if TAG=v1.1.0 bash "$root/.github/scripts/release.sh"; then printf '%s\n' 'Cross-target remote checksum was accepted.' >&2; exit 1; fi
 (cd "$MOCK_REMOTE" && shasum -a 256 kvm-control-v1.1.0-x86_64-unknown-linux-gnu.tar.gz > kvm-control-v1.1.0-x86_64-unknown-linux-gnu.tar.gz.sha256)
 cp "$MOCK_REMOTE/kvm-control-v1.1.0-x86_64-unknown-linux-gnu.tar.gz" "$MOCK_REMOTE/kvm-control-v1.1.0-x86_64-unknown-linux-gnu.tar.gz.sha256" dist/
-rm "$tmp/bin/convco"
-command -v convco >/dev/null
+printf '%s\n' '#!/usr/bin/env bash' 'printf "%s\n" "$MOCK_NEXT"' > "$tmp/bin/convco"
+chmod +x "$tmp/bin/convco"
+export MOCK_NEXT=0.1.0
 mkdir "$tmp/untagged"
 git -C "$tmp/untagged" init -q
 git -C "$tmp/untagged" -c user.name=test -c user.email=test@example.com commit --allow-empty -qm 'feat: initial release'
@@ -91,6 +93,21 @@ if (cd "$tmp/untagged" && PLAN="$intent" bash "$root/.github/scripts/check-relea
   exit 1
 fi
 (cd "$tmp/untagged" && PLAN='[]' bash "$root/.github/scripts/check-release-binaries.sh")
+mkdir -p "$tmp/untagged/crates/kvm-cli/src" "$tmp/untagged/crates/kvm-tui/src" "$tmp/untagged/crates/kvm-mcp/src"
+printf '%s\n' '[workspace]' 'members = ["crates/*"]' 'resolver = "2"' > "$tmp/untagged/Cargo.toml"
+for binary in kvm-cli kvm-tui kvm-mcp; do
+  printf '%s\n' '[package]' "name = \"$binary\"" 'version = "0.1.0"' 'edition = "2021"' > "$tmp/untagged/crates/$binary/Cargo.toml"
+  printf '%s\n' 'fn main() {}' > "$tmp/untagged/crates/$binary/src/main.rs"
+done
+printf '%s\n' 'autobins = false' >> "$tmp/untagged/crates/kvm-cli/Cargo.toml"
+printf '%s\n' 'pub fn marker() {}' > "$tmp/untagged/crates/kvm-cli/src/lib.rs"
+(cd "$tmp/untagged" && cargo generate-lockfile --offline && git add Cargo.toml Cargo.lock crates && git -c user.name=test -c user.email=test@example.com commit -qm 'test: add disabled binary')
+disabled=$(git -C "$tmp/untagged" rev-parse HEAD)
+disabled_plan=$(jq -cn --arg commit "$disabled" '[{tag:"v0.2.0",commit:$commit}]')
+if (cd "$tmp/untagged" && PLAN="$disabled_plan" bash "$root/.github/scripts/check-release-binaries.sh"); then
+  printf '%s\n' 'An auto-disabled binary was accepted.' >&2
+  exit 1
+fi
 for invalid in '{' '[{}]' '[{"tag":"v0.1.0"}]'; do
   if (cd "$tmp/untagged" && PLAN="$invalid" bash "$root/.github/scripts/record-release-intent.sh"); then
     printf '%s\n' 'Invalid release plan was accepted.' >&2
@@ -103,11 +120,22 @@ test "$(git -C "$tmp/intent-origin" rev-list -n 1 v0.1.0)" = "$initial"
 (cd "$tmp/untagged" && PLAN="$intent" bash "$root/.github/scripts/record-release-intent.sh")
 git -C "$tmp/untagged" -c user.name=test -c user.email=test@example.com commit --allow-empty -qm 'feat: after interrupted release'
 later=$(git -C "$tmp/untagged" rev-parse HEAD)
+export MOCK_NEXT=0.1.1
 : > "$GITHUB_OUTPUT"
 (cd "$tmp/untagged" && bash "$root/.github/scripts/version.sh")
 test "$(grep '^plan=' "$GITHUB_OUTPUT" | cut -d = -f 2- | jq -r 'map(.tag) | join(",")')" = 'v0.1.0,v0.1.1'
 test "$(grep '^plan=' "$GITHUB_OUTPUT" | cut -d = -f 2- | jq -r '.[0].commit')" = "$initial"
 test "$(grep '^plan=' "$GITHUB_OUTPUT" | cut -d = -f 2- | jq -r '.[1].commit')" = "$later"
+: > "$GITHUB_OUTPUT"
+(cd "$tmp/untagged" && ABANDON_INVALID_TAG=v0.1.0 bash "$root/.github/scripts/version.sh")
+test "$(git -C "$tmp/intent-origin" rev-list -n 1 v0.1.0)" = "$initial"
+test "$(git -C "$tmp/intent-origin" rev-list -n 1 abandoned-release-v0.1.0)" = "$initial"
+test "$(grep '^plan=' "$GITHUB_OUTPUT" | cut -d = -f 2- | jq -r 'map(.tag) | join(",")')" = v0.1.1
+: > "$GITHUB_OUTPUT"
+(cd "$tmp/untagged" && bash "$root/.github/scripts/version.sh")
+test "$(grep '^plan=' "$GITHUB_OUTPUT" | cut -d = -f 2- | jq -r 'map(.tag) | join(",")')" = v0.1.1
+printf '%s\n' '#!/usr/bin/env bash' 'if [[ "$1" == changelog ]]; then git log -1 --format=%s > release-notes.md; else printf "%s\n" "$MOCK_NEXT"; fi' > "$tmp/bin/convco"
+chmod +x "$tmp/bin/convco"
 cp "$MOCK_ASSETS" "$tmp/invalid-assets"
 for asset in "$MOCK_REMOTE"/*; do
   printf '%s\tuploaded\tsha256:%s\n' "$(basename "$asset")" "$(shasum -a 256 "$asset" | cut -d ' ' -f 1)"

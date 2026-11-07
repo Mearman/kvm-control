@@ -5,6 +5,11 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      abandon_invalid_tag:
+        description: Unreleased invalid tag to abandon without altering it
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -81,6 +86,7 @@ jobs:
         env:
           ATTEMPT: ${{ github.run_attempt }}
           GH_TOKEN: ${{ github.token }}
+          ABANDON_INVALID_TAG: ${{ inputs.abandon_invalid_tag }}
         run: bash .github/scripts/version.sh
       - name: Verify release binaries exist
         env:

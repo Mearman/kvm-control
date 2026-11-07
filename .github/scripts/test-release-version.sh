@@ -5,10 +5,10 @@ script_dir=$(cd "$(dirname "$0")" && pwd)
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 mkdir -p "$work/app/src" "$work/lib/src" "$work/tui/src" "$work/mcp/src"
-printf '%s\n' '[workspace]' 'members = ["app", "lib", "tui", "mcp"]' 'resolver = "2"' '[workspace.package]' 'version = "0.1.0"' > "$work/Cargo.toml"
+printf '%s\n' '[workspace]' 'members = ["app", "lib", "tui", "mcp"]' 'resolver = "2"' '[workspace.package]' 'version = "0.1.0"' '[workspace.dependencies]' 'synthetic-lib = { version = "0.1.0", path = "lib" }' > "$work/Cargo.toml"
 printf '%s\n' '[package]' 'name = "synthetic-app"' 'version.workspace = true' 'edition = "2021"' '[dependencies]' 'synthetic-lib = { version = "0.1.0", path = "../lib" }' > "$work/app/Cargo.toml"
 for binary in tui mcp; do
-  printf '%s\n' '[package]' "name = \"synthetic-$binary\"" 'version.workspace = true' 'edition = "2021"' '[dependencies]' 'synthetic-lib = { version = "0.1.0", path = "../lib" }' > "$work/$binary/Cargo.toml"
+  printf '%s\n' '[package]' "name = \"synthetic-$binary\"" 'version.workspace = true' 'edition = "2021"' '[dependencies]' 'synthetic-lib.workspace = true' > "$work/$binary/Cargo.toml"
   printf '%s\n' 'fn main() { println!("{}", synthetic_lib::version()); }' > "$work/$binary/src/main.rs"
 done
 printf '%s\n' '[package]' 'name = "synthetic-lib"' 'version.workspace = true' 'edition = "2021"' > "$work/lib/Cargo.toml"
