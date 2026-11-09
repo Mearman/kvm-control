@@ -5120,7 +5120,7 @@ mod tests {
             return;
         }
         let script = r#"
-import os, pty, select, signal, subprocess, sys, termios, time, tempfile
+import errno, os, pty, select, signal, subprocess, sys, termios, time, tempfile
 binary, name, scenario, signame = sys.argv[1:5]
 sandbox = tempfile.TemporaryDirectory()
 marker = os.path.join(sandbox.name, 'called')
@@ -5128,7 +5128,8 @@ with open(os.path.join(sandbox.name, 'tmux'), 'w') as f:
     f.write('#!/bin/sh\nprintf called > ' + marker + '\n')
 os.chmod(os.path.join(sandbox.name, 'tmux'), 0o700)
 master, slave = pty.openpty()
-before = termios.tcgetattr(slave)
+# The terminal attributes are read through the master, which shares the pair's attributes, so this process can close its own slave descriptor and the master reports end of file once the child, the only remaining holder, has exited and its output is queued.
+before = termios.tcgetattr(master)
 env = {key: value for key, value in os.environ.items() if key not in ('TMUX', 'TERM_PROGRAM', 'KONSOLE_VERSION', 'KVM_TUI_IMAGE_PROTOCOL')}
 env.update(KVM_STARTUP_PTY_CHILD=scenario, PATH=sandbox.name)
 if scenario == 'tmux':
@@ -5136,23 +5137,31 @@ if scenario == 'tmux':
 else:
     env.update(TERM='xterm-256color')
 proc = subprocess.Popen([binary, '--exact', name, '--nocapture'], stdin=slave, stdout=slave, stderr=slave, env=env)
+os.close(slave)
 data = b''
+eof = False
 deadline = time.monotonic() + 10
-def drain():
-    global data
-    while select.select([master], [], [], 0)[0]:
-        data += os.read(master, 65536)
+def pump(timeout):
+    global data, eof
+    if eof or not select.select([master], [], [], timeout)[0]:
+        return
+    try:
+        chunk = os.read(master, 65536)
+    except OSError as error:
+        # Linux reports the slave side having closed as EIO, other systems as an empty read.
+        if error.errno != errno.EIO:
+            raise
+        chunk = b''
+    if chunk:
+        data += chunk
+    else:
+        eof = True
 def read_until(needle, why):
-    global data
+    # End of file means the child has exited and everything it wrote has been read, so a needle missing then is missing for good.
     while needle not in data:
-        if time.monotonic() >= deadline or proc.poll() is not None:
-            # A child that wrote the needle and exited at once can be seen to exit before its output is read, so read what it left before failing.
-            drain()
-            if needle in data:
-                break
-            raise AssertionError(why + ': ' + repr(data))
-        if select.select([master], [], [], 0.1)[0]:
-            data += os.read(master, 65536)
+        if eof or time.monotonic() >= deadline:
+            raise AssertionError(why + ': ' + repr((proc.poll(), data)))
+        pump(0.1)
 def normalised(attributes):
     # Darwin may set PENDIN transiently when canonical mode is restored.
     if hasattr(termios, 'PENDIN'):
@@ -5174,22 +5183,21 @@ try:
     else:
         assert b'\x1b[>' not in data, ('keyboard enhancement pushed without an answer', data)
     assert not os.path.exists(marker), 'startup invoked tmux'
-    after = termios.tcgetattr(slave)
+    after = termios.tcgetattr(master)
     assert normalised(after) == normalised(before), ('terminal attributes not restored', before, after, data)
     os.write(master, b'stdin-check\n')
     read_until(b'STDIN_OWNED stdin-check', 'standard input was not left to the process')
-    while proc.poll() is None:
+    while not eof:
         if time.monotonic() >= deadline:
             raise AssertionError('process did not exit')
-        if select.select([master], [], [], 0.1)[0]:
-            data += os.read(master, 65536)
+        pump(0.1)
+    proc.wait(timeout=max(0, deadline - time.monotonic()))
     assert proc.returncode == 0, (proc.returncode, data)
 finally:
     if proc.poll() is None:
         proc.kill()
         proc.wait()
     os.close(master)
-    os.close(slave)
 "#;
         for (scenario, signal) in [
             ("tmux", "TERM"),
