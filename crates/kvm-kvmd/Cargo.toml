@@ -3,7 +3,7 @@ name = "kvm-kvmd"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-rust-version.workspace = true
+rust-version = "1.88"
 
 [dependencies]
 async-trait.workspace = true

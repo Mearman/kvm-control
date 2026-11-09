@@ -2,7 +2,7 @@
 name = "kvm-tui"
 edition.workspace = true
 license.workspace = true
-rust-version.workspace = true
+rust-version = "1.90"
 version.workspace = true
 
 [dependencies]
